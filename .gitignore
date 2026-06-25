@@ -1,0 +1,31 @@
+# Autotools generated files (regenerate with: autoreconf -fi)
+/configure
+/aclocal.m4
+/autom4te.cache/
+/build-aux/
+/config.h
+/config.h.in
+/config.log
+/config.status
+/stamp-h1
+Makefile
+Makefile.in
+.deps/
+.dirstamp
+
+# m4 macros pulled in by aclocal
+/m4/*.m4
+
+# Build products
+*.o
+*.lo
+*.la
+*.a
+
+# Generated man pages
+CLA/mqtt/bpv7/doc/*.1
+
+# Built daemons
+CLA/mqtt/mqttcli
+CLA/mqtt/mqttclo
+/.idea/
