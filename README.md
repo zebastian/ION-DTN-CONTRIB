@@ -1,5 +1,7 @@
 # ION-DTN-CONTRIB
 
+![ION-DTN-CONTRIB logo](misc/logo.png)
+
 Community contributions for [ION-DTN](https://github.com/nasa-jpl/ION-DTN), NASA/JPL's
 implementation of Delay/Disruption Tolerant Networking (DTN).
 
