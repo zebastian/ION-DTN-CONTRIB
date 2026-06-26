@@ -1,0 +1,5 @@
+# loopback-mysql test run artifacts
+tests/*/ion.log
+doc/*.1
+mqttcli
+mqttclo

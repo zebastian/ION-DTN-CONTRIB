@@ -5,3 +5,10 @@ tests/*/bpshd.pid
 tests/*/out.case*
 tests/*/err.case*
 tests/*/rsync.*
+
+# Generated man pages
+doc/*.1
+
+# Built daemons
+bpsh
+bpshd
