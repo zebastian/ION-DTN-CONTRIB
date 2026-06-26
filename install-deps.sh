@@ -1,19 +1,21 @@
 #!/bin/sh
-# install-deps.sh — install build prerequisites for ION-DTN-CONTRIB.
+# install-deps.sh — install prerequisites for ION-DTN-CONTRIB.
 #
-# Installs the general toolchain needed to build the contributions, then runs
-# each selected contribution's own install-deps.sh (CLA/<name>/install-deps.sh
-# or APP/<name>/install-deps.sh).
+# Build mode (default) installs the general toolchain plus each selected
+# contribution's build dependencies.  Test mode (leading "test" argument)
+# installs each selected contribution's runtime test dependencies instead.
 #
 # Usage:
-#   ./install-deps.sh                  general build deps only
-#   ./install-deps.sh ALL              general deps + every contribution
-#   ./install-deps.sh CLA_MQTT [...]   general deps + the named contribution(s)
+#   ./install-deps.sh                     general build deps only
+#   ./install-deps.sh ALL                 build deps for every contribution
+#   ./install-deps.sh CLA_MQTT [...]      build deps for the named contribution(s)
+#   ./install-deps.sh test                test deps for every contribution
+#   ./install-deps.sh test CLA_MQTT [...] test deps for the named contribution(s)
 #
-# Tokens map <KIND>_<NAME> to the directory <KIND>/<name>:
-#   CLA_MQTT -> CLA/mqtt, APP_BPSH -> APP/bpsh.
+# Tokens map <KIND>_<NAME> to <KIND>/<name>: CLA_MQTT -> CLA/mqtt.  Each
+# contribution's install-deps.sh accepts the same "test" argument.
 #
-# Debian/Ubuntu (apt) only. ION-DTN itself must already be installed from
+# Debian/Ubuntu (apt) only.  ION-DTN itself must already be installed from
 # source; it is not available as a package and is not installed here.
 #
 # Honoured environment variables (also passed to the per-contribution scripts):
@@ -40,15 +42,27 @@ if ! command -v "$APT_GET" >/dev/null 2>&1; then
 	exit 1
 fi
 
-# General toolchain: autotools build + pod2man (perl) for the man pages.
-GENERAL_PKGS="build-essential autoconf automake libtool pkg-config perl"
+mode=build
+if [ "${1:-}" = test ]; then
+	mode=test
+	shift
+fi
 
-echo ">> Installing general build prerequisites"
 $SUDO "$APT_GET" update
-# shellcheck disable=SC2086
-$SUDO "$APT_GET" install -y $GENERAL_PKGS
 
-# Resolve the list of CLA install scripts to run.
+if [ "$mode" = build ]; then
+	# General toolchain: autotools build + pod2man (perl) for the man pages.
+	GENERAL_PKGS="build-essential autoconf automake libtool pkg-config perl"
+	echo ">> Installing general build prerequisites"
+	# shellcheck disable=SC2086
+	$SUDO "$APT_GET" install -y $GENERAL_PKGS
+fi
+
+# Test mode with no tokens means every contribution.
+if [ "$mode" = test ] && [ "$#" -eq 0 ]; then
+	set -- ALL
+fi
+
 contribs=
 for arg in "$@"; do
 	case $arg in
@@ -76,16 +90,22 @@ for arg in "$@"; do
 	esac
 done
 
+testarg=
+[ "$mode" = test ] && testarg=test
+
 for dir in $contribs; do
 	script="$dir/install-deps.sh"
+	name=${dir#"$ROOT"/}
+	label="build prerequisites"
+	[ "$mode" = test ] && label="test prerequisites"
 	if [ -x "$script" ]; then
-		echo ">> Installing prerequisites for ${dir#"$ROOT"/}"
-		"$script"
+		echo ">> Installing $label for $name"
+		"$script" $testarg
 	elif [ -f "$script" ]; then
-		echo ">> Installing prerequisites for ${dir#"$ROOT"/}"
-		sh "$script"
+		echo ">> Installing $label for $name"
+		sh "$script" $testarg
 	else
-		echo ">> ${dir#"$ROOT"/} has no install-deps.sh, skipping"
+		echo ">> $name has no install-deps.sh, skipping"
 	fi
 done
 

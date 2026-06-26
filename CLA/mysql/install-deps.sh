@@ -1,15 +1,7 @@
 #!/bin/sh
-# install-deps.sh — install build prerequisites for the MySQL CLA.
-#
-# Pulls in the MariaDB client development library (which provides the
-# MySQL C API and mariadb_config, and works against both MySQL and
-# MariaDB servers), plus the command-line client used by the loopback
-# test.  Invoked by the top-level install-deps.sh, but may be run on
-# its own.
-#
-# Honoured environment variables:
-#   APT_GET   apt front-end to use      (default: apt-get)
-#   SUDO      privilege-escalation cmd  (default: sudo, empty when run as root)
+# install-deps.sh — prerequisites for the MySQL CLA.
+#   (default)  build deps: MariaDB client dev library (MySQL C API).
+#   test       test deps:  a local MariaDB server + client for the loopback test.
 
 set -eu
 
@@ -27,4 +19,14 @@ if ! command -v "$APT_GET" >/dev/null 2>&1; then
 	exit 1
 fi
 
-$SUDO "$APT_GET" install -y libmariadb-dev libmariadb3 mariadb-client
+case "${1:-build}" in
+test) PKGS="mariadb-server mariadb-client" ;;
+build) PKGS="libmariadb-dev libmariadb3" ;;
+*)
+	echo "usage: $0 [test]" >&2
+	exit 1
+	;;
+esac
+
+# shellcheck disable=SC2086
+$SUDO "$APT_GET" install -y $PKGS

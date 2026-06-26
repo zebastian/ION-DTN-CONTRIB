@@ -31,6 +31,14 @@ map to the directory `<KIND>/<name>` (e.g. `CLA_MQTT` -> `CLA/mqtt`,
 ./install-deps.sh APP_BPSH   # general deps + the named contribution(s)
 ```
 
+Runtime dependencies for the tests (brokers, servers, tools — see Testing) are
+installed separately with a leading `test`:
+
+```bash
+./install-deps.sh test            # test deps for every contribution
+./install-deps.sh test CLA_MYSQL  # test deps for the named contribution(s)
+```
+
 Then build (selecting which contributions to build — see below):
 
 ```bash

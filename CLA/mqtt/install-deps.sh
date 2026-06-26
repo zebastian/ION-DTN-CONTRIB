@@ -1,12 +1,7 @@
 #!/bin/sh
-# install-deps.sh — install build prerequisites for the MQTT CLA.
-#
-# Pulls in the Eclipse Paho MQTT C client (TLS-capable) and its headers.
-# Invoked by the top-level install-deps.sh, but may be run on its own.
-#
-# Honoured environment variables:
-#   APT_GET   apt front-end to use      (default: apt-get)
-#   SUDO      privilege-escalation cmd  (default: sudo, empty when run as root)
+# install-deps.sh — prerequisites for the MQTT CLA.
+#   (default)  build deps: Eclipse Paho MQTT C client (TLS-capable) + headers.
+#   test       test deps:  a local mosquitto broker + clients for the loopback test.
 
 set -eu
 
@@ -24,6 +19,14 @@ if ! command -v "$APT_GET" >/dev/null 2>&1; then
 	exit 1
 fi
 
-# libpaho-mqtt-dev provides the TLS-capable libpaho-mqtt3cs the CLA prefers
-# (and the non-TLS libpaho-mqtt3c fallback); libpaho-mqtt1.3 is the runtime.
-$SUDO "$APT_GET" install -y libpaho-mqtt-dev libpaho-mqtt1.3
+case "${1:-build}" in
+test) PKGS="mosquitto mosquitto-clients" ;;
+build) PKGS="libpaho-mqtt-dev libpaho-mqtt1.3" ;;
+*)
+	echo "usage: $0 [test]" >&2
+	exit 1
+	;;
+esac
+
+# shellcheck disable=SC2086
+$SUDO "$APT_GET" install -y $PKGS

@@ -1,14 +1,7 @@
 #!/bin/sh
-# install-deps.sh — install prerequisites for bpsh / bpshd.
-#
-# bpsh and bpshd build against an installed ION-DTN with only the general
-# toolchain (no extra libraries). This installs rsync, which the loopback
-# test's directory-sync case exercises over bpsh.
-# Invoked by the top-level install-deps.sh, but may be run on its own.
-#
-# Honoured environment variables:
-#   APT_GET   apt front-end to use      (default: apt-get)
-#   SUDO      privilege-escalation cmd  (default: sudo, empty when run as root)
+# install-deps.sh — prerequisites for bpsh / bpshd.
+#   (default)  build deps: none beyond the general toolchain.
+#   test       test deps:  rsync, exercised by the loopback test's sync case.
 
 set -eu
 
@@ -26,4 +19,16 @@ if ! command -v "$APT_GET" >/dev/null 2>&1; then
 	exit 1
 fi
 
-$SUDO "$APT_GET" install -y rsync
+case "${1:-build}" in
+test) PKGS="rsync" ;;
+build) PKGS="" ;;
+*)
+	echo "usage: $0 [test]" >&2
+	exit 1
+	;;
+esac
+
+if [ -n "$PKGS" ]; then
+	# shellcheck disable=SC2086
+	$SUDO "$APT_GET" install -y $PKGS
+fi
