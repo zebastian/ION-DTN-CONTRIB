@@ -1,0 +1,155 @@
+=head1 NAME
+
+mysqlcli - DTN MySQL convergence layer input task
+
+=head1 SYNOPSIS
+
+B<mysqlcli> I<host>[:I<port>] [B<-d> I<db>] [B<-T> I<table>]
+[B<-u> I<user>] [B<-p> I<password>] [B<-S> I<socket>] [B<-n> I<batch>]
+[B<-i> I<pollms>] [B<-e> I<srcpattern>] [B<-t>] [B<-c> I<cafile>]
+[B<-k> I<cert>] [B<-K> I<key>]
+
+=head1 DESCRIPTION
+
+B<mysqlcli> is a background "daemon" task that receives bundles from a
+MySQL/MariaDB table.  It selects the rows whose C<src_eid> belongs to the
+local node from the table named by B<-T> (default C<outbound>) in the
+database named by B<-d> (default C<ion>), injects each bundle into ION,
+and deletes the consumed rows.
+
+Because the row owner is matched against the local node's own EID
+(derived from ION as C<ipn:>I<ownNodeNbr>C<.*>), several ION nodes may
+share one server and table; each B<mysqlcli> picks up only its own rows.
+The match can be overridden with B<-e>.
+
+The duct name format is I<host>[:I<port>], identifying the MySQL server
+(default port 3306).  The database and table are created if they do not
+exist.  Rows are read and deleted in batches of up to B<-n> bundles
+(default 100) within a single transaction; when no matching rows are
+present the daemon polls every B<-i> milliseconds.  On connection
+failure it retries with exponential backoff (1 second up to 30 seconds).
+
+B<mysqlcli> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command that starts operation of the Bundle Protocol; the text
+of the command that is used to spawn the task must be provided at the
+time the "mysql" convergence layer protocol is added to the BP database.
+The convergence layer input task is terminated by B<bpadmin> in response
+to an 'x' (STOP) command.
+
+B<mysqlcli> requires a MySQL/MariaDB client library (e.g. libmariadb).
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-d> I<db>
+
+Database name (default C<ion>).
+
+=item B<-T> I<table>
+
+Table name (default C<outbound>).
+
+=item B<-u> I<user>
+
+MySQL user for authentication.
+
+=item B<-p> I<password>
+
+MySQL password for authentication.
+
+=item B<-S> I<socket>
+
+Path to a Unix domain socket, used instead of TCP.
+
+=item B<-n> I<batch>
+
+Maximum number of bundles read and deleted per transaction (default 100).
+
+=item B<-i> I<pollms>
+
+Idle poll interval, in milliseconds, when no matching rows are present
+(default 1000).
+
+=item B<-e> I<srcpattern>
+
+Override the row-owner match with an explicit SQL C<LIKE> pattern applied
+to C<src_eid> (e.g. C<'ipn:5.%'>), instead of deriving the local node's
+own EID.
+
+=item B<-t>
+
+Enable TLS.  Implied by any of B<-c>, B<-k>.
+
+=item B<-c> I<cafile>
+
+Path to a PEM file of trusted CA certificates.  Implies B<-t>.
+
+=item B<-k> I<cert>
+
+Path to the client certificate (PEM) for mutual TLS.  Implies B<-t>.
+
+=item B<-K> I<key>
+
+Path to the client private key (PEM) for mutual TLS.  Implies B<-t>.
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<mysqlcli> terminated normally, for reasons noted in the B<ion.log> file.
+
+=item "1"
+
+B<mysqlcli> terminated abnormally, for reasons noted in the B<ion.log> file.
+Investigate and solve the problem identified in the log file, then use
+B<bpadmin> to restart B<mysqlcli>.
+
+=back
+
+=head1 FILES
+
+No configuration files are needed.
+
+=head1 ENVIRONMENT
+
+No environment variables apply.
+
+=head1 DIAGNOSTICS
+
+The following diagnostics may be issued to the B<ion.log> log file:
+
+=over 4
+
+=item mysqlcli can't attach to BP.
+
+B<bpadmin> has not yet initialized Bundle Protocol operations.
+
+=item No such mysql duct.
+
+No mysql induct matching the duct name has been added to the BP database.
+Use B<bpadmin> to add the induct.
+
+=item mysqlcla: can't connect.
+
+The MySQL server is not reachable.  Check that the server is running and
+the host/port/credentials are correct.  The daemon will retry with
+exponential backoff.
+
+=back
+
+=head1 EXAMPLES
+
+    a induct mysql db1:3306 'mysqlcli -d ion -T outbound -u ion -p secret'
+
+=head1 BUGS
+
+Report bugs to <https://github.com/zebastian/ION-DTN-CONTRIB/issues>
+
+=head1 SEE ALSO
+
+bpadmin(1), mysqlclo(1), bprc(5)

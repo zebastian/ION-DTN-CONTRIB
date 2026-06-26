@@ -6,6 +6,9 @@ SUBDIRS =
 if ENABLE_CLA_MQTT
 SUBDIRS += CLA/mqtt
 endif
+if ENABLE_CLA_MYSQL
+SUBDIRS += CLA/mysql
+endif
 if ENABLE_APP_BPSH
 SUBDIRS += APP/bpsh
 endif

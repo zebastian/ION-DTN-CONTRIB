@@ -30,14 +30,18 @@ AC_ARG_ENABLE([cla-mqtt],
 AC_ARG_ENABLE([app-bpsh],
   [AS_HELP_STRING([--enable-app-bpsh], [build the bpsh app (APP/bpsh)])],
   [enable_app_bpsh=$enableval], [enable_app_bpsh=])
+AC_ARG_ENABLE([cla-mysql],
+  [AS_HELP_STRING([--enable-cla-mysql], [build the MySQL CLA (CLA/mysql)])],
+  [enable_cla_mysql=$enableval], [enable_cla_mysql=])
 
 # --enable-all sets the default for any contribution not named explicitly, so
 # --enable-all --disable-cla-mqtt still works.
 AS_IF([test "x$enable_all" = xyes], [contrib_default=yes], [contrib_default=no])
 test -z "$enable_cla_mqtt" && enable_cla_mqtt=$contrib_default
 test -z "$enable_app_bpsh" && enable_app_bpsh=$contrib_default
+test -z "$enable_cla_mysql" && enable_cla_mysql=$contrib_default
 
-AS_IF([test "x$enable_cla_mqtt$enable_app_bpsh" = xnono],
+AS_IF([test "x$enable_cla_mqtt$enable_app_bpsh$enable_cla_mysql" = xnonono],
   [AC_MSG_WARN([no contributions selected; pass --enable-all or --enable-<contrib> (e.g. --enable-app-bpsh)])])
 
 #
@@ -98,8 +102,29 @@ AS_IF([test "x$enable_cla_mqtt" = xyes], [
 ])
 AC_SUBST([MQTT_LIBS])
 
+#
+# MySQL / MariaDB client library (via mariadb_config or mysql_config).
+# Only required when the MySQL CLA is enabled.
+#
+AS_IF([test "x$enable_cla_mysql" = xyes], [
+  AC_CHECK_PROGS([MYSQL_CONFIG], [mariadb_config mysql_config], [no])
+  AS_IF([test "x$MYSQL_CONFIG" = xno],
+    [AC_MSG_ERROR([Neither mariadb_config nor mysql_config found. Install libmariadb-dev (or libmysqlclient-dev), or pass --disable-cla-mysql.])])
+  MYSQL_CFLAGS=`$MYSQL_CONFIG --include 2>/dev/null`
+  AS_IF([test -z "$MYSQL_CFLAGS"], [MYSQL_CFLAGS=`$MYSQL_CONFIG --cflags`])
+  MYSQL_LIBS=`$MYSQL_CONFIG --libs`
+  save_CPPFLAGS="$CPPFLAGS"
+  CPPFLAGS="$CPPFLAGS $MYSQL_CFLAGS"
+  AC_CHECK_HEADER([mysql.h], [],
+    [AC_MSG_ERROR([mysql.h not found via $MYSQL_CONFIG. Install the client development headers, or pass --disable-cla-mysql.])])
+  CPPFLAGS="$save_CPPFLAGS"
+])
+AC_SUBST([MYSQL_CFLAGS])
+AC_SUBST([MYSQL_LIBS])
+
 AM_CONDITIONAL([ENABLE_CLA_MQTT], [test "x$enable_cla_mqtt" = xyes])
 AM_CONDITIONAL([ENABLE_APP_BPSH], [test "x$enable_app_bpsh" = xyes])
+AM_CONDITIONAL([ENABLE_CLA_MYSQL], [test "x$enable_cla_mysql" = xyes])
 
 #
 # Man pages are generated from POD only when pod2man is available.
@@ -109,6 +134,7 @@ AM_CONDITIONAL([HAVE_POD2MAN], [test "x$POD2MAN" != "x"])
 
 AC_CONFIG_FILES([Makefile
                  CLA/mqtt/Makefile
+                 CLA/mysql/Makefile
                  APP/bpsh/Makefile])
 AC_OUTPUT
 
@@ -116,5 +142,6 @@ echo
 echo "  ION-DTN-CONTRIB configured"
 echo "    ION prefix ...... ${ion_prefix}"
 echo "    CLA/mqtt ........ ${enable_cla_mqtt} (${MQTT_LIBS:-n/a})"
+echo "    CLA/mysql ....... ${enable_cla_mysql} (${MYSQL_LIBS:-n/a})"
 echo "    APP/bpsh ........ ${enable_app_bpsh}"
 echo

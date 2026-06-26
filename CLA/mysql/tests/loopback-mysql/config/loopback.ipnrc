@@ -1,0 +1,6 @@
+# ipnrc configuration file for the MySQL CLA loopback test.
+# Command: % ipnadmin loopback.ipnrc
+
+# Bundles to node 1 egress via the mysql outduct (DBDUCT substituted by
+# the dotest script).
+a plan 1 mysql/DBDUCT

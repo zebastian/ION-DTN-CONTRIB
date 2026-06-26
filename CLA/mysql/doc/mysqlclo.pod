@@ -1,0 +1,152 @@
+=head1 NAME
+
+mysqlclo - DTN MySQL convergence layer output task
+
+=head1 SYNOPSIS
+
+B<mysqlclo> I<host>[:I<port>] [B<-d> I<db>] [B<-T> I<table>]
+[B<-u> I<user>] [B<-p> I<password>] [B<-S> I<socket>] [B<-n> I<batch>]
+[B<-f> I<flushms>] [B<-b> I<bufsize>] [B<-t>] [B<-c> I<cafile>]
+[B<-k> I<cert>] [B<-K> I<key>]
+
+=head1 DESCRIPTION
+
+B<mysqlclo> is a background "daemon" task that transmits bundles by
+storing them in a MySQL/MariaDB table.  Each bundle dequeued from ION is
+always inserted, with metadata, into the table named by B<-T> (default
+C<inbound>) in the database named by B<-d> (default C<ion>); a peer node
+or an application then picks the bundles up.
+
+The duct name format is I<host>[:I<port>], identifying the MySQL server
+(default port 3306).  The database and table are created if they do not
+exist.  Each row holds C<id>, C<payload> (the raw bundle), C<length>,
+C<src_eid>, C<dst_eid>, and C<created_at>.
+
+Inserts are batched: bundles are buffered and committed in a single
+transaction once B<-n> bundles are queued or the B<-f> flush window
+elapses, whichever comes first.  On connection failure the daemon
+retries with exponential backoff (1 second up to 30 seconds).
+
+B<mysqlclo> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command that starts operation of the Bundle Protocol; the text
+of the command that is used to spawn the task must be provided at the
+time the "mysql" convergence layer protocol is added to the BP database.
+The convergence layer output task is terminated by B<bpadmin> in
+response to an 'x' (STOP) command.
+
+B<mysqlclo> requires a MySQL/MariaDB client library (e.g. libmariadb).
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-d> I<db>
+
+Database name (default C<ion>).
+
+=item B<-T> I<table>
+
+Table name (default C<inbound>).
+
+=item B<-u> I<user>
+
+MySQL user for authentication.
+
+=item B<-p> I<password>
+
+MySQL password for authentication.
+
+=item B<-S> I<socket>
+
+Path to a Unix domain socket, used instead of TCP.
+
+=item B<-n> I<batch>
+
+Maximum number of bundles per insert transaction (default 100).
+
+=item B<-f> I<flushms>
+
+Maximum time, in milliseconds, to hold a partial batch before
+committing it (default 100).
+
+=item B<-b> I<bufsize>
+
+Maximum bundle size handled, in bytes (default 262144).  The server's
+C<max_allowed_packet> must accommodate the resulting INSERT.
+
+=item B<-t>
+
+Enable TLS.  Implied by any of B<-c>, B<-k>.
+
+=item B<-c> I<cafile>
+
+Path to a PEM file of trusted CA certificates.  Implies B<-t>.
+
+=item B<-k> I<cert>
+
+Path to the client certificate (PEM) for mutual TLS.  Implies B<-t>.
+
+=item B<-K> I<key>
+
+Path to the client private key (PEM) for mutual TLS.  Implies B<-t>.
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<mysqlclo> terminated normally, for reasons noted in the B<ion.log> file.
+
+=item "1"
+
+B<mysqlclo> terminated abnormally, for reasons noted in the B<ion.log> file.
+Investigate and solve the problem identified in the log file, then use
+B<bpadmin> to restart B<mysqlclo>.
+
+=back
+
+=head1 FILES
+
+No configuration files are needed.
+
+=head1 ENVIRONMENT
+
+No environment variables apply.
+
+=head1 DIAGNOSTICS
+
+The following diagnostics may be issued to the B<ion.log> log file:
+
+=over 4
+
+=item mysqlclo can't attach to BP.
+
+B<bpadmin> has not yet initialized Bundle Protocol operations.
+
+=item No such mysql duct.
+
+No mysql outduct matching the duct name has been added to the BP
+database.  Use B<bpadmin> to add the outduct.
+
+=item mysqlcla: can't connect.
+
+The MySQL server is not reachable.  Check that the server is running and
+the host/port/credentials are correct.  The daemon will retry with
+exponential backoff.
+
+=back
+
+=head1 EXAMPLES
+
+    a outduct mysql db1:3306 'mysqlclo -d ion -T inbound -u ion -p secret'
+
+=head1 BUGS
+
+Report bugs to <https://github.com/zebastian/ION-DTN-CONTRIB/issues>
+
+=head1 SEE ALSO
+
+bpadmin(1), mysqlcli(1), bprc(5)

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Clean up after the MySQL CLA loopback test.
+pkill -9 -f "mysqlcli" 2>/dev/null
+pkill -9 -f "mysqlclo" 2>/dev/null
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f ion.log testfile1 sendfile
+rm -f config/loopback_runtime.bprc config/loopback_runtime.ipnrc
+exit 0

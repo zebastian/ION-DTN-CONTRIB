@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+#
+# Loopback test for the MySQL CLA (mysqlcli / mysqlclo).
+#
+# A single ION node sends a file to itself: mysqlclo writes the bundle
+# into the "loopback" table, and mysqlcli (filtering on this node's own
+# src_eid) reads it back, injects it into ION, and deletes the row.
+#
+# Requires a reachable MySQL/MariaDB server.  Override via env:
+#   MYSQL_HOST (127.0.0.1) MYSQL_PORT (3306) MYSQL_USER (root)
+#   MYSQL_PASS ('')        MYSQL_DB (iontest)
+#
+# Copyright (c) 2026, California Institute of Technology.
+# ALL RIGHTS RESERVED.  U.S. Government Sponsorship acknowledged.
+#
+
+MYSQL_HOST="${MYSQL_HOST:-127.0.0.1}"
+MYSQL_PORT="${MYSQL_PORT:-3306}"
+MYSQL_USER="${MYSQL_USER:-root}"
+MYSQL_PASS="${MYSQL_PASS:-}"
+MYSQL_DB="${MYSQL_DB:-iontest}"
+
+if [ "$MYSQL_PORT" = "3306" ]; then
+	DBDUCT="$MYSQL_HOST"
+else
+	DBDUCT="${MYSQL_HOST}:${MYSQL_PORT}"
+fi
+
+# Daemon args (-p takes a separate token); client args (-p is glued).
+DBARGS="-u ${MYSQL_USER}"
+CLIENT="mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER}"
+if [ -n "$MYSQL_PASS" ]; then
+	DBARGS="${DBARGS} -p ${MYSQL_PASS}"
+	CLIENT="${CLIENT} -p${MYSQL_PASS}"
+fi
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the MySQL CLA with a single-node loopback."
+echo
+echo "########################################"
+
+FAIL=0
+
+# --- Prerequisites ---
+
+if ! command -v mysqlcli >/dev/null 2>&1 || ! command -v mysqlclo >/dev/null 2>&1; then
+	echo "SKIP: mysqlcli/mysqlclo not found. Build with --enable-cla-mysql."
+	exit 2
+fi
+
+if ! command -v mysql >/dev/null 2>&1; then
+	echo "SKIP: mysql client not found. Install mariadb-client."
+	exit 2
+fi
+
+if ! $CLIENT -e "SELECT 1" >/dev/null 2>&1; then
+	echo "SKIP: cannot reach MySQL/MariaDB server at ${DBDUCT}."
+	exit 2
+fi
+
+# --- Clean slate ---
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -f "mysqlcli" 2>/dev/null
+pkill -9 -f "mysqlclo" 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile1 sendfile
+
+$CLIENT -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB}\`;
+	DROP TABLE IF EXISTS \`${MYSQL_DB}\`.\`loopback\`;" 2>/dev/null
+
+# --- Generate runtime configs ---
+
+CONFIGDIR="./config"
+sed -e "s|DBDUCT|${DBDUCT}|g" -e "s|DBNAME|${MYSQL_DB}|g" \
+	-e "s|DBARGS|${DBARGS}|g" \
+	"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+sed -e "s|DBDUCT|${DBDUCT}|g" \
+	"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+sed -i "s|config/loopback.ipnrc|config/loopback_runtime.ipnrc|g" \
+	"${CONFIGDIR}/loopback_runtime.bprc"
+
+# --- Start ION ---
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+
+echo "Waiting for MySQL CLAs to start..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	if pgrep -f "mysqlcli" >/dev/null && pgrep -f "mysqlclo" >/dev/null; then
+		echo "MySQL CLAs are running."
+		break
+	fi
+	sleep 1
+done
+sleep 2
+
+if ! pgrep -f "mysqlcli" >/dev/null || ! pgrep -f "mysqlclo" >/dev/null; then
+	echo "ERROR: MySQL CLAs did not start."
+	tail -30 ion.log 2>/dev/null
+	ionstop
+	killm
+	exit 1
+fi
+
+# --- Send a file to ourselves (real source EID ipn:1.1 so the cli's
+#     own-node filter matches). ---
+
+echo "MySQL CLA loopback test payload" > sendfile
+
+echo "Starting bprecvfile on ipn:1.2..."
+bprecvfile ipn:1.2 &
+BPRECV_PID=$!
+sleep 1
+
+echo "Sending file from ipn:1.1 to ipn:1.2..."
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 6
+
+echo "Checking received data..."
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "SUCCESS: file received via MySQL CLA loopback."
+else
+	echo "FAILURE: file not received or mismatched."
+	echo "--- rows left in table ---"
+	$CLIENT -e "SELECT id,length,src_eid,dst_eid FROM \`${MYSQL_DB}\`.\`loopback\`" 2>/dev/null
+	tail -30 ion.log 2>/dev/null
+	FAIL=1
+fi
+
+# --- Teardown ---
+
+echo "Cleaning up..."
+kill $BPRECV_PID 2>/dev/null
+wait $BPRECV_PID 2>/dev/null
+pkill -9 -f "mysqlcli" 2>/dev/null
+pkill -9 -f "mysqlclo" 2>/dev/null
+sleep 1
+ionstop
+sleep 1
+killm
+
+$CLIENT -e "DROP TABLE IF EXISTS \`${MYSQL_DB}\`.\`loopback\`;" 2>/dev/null
+rm -f testfile1 sendfile
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL

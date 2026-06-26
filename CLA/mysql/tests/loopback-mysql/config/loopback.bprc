@@ -1,0 +1,23 @@
+# bprc configuration file for the MySQL CLA loopback test.
+# Command: % bpadmin loopback.bprc
+#
+# DBDUCT / DBNAME / DBARGS are substituted by the dotest script at
+# runtime.  The induct and outduct share one table ("loopback") so a
+# bundle written by mysqlclo is picked up again by mysqlcli on the same
+# node.
+
+1
+
+a scheme ipn 'ipnfw' 'ipnadminep'
+
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+
+a protocol mysql 262144 0
+
+a induct  mysql DBDUCT 'mysqlcli -d DBNAME -T loopback DBARGS'
+a outduct mysql DBDUCT 'mysqlclo -d DBNAME -T loopback DBARGS'
+
+r 'ipnadmin config/loopback.ipnrc'
+
+s
