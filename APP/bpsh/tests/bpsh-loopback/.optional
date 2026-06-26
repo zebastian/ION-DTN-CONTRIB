@@ -1,0 +1,1 @@
+Requires a running ION node (and rsync for the directory-sync case); not part of standard regression suite.

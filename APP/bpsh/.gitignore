@@ -1,0 +1,7 @@
+# bpsh-loopback test run artifacts
+tests/*/ion.log
+tests/*/bpshd.log
+tests/*/bpshd.pid
+tests/*/out.case*
+tests/*/err.case*
+tests/*/rsync.*

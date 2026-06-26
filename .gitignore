@@ -25,10 +25,13 @@ Makefile.in
 
 # Generated man pages
 CLA/mqtt/doc/*.1
+APP/bpsh/doc/*.1
 
 # Built daemons
 CLA/mqtt/mqttcli
 CLA/mqtt/mqttclo
+APP/bpsh/bpsh
+APP/bpsh/bpshd
 
 # Test run artifacts
 CLA/*/tests/*/ion.log

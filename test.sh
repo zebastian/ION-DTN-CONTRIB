@@ -1,20 +1,21 @@
 #!/bin/sh
 # test.sh — run the test suites bundled with the ION-DTN-CONTRIB contributions.
 #
-# Exercises each selected convergence-layer adapter's tests/ folder, running
-# every test directory's `dotest` (ION's test convention: exit 0 = pass) and
-# its `cleanup` afterwards.
+# Exercises each selected contribution's tests/ folder, running every test
+# directory's `dotest` (ION's test convention: exit 0 = pass) and its `cleanup`
+# afterwards.
 #
 # Usage:
-#   ./test.sh                  run every CLA's tests (same as ALL)
-#   ./test.sh ALL              run every CLA's tests
-#   ./test.sh CLA_MQTT [...]   run only the named CLA(s)
+#   ./test.sh                  run every contribution's tests (same as ALL)
+#   ./test.sh ALL              run every contribution's tests
+#   ./test.sh CLA_MQTT [...]   run only the named contribution(s)
 #
-# CLA tokens map to directories under CLA/: CLA_MQTT -> CLA/mqtt.
+# Tokens map <KIND>_<NAME> to the directory <KIND>/<name>:
+#   CLA_MQTT -> CLA/mqtt, APP_BPSH -> APP/bpsh.
 #
 # A test directory marked `.optional` (e.g. one needing an external broker)
 # that fails is reported but does NOT fail the overall run; any non-optional
-# failure makes test.sh exit non-zero. If a CLA provides its own
+# failure makes test.sh exit non-zero. If a contribution provides its own
 # tests/runtests script it is used instead of the built-in loop.
 
 set -u
@@ -82,37 +83,38 @@ run_cla() {
 	done
 }
 
-# Resolve the list of CLA directories from the arguments (default: ALL).
-clas=
+# Resolve the list of contribution directories from the arguments (default: ALL).
+contribs=
 if [ "$#" -eq 0 ]; then
 	set -- ALL
 fi
 for arg in "$@"; do
 	case $arg in
 	ALL)
-		for d in "$ROOT"/CLA/*/; do
+		for d in "$ROOT"/CLA/*/ "$ROOT"/APP/*/; do
 			[ -d "$d" ] || continue
-			clas="$clas ${d%/}"
+			contribs="$contribs ${d%/}"
 		done
 		;;
-	CLA_*)
-		name=$(printf '%s' "${arg#CLA_}" | tr 'A-Z' 'a-z')
-		dir="$ROOT/CLA/$name"
+	CLA_* | APP_*)
+		kind=${arg%%_*}
+		name=$(printf '%s' "${arg#*_}" | tr 'A-Z' 'a-z')
+		dir="$ROOT/$kind/$name"
 		if [ ! -d "$dir" ]; then
-			echo "error: unknown CLA '$arg' (no $dir)" >&2
+			echo "error: unknown contribution '$arg' (no $dir)" >&2
 			exit 1
 		fi
-		clas="$clas $dir"
+		contribs="$contribs $dir"
 		;;
 	*)
 		echo "error: unrecognised argument '$arg'" >&2
-		echo "       expected ALL or CLA_<NAME> tokens." >&2
+		echo "       expected ALL or CLA_<NAME> / APP_<NAME> tokens." >&2
 		exit 1
 		;;
 	esac
 done
 
-for dir in $clas; do
+for dir in $contribs; do
 	run_cla "$dir"
 done
 

@@ -76,7 +76,8 @@ AC_CHECK_PROG([POD2MAN], [pod2man], [pod2man])
 AM_CONDITIONAL([HAVE_POD2MAN], [test "x$POD2MAN" != "x"])
 
 AC_CONFIG_FILES([Makefile
-                 CLA/mqtt/Makefile])
+                 CLA/mqtt/Makefile
+                 APP/bpsh/Makefile])
 AC_OUTPUT
 
 echo

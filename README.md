@@ -18,13 +18,15 @@ This repository collects contributions extending ION-DTN:
 Contributions are built against an **installed** ION-DTN.
 
 On Debian/Ubuntu, install the build prerequisites first with `install-deps.sh`.
-It installs the general toolchain and, optionally, each selected CLA's own
-dependencies:
+It installs the general toolchain and, optionally, each selected contribution's
+own dependencies. Contributions are selected with `<KIND>_<NAME>` tokens that
+map to the directory `<KIND>/<name>` (e.g. `CLA_MQTT` -> `CLA/mqtt`,
+`APP_BPSH` -> `APP/bpsh`):
 
 ```bash
 ./install-deps.sh            # general build deps only
-./install-deps.sh ALL        # general deps + every CLA
-./install-deps.sh CLA_MQTT   # general deps + the named CLA(s)
+./install-deps.sh ALL        # general deps + every contribution
+./install-deps.sh APP_BPSH   # general deps + the named contribution(s)
 ```
 
 Then build:
@@ -42,12 +44,13 @@ build notes and dependencies live in each sub-project's `README.md`.
 
 ## Testing
 
-`test.sh` exercises each selected contribution's `tests/` folder:
+`test.sh` exercises each selected contribution's `tests/` folder, using the
+same `ALL` / `<KIND>_<NAME>` selection as `install-deps.sh`:
 
 ```bash
-./test.sh                run every CLA's tests
-./test.sh ALL            run every CLA's tests
-./test.sh CLA_MQTT       run only the named CLA(s)
+./test.sh                run every contribution's tests
+./test.sh ALL            run every contribution's tests
+./test.sh APP_BPSH       run only the named contribution(s)
 ```
 
 Each test directory's `dotest` is run (exit 0 = pass) followed by its

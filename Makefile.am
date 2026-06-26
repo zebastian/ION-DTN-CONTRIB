@@ -1,7 +1,7 @@
 ACLOCAL_AMFLAGS = -I m4
 
 # One subdirectory per contribution.
-SUBDIRS = CLA/mqtt
+SUBDIRS = CLA/mqtt APP/bpsh
 
 # Vendored ION-DTN private headers, shared by all contributions (see
 # include/README).
