@@ -2,6 +2,8 @@
 # Process this file with autoreconf to produce a configure script.
 #
 # ION-DTN-CONTRIB builds against an *installed* ION-DTN (see --with-ion).
+# Each contribution's own configure logic lives in its subfolder's
+# configure.m4, m4_include'd below (one line per contribution).
 
 AC_PREREQ([2.69])
 AC_INIT([ion-dtn-contrib],[0.1.0],[https://github.com/nasa-jpl/ION-DTN/issues])
@@ -14,35 +16,13 @@ AC_PROG_CC
 AC_PROG_INSTALL
 AC_PROG_MKDIR_P
 
-#
-# Per-contribution selection (mirrors the ALL / <KIND>_<NAME> tokens used by
-# install-deps.sh and test.sh). Nothing is built by default: opt in to each
-# contribution with --enable-<contrib>, or build everything with --enable-all.
-# A contribution's own dependency checks below are skipped when it is not
-# selected, so e.g. building only bpsh does not require the Paho MQTT library.
-#
+# Nothing is built by default; opt in with --enable-<contrib> or --enable-all.
 AC_ARG_ENABLE([all],
   [AS_HELP_STRING([--enable-all], [build every contribution])],
   [enable_all=$enableval], [enable_all=no])
-AC_ARG_ENABLE([cla-mqtt],
-  [AS_HELP_STRING([--enable-cla-mqtt], [build the MQTT CLA (CLA/mqtt)])],
-  [enable_cla_mqtt=$enableval], [enable_cla_mqtt=])
-AC_ARG_ENABLE([app-bpsh],
-  [AS_HELP_STRING([--enable-app-bpsh], [build the bpsh app (APP/bpsh)])],
-  [enable_app_bpsh=$enableval], [enable_app_bpsh=])
-AC_ARG_ENABLE([cla-mysql],
-  [AS_HELP_STRING([--enable-cla-mysql], [build the MySQL CLA (CLA/mysql)])],
-  [enable_cla_mysql=$enableval], [enable_cla_mysql=])
-
-# --enable-all sets the default for any contribution not named explicitly, so
-# --enable-all --disable-cla-mqtt still works.
 AS_IF([test "x$enable_all" = xyes], [contrib_default=yes], [contrib_default=no])
-test -z "$enable_cla_mqtt" && enable_cla_mqtt=$contrib_default
-test -z "$enable_app_bpsh" && enable_app_bpsh=$contrib_default
-test -z "$enable_cla_mysql" && enable_cla_mysql=$contrib_default
-
-AS_IF([test "x$enable_cla_mqtt$enable_app_bpsh$enable_cla_mysql" = xnonono],
-  [AC_MSG_WARN([no contributions selected; pass --enable-all or --enable-<contrib> (e.g. --enable-app-bpsh)])])
+contrib_selected=no
+contrib_status=
 
 #
 # Locate the installed ION-DTN (headers + libraries).
@@ -77,71 +57,27 @@ LDFLAGS="$save_LDFLAGS"
 # link lines, so clear them back out here.
 LIBS="$save_LIBS"
 
-#
-# pthread (used by the MQTT input daemon).
-#
+# pthread is used by all of the daemons.
 AC_CHECK_LIB([pthread], [pthread_create], [],
   [AC_MSG_ERROR([libpthread is required.])])
 
-#
-# Eclipse Paho MQTT C client (mirrors ION's own --with-paho-mqtt logic):
-# prefer the TLS-capable libpaho-mqtt3cs, fall back to libpaho-mqtt3c.
-# Only required when the MQTT CLA is enabled.
-#
-AS_IF([test "x$enable_cla_mqtt" = xyes], [
-  save_LIBS="$LIBS"
-  AC_CHECK_LIB([paho-mqtt3cs], [MQTTClient_create],
-    [MQTT_LIBS="-lpaho-mqtt3cs"],
-    [AC_CHECK_LIB([paho-mqtt3c], [MQTTClient_create],
-      [MQTT_LIBS="-lpaho-mqtt3c"
-       AC_MSG_WARN([Only libpaho-mqtt3c found (no TLS). MQTT TLS options will not work.])],
-      [AC_MSG_ERROR([Neither libpaho-mqtt3cs nor libpaho-mqtt3c found. Install the Eclipse Paho MQTT C client library, or pass --disable-cla-mqtt.])])])
-  LIBS="$save_LIBS"
-  AC_CHECK_HEADER([MQTTClient.h], [],
-    [AC_MSG_ERROR([MQTTClient.h not found. Install the Eclipse Paho MQTT C client development headers, or pass --disable-cla-mqtt.])])
-])
-AC_SUBST([MQTT_LIBS])
-
-#
-# MySQL / MariaDB client library (via mariadb_config or mysql_config).
-# Only required when the MySQL CLA is enabled.
-#
-AS_IF([test "x$enable_cla_mysql" = xyes], [
-  AC_CHECK_PROGS([MYSQL_CONFIG], [mariadb_config mysql_config], [no])
-  AS_IF([test "x$MYSQL_CONFIG" = xno],
-    [AC_MSG_ERROR([Neither mariadb_config nor mysql_config found. Install libmariadb-dev (or libmysqlclient-dev), or pass --disable-cla-mysql.])])
-  MYSQL_CFLAGS=`$MYSQL_CONFIG --include 2>/dev/null`
-  AS_IF([test -z "$MYSQL_CFLAGS"], [MYSQL_CFLAGS=`$MYSQL_CONFIG --cflags`])
-  MYSQL_LIBS=`$MYSQL_CONFIG --libs`
-  save_CPPFLAGS="$CPPFLAGS"
-  CPPFLAGS="$CPPFLAGS $MYSQL_CFLAGS"
-  AC_CHECK_HEADER([mysql.h], [],
-    [AC_MSG_ERROR([mysql.h not found via $MYSQL_CONFIG. Install the client development headers, or pass --disable-cla-mysql.])])
-  CPPFLAGS="$save_CPPFLAGS"
-])
-AC_SUBST([MYSQL_CFLAGS])
-AC_SUBST([MYSQL_LIBS])
-
-AM_CONDITIONAL([ENABLE_CLA_MQTT], [test "x$enable_cla_mqtt" = xyes])
-AM_CONDITIONAL([ENABLE_APP_BPSH], [test "x$enable_app_bpsh" = xyes])
-AM_CONDITIONAL([ENABLE_CLA_MYSQL], [test "x$enable_cla_mysql" = xyes])
-
-#
 # Man pages are generated from POD only when pod2man is available.
-#
 AC_CHECK_PROG([POD2MAN], [pod2man], [pod2man])
 AM_CONDITIONAL([HAVE_POD2MAN], [test "x$POD2MAN" != "x"])
 
-AC_CONFIG_FILES([Makefile
-                 CLA/mqtt/Makefile
-                 CLA/mysql/Makefile
-                 APP/bpsh/Makefile])
+# One include per contribution (the configure analogue of SUBDIRS).
+m4_include([CLA/mqtt/configure.m4])
+m4_include([CLA/mysql/configure.m4])
+m4_include([APP/bpsh/configure.m4])
+
+AS_IF([test "x$contrib_selected" = xno],
+  [AC_MSG_WARN([no contributions selected; pass --enable-all or --enable-<contrib> (e.g. --enable-app-bpsh)])])
+
+AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
 
 echo
 echo "  ION-DTN-CONTRIB configured"
 echo "    ION prefix ...... ${ion_prefix}"
-echo "    CLA/mqtt ........ ${enable_cla_mqtt} (${MQTT_LIBS:-n/a})"
-echo "    CLA/mysql ....... ${enable_cla_mysql} (${MYSQL_LIBS:-n/a})"
-echo "    APP/bpsh ........ ${enable_app_bpsh}"
+printf '%s\n' "$contrib_status"
 echo
