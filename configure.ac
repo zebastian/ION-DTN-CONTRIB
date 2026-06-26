@@ -7,7 +7,7 @@ AC_PREREQ([2.69])
 AC_INIT([ion-dtn-contrib],[0.1.0],[https://github.com/nasa-jpl/ION-DTN/issues])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
-AC_CONFIG_SRCDIR([CLA/mqtt/bpv7/mqtt/mqttclo.c])
+AC_CONFIG_SRCDIR([CLA/mqtt/src/mqttclo.c])
 AM_INIT_AUTOMAKE([subdir-objects foreign -Wall])
 
 AC_PROG_CC

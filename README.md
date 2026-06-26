@@ -10,8 +10,8 @@ This repository collects contributions extending ION-DTN:
 - other software
 
 ## Information about the Software 
-- The software in this repository is licensed under GPL.
-- Each sub-project is written and maintained by the author of that project
+- The software in this repository is licensed under MIT.
+- Each sub-project is written and maintained by the author of that project.
 
 ## Building
 

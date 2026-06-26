@@ -1,5 +1,6 @@
 # Autotools generated files (regenerate with: autoreconf -fi)
 /configure
+/configure~
 /aclocal.m4
 /autom4te.cache/
 /build-aux/
@@ -23,9 +24,12 @@ Makefile.in
 *.a
 
 # Generated man pages
-CLA/mqtt/bpv7/doc/*.1
+CLA/mqtt/doc/*.1
 
 # Built daemons
 CLA/mqtt/mqttcli
 CLA/mqtt/mqttclo
+
+# Test run artifacts
+CLA/*/tests/*/ion.log
 /.idea/

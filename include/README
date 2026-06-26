@@ -1,0 +1,14 @@
+Vendored ION-DTN private headers
+================================
+
+bpP.h is an internal Bundle Protocol header that ION-DTN does NOT install to
+its include prefix, yet the MQTT CLA sources require it. A verbatim copy is
+kept here so this contribution can be built against an *installed* ION without
+needing an ION source checkout.
+
+Provenance: ION-DTN 4.1.4, bpv7/library/bpP.h
+
+Keep this copy in sync with the ION-DTN version you have installed. The struct
+layouts it declares must match the installed libbp/libici, or the daemons will
+misbehave at runtime.
+1
