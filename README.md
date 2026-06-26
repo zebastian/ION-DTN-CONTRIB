@@ -15,7 +15,19 @@ This repository collects contributions extending ION-DTN:
 
 ## Building
 
-Contributions are built against an **installed** ION-DTN:
+Contributions are built against an **installed** ION-DTN.
+
+On Debian/Ubuntu, install the build prerequisites first with `install-deps.sh`.
+It installs the general toolchain and, optionally, each selected CLA's own
+dependencies:
+
+```bash
+./install-deps.sh            # general build deps only
+./install-deps.sh ALL        # general deps + every CLA
+./install-deps.sh CLA_MQTT   # general deps + the named CLA(s)
+```
+
+Then build:
 
 ```bash
 autoreconf -fi
