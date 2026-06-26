@@ -15,6 +15,32 @@ AC_PROG_INSTALL
 AC_PROG_MKDIR_P
 
 #
+# Per-contribution selection (mirrors the ALL / <KIND>_<NAME> tokens used by
+# install-deps.sh and test.sh). Nothing is built by default: opt in to each
+# contribution with --enable-<contrib>, or build everything with --enable-all.
+# A contribution's own dependency checks below are skipped when it is not
+# selected, so e.g. building only bpsh does not require the Paho MQTT library.
+#
+AC_ARG_ENABLE([all],
+  [AS_HELP_STRING([--enable-all], [build every contribution])],
+  [enable_all=$enableval], [enable_all=no])
+AC_ARG_ENABLE([cla-mqtt],
+  [AS_HELP_STRING([--enable-cla-mqtt], [build the MQTT CLA (CLA/mqtt)])],
+  [enable_cla_mqtt=$enableval], [enable_cla_mqtt=])
+AC_ARG_ENABLE([app-bpsh],
+  [AS_HELP_STRING([--enable-app-bpsh], [build the bpsh app (APP/bpsh)])],
+  [enable_app_bpsh=$enableval], [enable_app_bpsh=])
+
+# --enable-all sets the default for any contribution not named explicitly, so
+# --enable-all --disable-cla-mqtt still works.
+AS_IF([test "x$enable_all" = xyes], [contrib_default=yes], [contrib_default=no])
+test -z "$enable_cla_mqtt" && enable_cla_mqtt=$contrib_default
+test -z "$enable_app_bpsh" && enable_app_bpsh=$contrib_default
+
+AS_IF([test "x$enable_cla_mqtt$enable_app_bpsh" = xnono],
+  [AC_MSG_WARN([no contributions selected; pass --enable-all or --enable-<contrib> (e.g. --enable-app-bpsh)])])
+
+#
 # Locate the installed ION-DTN (headers + libraries).
 #
 AC_ARG_WITH([ion],
@@ -56,18 +82,24 @@ AC_CHECK_LIB([pthread], [pthread_create], [],
 #
 # Eclipse Paho MQTT C client (mirrors ION's own --with-paho-mqtt logic):
 # prefer the TLS-capable libpaho-mqtt3cs, fall back to libpaho-mqtt3c.
+# Only required when the MQTT CLA is enabled.
 #
-save_LIBS="$LIBS"
-AC_CHECK_LIB([paho-mqtt3cs], [MQTTClient_create],
-  [MQTT_LIBS="-lpaho-mqtt3cs"],
-  [AC_CHECK_LIB([paho-mqtt3c], [MQTTClient_create],
-    [MQTT_LIBS="-lpaho-mqtt3c"
-     AC_MSG_WARN([Only libpaho-mqtt3c found (no TLS). MQTT TLS options will not work.])],
-    [AC_MSG_ERROR([Neither libpaho-mqtt3cs nor libpaho-mqtt3c found. Install the Eclipse Paho MQTT C client library.])])])
-LIBS="$save_LIBS"
-AC_CHECK_HEADER([MQTTClient.h], [],
-  [AC_MSG_ERROR([MQTTClient.h not found. Install the Eclipse Paho MQTT C client development headers.])])
+AS_IF([test "x$enable_cla_mqtt" = xyes], [
+  save_LIBS="$LIBS"
+  AC_CHECK_LIB([paho-mqtt3cs], [MQTTClient_create],
+    [MQTT_LIBS="-lpaho-mqtt3cs"],
+    [AC_CHECK_LIB([paho-mqtt3c], [MQTTClient_create],
+      [MQTT_LIBS="-lpaho-mqtt3c"
+       AC_MSG_WARN([Only libpaho-mqtt3c found (no TLS). MQTT TLS options will not work.])],
+      [AC_MSG_ERROR([Neither libpaho-mqtt3cs nor libpaho-mqtt3c found. Install the Eclipse Paho MQTT C client library, or pass --disable-cla-mqtt.])])])
+  LIBS="$save_LIBS"
+  AC_CHECK_HEADER([MQTTClient.h], [],
+    [AC_MSG_ERROR([MQTTClient.h not found. Install the Eclipse Paho MQTT C client development headers, or pass --disable-cla-mqtt.])])
+])
 AC_SUBST([MQTT_LIBS])
+
+AM_CONDITIONAL([ENABLE_CLA_MQTT], [test "x$enable_cla_mqtt" = xyes])
+AM_CONDITIONAL([ENABLE_APP_BPSH], [test "x$enable_app_bpsh" = xyes])
 
 #
 # Man pages are generated from POD only when pod2man is available.
@@ -83,5 +115,6 @@ AC_OUTPUT
 echo
 echo "  ION-DTN-CONTRIB configured"
 echo "    ION prefix ...... ${ion_prefix}"
-echo "    MQTT libs ....... ${MQTT_LIBS}"
+echo "    CLA/mqtt ........ ${enable_cla_mqtt} (${MQTT_LIBS:-n/a})"
+echo "    APP/bpsh ........ ${enable_app_bpsh}"
 echo

@@ -1,7 +1,14 @@
 ACLOCAL_AMFLAGS = -I m4
 
-# One subdirectory per contribution.
-SUBDIRS = CLA/mqtt APP/bpsh
+# One subdirectory per contribution; each is included only when enabled at
+# configure time (see --disable-cla-mqtt / --disable-app-bpsh).
+SUBDIRS =
+if ENABLE_CLA_MQTT
+SUBDIRS += CLA/mqtt
+endif
+if ENABLE_APP_BPSH
+SUBDIRS += APP/bpsh
+endif
 
 # Vendored ION-DTN private headers, shared by all contributions (see
 # include/README).

@@ -31,11 +31,11 @@ map to the directory `<KIND>/<name>` (e.g. `CLA_MQTT` -> `CLA/mqtt`,
 ./install-deps.sh APP_BPSH   # general deps + the named contribution(s)
 ```
 
-Then build:
+Then build (selecting which contributions to build — see below):
 
 ```bash
 autoreconf -fi
-./configure
+./configure --enable-all
 make
 sudo make install
 ```
@@ -43,6 +43,18 @@ sudo make install
 `configure` locates the installed ION headers and libraries (default prefix
 `/usr/local`) and checks each contribution's own dependencies. Per-contribution
 build notes and dependencies live in each sub-project's `README.md`.
+
+Contributions are opt-in, the same way `install-deps.sh` and `test.sh` select
+them: nothing is built by default, so enable each one you want (or all of
+them). A contribution's dependency checks are skipped when it is not selected,
+so e.g. a bpsh-only build needs no Paho MQTT library:
+
+```bash
+./configure --enable-all                  # build/install every contribution
+./configure --enable-app-bpsh             # build/install only APP/bpsh
+./configure --enable-cla-mqtt             # build/install only CLA/mqtt
+./configure --enable-all --disable-cla-mqtt   # everything except CLA/mqtt
+```
 
 ## Testing
 
