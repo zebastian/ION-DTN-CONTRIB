@@ -17,3 +17,9 @@ doc/*.1
 # Built daemons
 quiccli
 quicclo
+
+# make check artifacts
+quicmsg_test
+quicmsg_test.log
+quicmsg_test.trs
+test-suite.log
