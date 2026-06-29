@@ -55,9 +55,7 @@ extern "C" {
 #define QMSG_REJECT_UNSUPPORTED	   0x01
 #define QMSG_REJECT_UNEXPECTED	   0x02
 
-/*	SESS_TERM message flags / reason codes.  NB: SESS_TERM and
- *	MSG_REJECT field layouts are modelled on TCPCLv4 pending final
- *	verification against draft sections 4.10.1 / 4.11.1.		*/
+/*	SESS_TERM message flags / reason codes (draft 4.10).		*/
 #define QMSG_TERM_FLAG_REPLY	   0x01
 #define QMSG_TERM_UNKNOWN	   0x00
 
@@ -102,14 +100,16 @@ typedef struct
 
 typedef struct
 {
-	uint8_t flags;
-	uint8_t reason;
+	uint8_t	       flags;
+	uint8_t	       reason;
+	const uint8_t *sessExt; /* session extension items (opaque).	*/
+	uint32_t       sessExtLen;
 } QuicSessTerm;
 
 typedef struct
 {
+	uint8_t rejectedType; /* type of the message being rejected.	*/
 	uint8_t reason;
-	uint8_t rejectedType;
 } QuicMsgReject;
 
 /*	Return the message type (buf[0]), or -1 if len == 0.		*/

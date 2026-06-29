@@ -92,11 +92,11 @@ static void test_small_messages(void)
 {
 	QuicXferRefuse refIn = { QMSG_REFUSE_NO_RESOURCES, 42 };
 	QuicXferRefuse refOut;
-	QuicSessTerm   termIn = { QMSG_TERM_FLAG_REPLY, QMSG_TERM_UNKNOWN };
-	QuicSessTerm   termOut;
-	QuicMsgReject  rejIn = { QMSG_REJECT_UNEXPECTED, QMSG_KEEPALIVE };
-	QuicMsgReject  rejOut;
-	int	       n;
+	QuicSessTerm termIn = { QMSG_TERM_FLAG_REPLY, QMSG_TERM_UNKNOWN, NULL, 0 };
+	QuicSessTerm  termOut;
+	QuicMsgReject rejIn = { QMSG_KEEPALIVE, QMSG_REJECT_UNEXPECTED };
+	QuicMsgReject rejOut;
+	int	      n;
 
 	n = quicMsgEncodeXferRefuse(buf, sizeof(buf), &refIn);
 	assert(n > 0 && quicMsgDecodeXferRefuse(buf, n, &refOut) == n);
@@ -109,11 +109,12 @@ static void test_small_messages(void)
 	n = quicMsgEncodeSessTerm(buf, sizeof(buf), &termIn);
 	assert(n > 0 && quicMsgDecodeSessTerm(buf, n, &termOut) == n);
 	assert(termOut.flags == QMSG_TERM_FLAG_REPLY);
+	assert(termOut.reason == QMSG_TERM_UNKNOWN && termOut.sessExtLen == 0);
 
 	n = quicMsgEncodeMsgReject(buf, sizeof(buf), &rejIn);
 	assert(n > 0 && quicMsgDecodeMsgReject(buf, n, &rejOut) == n);
-	assert(rejOut.reason == QMSG_REJECT_UNEXPECTED);
 	assert(rejOut.rejectedType == QMSG_KEEPALIVE);
+	assert(rejOut.reason == QMSG_REJECT_UNEXPECTED);
 }
 
 static void test_wrong_type(void)

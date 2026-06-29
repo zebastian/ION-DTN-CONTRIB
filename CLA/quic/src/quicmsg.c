@@ -328,6 +328,8 @@ int quicMsgEncodeSessTerm(uint8_t *buf, size_t cap, const QuicSessTerm *m)
 	wU8(&w, QMSG_SESS_TERM);
 	wU8(&w, m->flags);
 	wU8(&w, m->reason);
+	wU32(&w, m->sessExtLen);
+	wBytes(&w, m->sessExt, m->sessExtLen);
 	return w.ok ? (int) w.len : -1;
 }
 
@@ -344,6 +346,8 @@ int quicMsgDecodeSessTerm(const uint8_t *buf, size_t len, QuicSessTerm *m)
 	memset(m, 0, sizeof(*m));
 	m->flags = rU8(&r);
 	m->reason = rU8(&r);
+	m->sessExtLen = rU32(&r);
+	m->sessExt = rBytes(&r, m->sessExtLen);
 	return r.ok ? (int) r.off : 0;
 }
 
@@ -355,8 +359,8 @@ int quicMsgEncodeMsgReject(uint8_t *buf, size_t cap, const QuicMsgReject *m)
 
 	wInit(&w, buf, cap);
 	wU8(&w, QMSG_MSG_REJECT);
-	wU8(&w, m->reason);
 	wU8(&w, m->rejectedType);
+	wU8(&w, m->reason);
 	return w.ok ? (int) w.len : -1;
 }
 
@@ -371,7 +375,7 @@ int quicMsgDecodeMsgReject(const uint8_t *buf, size_t len, QuicMsgReject *m)
 	}
 
 	memset(m, 0, sizeof(*m));
-	m->reason = rU8(&r);
 	m->rejectedType = rU8(&r);
+	m->reason = rU8(&r);
 	return r.ok ? (int) r.off : 0;
 }
