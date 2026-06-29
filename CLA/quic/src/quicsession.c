@@ -77,6 +77,20 @@ typedef struct QuicConn
 	int	       xferLen;
 	uint64_t       xferBundleLen;
 	int	       xferActive;
+
+	/*	Receiver's cumulative XFER_ACK on the data stream: at most
+	 *	one in flight; a newer cumulative value supersedes a pending
+	 *	one.  Reclaimed via acked_stream_data_offset.		*/
+	uint8_t	      ackFlags;
+	uint16_t      ackSegId;
+	uint64_t      ackTransferId;
+	uint64_t      ackCumLen;  /* cumulative octets received.	*/
+	int	      ackPending; /* a value awaits sending.		*/
+	unsigned char ackBuf[24]; /* one XFER_ACK (20 octets).	*/
+	int	      ackBufLen;  /* 0 == buffer free for reuse.	*/
+	int	      ackBufOff;  /* octets handed to ngtcp2.		*/
+	uint64_t      dataTxOff;  /* octets we sent on the data stream.	*/
+	uint64_t      dataAckOff; /* octets of those acked.		*/
 } QuicConn;
 
 /*	QUICCL session states.						*/
@@ -529,6 +543,14 @@ static int xferReassemble(QuicConn *qc, const QuicXferSegment *seg,
 	memcpy(qc->xfer + qc->xferLen, segData, seg->segmentLength);
 	qc->xferLen += (int) seg->segmentLength;
 
+	/*	Queue a cumulative acknowledgement for this segment.	*/
+
+	qc->ackTransferId = seg->transferId;
+	qc->ackSegId = seg->segmentId;
+	qc->ackFlags = seg->flags;
+	qc->ackCumLen = (uint64_t) qc->xferLen;
+	qc->ackPending = 1;
+
 	if (seg->flags & QMSG_FLAG_END)
 	{
 		qc->xferActive = 0;
@@ -660,7 +682,13 @@ static int recvStreamDataCb(ngtcp2_conn *conn, uint32_t flags,
 	}
 	else if (datalen > 0)
 	{
-		/*	Any other stream carries bundle data.		*/
+		/*	Any other stream carries bundle data; remember it so
+		 *	the receiver can send XFER_ACKs back on it.		*/
+
+		if (qc->streamId < 0)
+		{
+			qc->streamId = stream_id;
+		}
 
 		if (qc->rxLen + (int) datalen > qc->rxCap)
 		{
@@ -701,12 +729,25 @@ static int recvStreamDataCb(ngtcp2_conn *conn, uint32_t flags,
 static int ackedOffsetCb(ngtcp2_conn *conn, int64_t stream_id, uint64_t offset,
 		uint64_t datalen, void *user_data, void *stream_user_data)
 {
+	QuicConn *qc = user_data;
+
 	(void) conn;
-	(void) stream_id;
 	(void) offset;
-	(void) datalen;
-	(void) user_data;
 	(void) stream_user_data;
+
+	/*	Track acknowledgement of our XFER_ACKs on the data stream so
+	 *	the single ACK buffer can be reused once fully acked.	*/
+
+	if (stream_id == qc->streamId)
+	{
+		qc->dataAckOff += datalen;
+		if (qc->ackBufOff >= qc->ackBufLen
+				&& qc->dataAckOff >= qc->dataTxOff)
+		{
+			qc->ackBufLen = 0; /* Buffer free.		*/
+		}
+	}
+
 	return 0;
 }
 
@@ -773,6 +814,36 @@ static void makePath(ngtcp2_path *path, ngtcp2_path_storage *ps, QuicConn *qc)
 	*path = ps->path;
 }
 
+/*	If an XFER_ACK is pending and the single ACK buffer is free, encode
+ *	the latest cumulative acknowledgement into it.  Called by the I/O
+ *	thread only, so the ACK fields need no lock.			*/
+
+static void prepareAck(QuicConn *qc)
+{
+	QuicXferAck ack;
+	int	    n;
+
+	if (!qc->ackPending || qc->ackBufLen != 0 || qc->streamId < 0)
+	{
+		return;
+	}
+
+	memset(&ack, 0, sizeof(ack));
+	ack.flags = qc->ackFlags;
+	ack.segmentId = qc->ackSegId;
+	ack.transferId = qc->ackTransferId;
+	ack.ackLength = qc->ackCumLen;
+	n = quicMsgEncodeXferAck(qc->ackBuf, sizeof(qc->ackBuf), &ack);
+	if (n < 0)
+	{
+		return;
+	}
+
+	qc->ackBufLen = n;
+	qc->ackBufOff = 0;
+	qc->ackPending = 0;
+}
+
 /*	Drain all packets ngtcp2 wants to send for this connection.	*/
 
 static int writeConn(QuicConn *qc)
@@ -782,6 +853,8 @@ static int writeConn(QuicConn *qc)
 	ngtcp2_path_storage ps;
 	ngtcp2_pkt_info	    pi;
 	ngtcp2_tstamp	    ts = quicNow();
+
+	prepareAck(qc);
 
 	for (;;)
 	{
@@ -825,6 +898,19 @@ static int writeConn(QuicConn *qc)
 
 		pthread_mutex_unlock(&s->mutex);
 
+		/*	Else drain the receiver's XFER_ACK (ACK fields are
+		 *	I/O-thread-only, so no lock needed).		*/
+
+		if (chan == 0 && qc->ackBufOff < qc->ackBufLen
+				&& qc->streamId >= 0)
+		{
+			curData = qc->ackBuf;
+			curOff = qc->ackBufOff;
+			curLen = qc->ackBufLen;
+			streamId = qc->streamId;
+			chan = 3;
+		}
+
 		if (chan != 0)
 		{
 			datav.base = (uint8_t *) curData + curOff;
@@ -857,6 +943,13 @@ static int writeConn(QuicConn *qc)
 			}
 
 			pthread_mutex_unlock(&s->mutex);
+
+			if (chan == 3)
+			{
+				qc->ackBufOff += (int) pdatalen;
+				qc->dataTxOff += (uint64_t) pdatalen;
+			}
+
 			qc->lastTx = ts; /* keepalive timer baseline.	*/
 		}
 
