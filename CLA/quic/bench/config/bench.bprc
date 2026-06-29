@@ -1,0 +1,10 @@
+# bprc for the QUIC CLA benchmark. QUICDUCT/CERT/KEY substituted at runtime.
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+a protocol quic 1400 100
+a induct  quic QUICDUCT 'quiccli -c CERT -k KEY'
+a outduct quic QUICDUCT 'quicclo -n'
+r 'ipnadmin config/bench_runtime.ipnrc'
+s

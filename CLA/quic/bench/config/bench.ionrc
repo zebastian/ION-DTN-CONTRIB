@@ -1,0 +1,8 @@
+# ionrc for the QUIC CLA benchmark (single node, high rates so the QUIC
+# CLA is the bottleneck rather than the contact/production limits).
+1 1 config/bench.ionconfig
+s
+a contact +1 +3600 1 1 1000000000
+a range +1 +3600 1 1 1
+m production 1000000000
+m consumption 1000000000

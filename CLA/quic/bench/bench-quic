@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# bench-quic — throughput benchmark for the QUIC CLA (quiccli / quicclo).
+#
+# Drives a single-node QUIC loopback with bpdriver -> [quic] -> bpcounter
+# over a sweep of bundle payload sizes and records the throughput each
+# size achieves.
+#
+# Tunables (env overridable):
+#   MESSAGE_SIZE_MIN  smallest payload, bytes   (default 1024)
+#   MESSAGE_SIZE_MAX  largest payload, bytes    (default 65536)
+#   CYCLES            bundles sent per size     (default 2000)
+#   QUIC_PORT         UDP port for the link     (default 4656)
+#
+# Output: a table on stdout and results.csv (size,bundles,seconds,mbps,bundles_per_s).
+#
+# Requires quiccli/quicclo (build with --enable-cla-quic), bpdriver,
+# bpcounter, and openssl.
+
+set -u
+
+MESSAGE_SIZE_MIN="${MESSAGE_SIZE_MIN:-1024}"
+MESSAGE_SIZE_MAX="${MESSAGE_SIZE_MAX:-65536}"
+CYCLES="${CYCLES:-2000}"
+QUIC_PORT="${QUIC_PORT:-4656}"
+QUICDUCT="127.0.0.1:${QUIC_PORT}"
+
+CONFIGDIR="./config"
+CERT="$(pwd)/server.pem"
+KEY="$(pwd)/server.key"
+RESULTS="$(pwd)/results.csv"
+
+for tool in quiccli quicclo bpdriver bpcounter openssl ionadmin; do
+	if ! command -v "$tool" >/dev/null 2>&1; then
+		echo "ERROR: '$tool' not found in PATH." >&2
+		exit 1
+	fi
+done
+
+cleanup_ion()
+{
+	pkill -9 -f "quiccli" 2>/dev/null
+	pkill -9 -f "quicclo" 2>/dev/null
+	pkill -9 -f "bpcounter" 2>/dev/null
+	ionstop >/dev/null 2>&1
+	killm >/dev/null 2>&1
+}
+
+echo "Starting QUIC CLA benchmark (cycles=$CYCLES, sizes ${MESSAGE_SIZE_MIN}..${MESSAGE_SIZE_MAX})"
+cleanup_ion
+sleep 1
+rm -f ion.log server.pem server.key
+echo "size_bytes,bundles,seconds,mbps,bundles_per_s" > "$RESULTS"
+
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ]; then
+	echo "ERROR: could not generate a certificate." >&2
+	exit 1
+fi
+
+sed -e "s|QUICDUCT|${QUICDUCT}|g" -e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
+	"${CONFIGDIR}/bench.bprc" > "${CONFIGDIR}/bench_runtime.bprc"
+sed -e "s|QUICDUCT|${QUICDUCT}|g" \
+	"${CONFIGDIR}/bench.ipnrc" > "${CONFIGDIR}/bench_runtime.ipnrc"
+sed -i "s|config/bench.ipnrc|config/bench_runtime.ipnrc|g" \
+	"${CONFIGDIR}/bench_runtime.bprc"
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/bench.ionrc" >/dev/null 2>&1
+sleep 1
+bpadmin "${CONFIGDIR}/bench_runtime.bprc" >/dev/null 2>&1
+sleep 3
+
+if ! pgrep -f "quiccli" >/dev/null || ! pgrep -f "quicclo" >/dev/null; then
+	echo "ERROR: QUIC CLAs did not start." >&2
+	tail -20 ion.log 2>/dev/null
+	cleanup_ion
+	exit 1
+fi
+
+printf '%12s %9s %9s %12s %14s\n' "size(B)" "bundles" "sec" "Mbps" "bundles/s"
+
+size="$MESSAGE_SIZE_MIN"
+while [ "$size" -le "$MESSAGE_SIZE_MAX" ]; do
+	: > counter.out
+
+	# Receiver counts CYCLES bundles, then reports time + throughput.
+	bpcounter ipn:1.2 "$CYCLES" > counter.out 2>&1 &
+	CPID=$!
+	sleep 1
+
+	# Sender streams CYCLES bundles of <size> bytes through the QUIC link.
+	# Negative size selects bpdriver's streaming mode (no per-bundle ack),
+	# which is the mode paired with bpcounter.
+	bpdriver "$CYCLES" ipn:1.1 ipn:1.2 "-$size" >/dev/null 2>&1
+
+	# Wait (bounded) for the receiver to finish counting.
+	for _ in $(seq 1 60); do
+		kill -0 "$CPID" 2>/dev/null || break
+		sleep 1
+	done
+	kill -9 "$CPID" 2>/dev/null
+
+	# bpcounter reports via PUTMEMO, which lands in counter.out or ion.log.
+	line=$(grep -h "Throughput (Mbps)" counter.out ion.log 2>/dev/null | tail -1)
+	mbps=$(echo "$line" | sed -E 's/.*Throughput \(Mbps\)[: ]+([0-9.]+).*/\1/')
+	tline=$(grep -h "Time (seconds)" counter.out ion.log 2>/dev/null | tail -1)
+	secs=$(echo "$tline" | sed -E 's/.*Time \(seconds\)[: ]+([0-9.]+).*/\1/')
+	[ -z "$mbps" ] && mbps="n/a"
+	[ -z "$secs" ] && secs="n/a"
+
+	if [ "$secs" != "n/a" ] && [ "$secs" != "0.000" ]; then
+		bps=$(awk -v c="$CYCLES" -v s="$secs" 'BEGIN{printf "%.0f", c/s}')
+	else
+		bps="n/a"
+	fi
+
+	printf '%12s %9s %9s %12s %14s\n' "$size" "$CYCLES" "$secs" "$mbps" "$bps"
+	echo "${size},${CYCLES},${secs},${mbps},${bps}" >> "$RESULTS"
+
+	size=$((size * 2))
+done
+
+echo "Results written to $RESULTS"
+cleanup_ion
+rm -f server.pem server.key counter.out
+rm -f "${CONFIGDIR}/bench_runtime.bprc" "${CONFIGDIR}/bench_runtime.ipnrc"
