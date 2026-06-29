@@ -10,10 +10,11 @@ B<quiccli> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-A> I<alpn>]
 =head1 DESCRIPTION
 
 B<quiccli> is a background "daemon" task that receives bundles from remote
-nodes over QUIC (RFC 9000), using ngtcp2 with the GnuTLS crypto backend.  It
-binds a UDP socket to I<host>:I<port> (default port 4556), accepts QUIC
-connections, reassembles the length-prefixed bundles carried on each
-connection's bidirectional stream, and injects them into ION.
+nodes over QUIC, implementing the QUICCL protocol of draft-caini-dtn-quiccl
+(ngtcp2 with the GnuTLS crypto backend).  It binds a UDP socket to
+I<host>:I<port> (default port 4560), accepts QUIC connections, reassembles the
+bundles carried as XFER_SEGMENT messages on each connection's data streams (or
+as QUIC datagrams), and injects them into ION.
 
 A server certificate (B<-c>) and private key (B<-k>) are required.  The duct
 name format is I<host>[:I<port>]; an empty I<host> binds all interfaces.
@@ -41,7 +42,7 @@ PEM file of trusted CA certificates for verifying clients (mutual TLS).
 
 =item B<-A> I<alpn>
 
-ALPN protocol identifier (default C<dtn>); must match the client.
+ALPN protocol identifier (default C<quicclav1>); must match the client.
 
 =item B<-t> I<idlesec>
 
@@ -65,7 +66,7 @@ B<quiccli> terminated abnormally; see the B<ion.log> file.
 
 =head1 EXAMPLES
 
-    a induct quic 0.0.0.0:4556 'quiccli -c /etc/quic/server.pem -k /etc/quic/server.key'
+    a induct quic 0.0.0.0:4560 'quiccli -c /etc/quic/server.pem -k /etc/quic/server.key'
 
 =head1 SEE ALSO
 

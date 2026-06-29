@@ -5,14 +5,17 @@ quicclo - DTN QUIC convergence layer output task
 =head1 SYNOPSIS
 
 B<quicclo> [B<-C> I<cafile>] [B<-c> I<cert>] [B<-k> I<key>] [B<-A> I<alpn>]
-[B<-n>] [B<-t> I<idlesec>] I<host>[:I<port>]
+[B<-n>] [B<-u>] [B<-t> I<idlesec>] I<host>[:I<port>]
 
 =head1 DESCRIPTION
 
 B<quicclo> is a background "daemon" task that transmits bundles to a remote
-node over QUIC (RFC 9000), using ngtcp2 with the GnuTLS crypto backend.  It
-opens a QUIC connection to I<host>:I<port> (default port 4556) and writes
-each outbound bundle, length-prefixed, on a single bidirectional stream.
+node over QUIC, implementing the QUICCL protocol of draft-caini-dtn-quiccl
+(ngtcp2 with the GnuTLS crypto backend).  It opens a QUIC connection to
+I<host>:I<port> (default port 4560), performs the QUICCL session handshake on
+stream 0, and transmits each bundle as one or more XFER_SEGMENT messages on a
+priority-mapped data stream.  With B<-u> the unreliable service is used,
+sending bundles as QUIC datagrams instead.
 
 The duct name format is I<host>[:I<port>], identifying the B<quiccli> server.
 By default the server's certificate is verified against the system trust
@@ -42,11 +45,16 @@ Client private key (PEM) for mutual TLS.
 
 =item B<-A> I<alpn>
 
-ALPN protocol identifier (default C<dtn>); must match the server.
+ALPN protocol identifier (default C<quicclav1>); must match the server.
 
 =item B<-n>
 
 Do not verify the server certificate.
+
+=item B<-u>
+
+Use the unreliable service, carrying bundles in QUIC datagrams (no
+acknowledgement) rather than on reliable streams.
 
 =item B<-t> I<idlesec>
 
@@ -70,7 +78,7 @@ B<quicclo> terminated abnormally; see the B<ion.log> file.
 
 =head1 EXAMPLES
 
-    a outduct quic peer.example:4556 'quicclo -C /etc/quic/ca.pem'
+    a outduct quic peer.example:4560 'quicclo -C /etc/quic/ca.pem'
 
 =head1 SEE ALSO
 
