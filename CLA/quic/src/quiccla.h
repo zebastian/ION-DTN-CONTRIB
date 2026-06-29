@@ -44,6 +44,7 @@ typedef struct
 	char alpn[QUIC_MAX_ALPN_LEN];
 	int  idleSec;
 	int  unreliable;		  /* use QUIC datagrams, not streams.	*/
+	int  segmentMru; /* advertised Segment MRU; 0 = default.	*/
 } QuicClaConfig;
 
 /*
@@ -99,6 +100,7 @@ static int parseQuicDuctName(const char *ductName, char *host, int *port)
  *   -A <alpn>      ALPN protocol id (default "quicclav1")
  *   -n             client: do not verify server certificate
  *   -u             use the unreliable (QUIC datagram) service
+ *   -S <bytes>     advertised Segment MRU (default = max bundle size)
  *   -t <seconds>   idle timeout (default 30)
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
@@ -139,6 +141,10 @@ static int parseQuicArgs(int argc, char *argv[], QuicClaConfig *cfg)
 		else if (strcmp(argv[i], "-u") == 0)
 		{
 			cfg->unreliable = 1;
+		}
+		else if (strcmp(argv[i], "-S") == 0 && i + 1 < argc)
+		{
+			cfg->segmentMru = atoi(argv[++i]);
 		}
 		else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)
 		{

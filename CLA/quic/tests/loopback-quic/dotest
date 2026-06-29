@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# Loopback test for the QUIC CLA (quiccli / quicclo).
+# Loopback test for the QUIC CLA (quiccli / quicclo), reliable service.
 #
-# A single ION node sends a file to itself over QUIC: quicclo (client)
-# connects to quiccli (server) on 127.0.0.1 and the bundle is carried on
-# a QUIC stream, then injected and delivered locally.
+# A single ION node sends to itself over QUIC and exercises: a single
+# segment transfer, a multi-segment transfer (Segment MRU forced small
+# with -S), multiple streamed bundles, priority->stream routing (a
+# bundle with a high ECOS ordinal must use the expedited stream 4), and
+# graceful SESS_TERM on shutdown.
 #
-# Requires openssl (to generate a throwaway self-signed cert).
+# Requires openssl plus the standard bp test tools.
 #
 
 QUIC_PORT="${QUIC_PORT:-4656}"
@@ -19,21 +21,21 @@ echo "########################################"
 echo
 pwd | sed "s/\/.*\///" | xargs echo "NAME: "
 echo
-echo "PURPOSE: Testing the QUIC CLA with a single-node loopback."
+echo "PURPOSE: Testing the QUIC CLA reliable service (segmentation,"
+echo "         multiple bundles, priority streams, termination)."
 echo
 echo "########################################"
 
 FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
 
-if ! command -v quiccli >/dev/null 2>&1 || ! command -v quicclo >/dev/null 2>&1; then
-	echo "SKIP: quiccli/quicclo not found. Build with --enable-cla-quic."
-	exit 2
-fi
-
-if ! command -v openssl >/dev/null 2>&1; then
-	echo "SKIP: openssl not found (needed to generate a test certificate)."
-	exit 2
-fi
+for t in quiccli quicclo openssl bpsendfile bprecvfile bpdriver bpcounter \
+	bptrace; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
 
 echo "Killing old ION..."
 killm >/dev/null 2>&1
@@ -41,7 +43,7 @@ pkill -9 -f "quiccli" 2>/dev/null
 pkill -9 -f "quicclo" 2>/dev/null
 ./cleanup 2>/dev/null
 sleep 1
-rm -f ion.log testfile1 sendfile "$CERT" "$KEY"
+rm -f ion.log testfile* sendfile bigfile counter.out "$CERT" "$KEY"
 
 echo "Generating self-signed certificate..."
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -52,7 +54,6 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
 	exit 2
 fi
 
-# Generate runtime configs.
 sed -e "s|QUICDUCT|${QUICDUCT}|g" -e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
 	"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
 sed -e "s|QUICDUCT|${QUICDUCT}|g" \
@@ -76,34 +77,76 @@ sleep 2
 if ! pgrep -f "quiccli" >/dev/null || ! pgrep -f "quicclo" >/dev/null; then
 	echo "ERROR: QUIC CLAs did not start."
 	tail -30 ion.log 2>/dev/null
-	ionstop
-	killm
+	ionstop; killm
 	exit 1
 fi
 
-echo "QUIC CLA loopback test payload" > sendfile
-
-echo "Starting bprecvfile on ipn:1.2..."
-bprecvfile ipn:1.2 &
-BPRECV_PID=$!
+# --- Phase 1: single-segment transfer ----------------------------------
+echo "Phase 1: single-segment file..."
+head -c 64 /dev/urandom | base64 | head -c 64 > sendfile
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
 sleep 1
-
-echo "Sending file from ipn:1.1 to ipn:1.2..."
 bpsendfile ipn:1.1 ipn:1.2 sendfile
-sleep 6
-
-echo "Checking received data..."
+sleep 4
 if [ -f testfile1 ] && cmp -s sendfile testfile1; then
-	echo "SUCCESS: file received via QUIC CLA loopback."
+	echo "  PASS: single-segment bundle delivered."
 else
-	echo "FAILURE: file not received or mismatched."
-	tail -30 ion.log 2>/dev/null
-	FAIL=1
+	fail "single-segment bundle not delivered."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+# --- Phase 2: multi-segment transfer (6 KB > 2000-byte Segment MRU) -----
+echo "Phase 2: multi-segment file (~6 KB, Segment MRU 2000)..."
+head -c 6000 /dev/urandom | base64 | head -c 6000 > bigfile
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 bigfile
+sleep 5
+if [ -f testfile1 ] && cmp -s bigfile testfile1; then
+	echo "  PASS: multi-segment bundle reassembled."
+else
+	fail "multi-segment bundle not reassembled."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+# --- Phase 3: multiple streamed bundles --------------------------------
+echo "Phase 3: 50 streamed bundles..."
+bpcounter ipn:1.2 50 > counter.out 2>&1 & CP=$!
+sleep 1
+bpdriver 50 ipn:1.1 ipn:1.2 -1024 >/dev/null 2>&1
+for i in $(seq 1 30); do kill -0 $CP 2>/dev/null || break; sleep 1; done
+kill -9 $CP 2>/dev/null
+if grep -q "bundles received: 50" counter.out; then
+	echo "  PASS: 50 bundles received."
+else
+	fail "did not receive 50 bundles ($(grep -o 'received: [0-9]*' \
+		counter.out | tail -1))."
+fi
+
+# --- Phase 4: priority -> stream routing -------------------------------
+echo "Phase 4: high-priority bundle must use the expedited stream 4..."
+# Class of service custody.priority.ordinal = 0.2.200 (ordinal>=192).
+bptrace ipn:1.1 ipn:1.2 dtn:none 300 0.2.200 "priority probe" >/dev/null 2>&1
+sleep 3
+if grep -q "sending bundles on stream 4" ion.log; then
+	echo "  PASS: expedited bundle routed to stream 4."
+else
+	fail "expedited bundle not routed to stream 4."
+fi
+
+# --- Phase 5: graceful SESS_TERM on shutdown ---------------------------
+echo "Phase 5: graceful SESS_TERM..."
+pkill -TERM -x quicclo 2>/dev/null
+sleep 3
+if grep -q "received SESS_TERM" ion.log; then
+	echo "  PASS: peer received SESS_TERM."
+else
+	fail "no SESS_TERM observed on shutdown."
 fi
 
 echo "Cleaning up..."
-kill $BPRECV_PID 2>/dev/null
-wait $BPRECV_PID 2>/dev/null
 pkill -9 -f "quiccli" 2>/dev/null
 pkill -9 -f "quicclo" 2>/dev/null
 sleep 1
@@ -111,7 +154,8 @@ ionstop
 sleep 1
 killm
 
-rm -f testfile1 sendfile "$CERT" "$KEY"
+rm -f testfile* sendfile bigfile counter.out bpdriverAduFile bpacq.* \
+	"$CERT" "$KEY"
 rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
 
 exit $FAIL

@@ -4,7 +4,7 @@ a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
 a protocol quic 1400 100
-a induct  quic QUICDUCT 'quiccli -c CERT -k KEY'
+a induct  quic QUICDUCT 'quiccli -c CERT -k KEY -S 2000'
 a outduct quic QUICDUCT 'quicclo -n'
 r 'ipnadmin config/loopback_runtime.ipnrc'
 s

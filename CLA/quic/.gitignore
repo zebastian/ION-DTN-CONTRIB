@@ -3,6 +3,12 @@ tests/*/ion.log
 tests/*/config/*_runtime.*
 tests/*/server.pem
 tests/*/server.key
+tests/*/testfile*
+tests/*/sendfile
+tests/*/bigfile
+tests/*/counter.out
+tests/*/bpacq.*
+tests/*/bpdriverAduFile
 bench/ion.log
 bench/results.csv
 bench/server.pem

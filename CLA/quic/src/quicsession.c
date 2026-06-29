@@ -44,6 +44,7 @@ typedef struct QuicConn
 	struct sockaddr_storage local;
 	socklen_t		localLen;
 	int64_t			sendStreamId;	/* client: chosen send stream.*/
+	int64_t			lastSentStream; /* last logged send stream.	*/
 	int64_t			ackStreamId;	/* server: current ack stream.*/
 	int64_t			dataStreams[4]; /* client priority streams.	*/
 	int			dataStreamsOpen;
@@ -271,7 +272,8 @@ static int sendSessInit(QuicConn *qc)
 	 *	timeout (cfg.idleSec) so the session stays live when idle.	*/
 
 	init.keepalive = (uint16_t) (s->cfg.idleSec > 1 ? s->cfg.idleSec / 2 : 1);
-	init.segmentMru = QUICCLA_BUFSZ;
+	init.segmentMru = s->cfg.segmentMru > 0 ? (uint64_t) s->cfg.segmentMru :
+						  QUICCLA_BUFSZ;
 	init.datagramMru = 0;
 	init.transferMru = QUICCLA_BUFSZ;
 	isprintf(nodeId, sizeof(nodeId), "ipn:" UVAST_FIELDSPEC ".0",
@@ -431,6 +433,7 @@ static int sessParseSig(QuicConn *qc)
 			}
 
 			qc->sessState = QSS_ENDING;
+			writeMemo("[i] quic: received SESS_TERM.");
 			if (!qc->termSent)
 			{
 				oK(sendSessTerm(qc, QMSG_TERM_UNKNOWN, 1));
@@ -1311,6 +1314,7 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 	memset(qc, 0, sizeof(*qc));
 	qc->owner = s;
 	qc->sendStreamId = -1;
+	qc->lastSentStream = -1;
 	qc->ackStreamId = -1;
 	qc->dataStreams[0] = qc->dataStreams[1] = qc->dataStreams[2] =
 			qc->dataStreams[3] = -1;
@@ -1845,6 +1849,17 @@ int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
 	qc->sendStreamId = priorityStream(qc, ordinal);
 	pthread_mutex_unlock(&s->mutex);
 
+	if (qc->sendStreamId != qc->lastSentStream)
+	{
+		char memoBuf[80];
+
+		isprintf(memoBuf, sizeof(memoBuf),
+				"[i] quic: sending bundles on stream %d.",
+				(int) qc->sendStreamId);
+		writeMemo(memoBuf);
+		qc->lastSentStream = qc->sendStreamId;
+	}
+
 	wakeIo(s);
 
 	pthread_mutex_lock(&s->mutex);
@@ -2018,6 +2033,7 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 	memset(qc, 0, sizeof(*qc));
 	qc->owner = s;
 	qc->sendStreamId = -1;
+	qc->lastSentStream = -1;
 	qc->ackStreamId = -1;
 	qc->dataStreams[0] = qc->dataStreams[1] = qc->dataStreams[2] =
 			qc->dataStreams[3] = -1;
