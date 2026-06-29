@@ -81,20 +81,22 @@ if ! pgrep -f "quiccli" >/dev/null || ! pgrep -f "quicclo" >/dev/null; then
 	exit 1
 fi
 
-echo "QUIC CLA loopback test payload" > sendfile
+# A multi-kilobyte payload spans several QUIC datagrams, exercising
+# datagram segmentation and reassembly.
+head -c 5000 /dev/urandom | base64 | head -c 5000 > sendfile
 
 echo "Starting bprecvfile on ipn:1.2..."
 bprecvfile ipn:1.2 &
 BPRECV_PID=$!
 sleep 1
 
-echo "Sending file from ipn:1.1 to ipn:1.2..."
+echo "Sending multi-datagram file from ipn:1.1 to ipn:1.2..."
 bpsendfile ipn:1.1 ipn:1.2 sendfile
 sleep 6
 
 echo "Checking received data..."
 if [ -f testfile1 ] && cmp -s sendfile testfile1; then
-	echo "SUCCESS: file received via QUIC CLA loopback."
+	echo "SUCCESS: multi-datagram bundle reassembled via QUIC CLA loopback."
 else
 	echo "FAILURE: file not received or mismatched."
 	tail -30 ion.log 2>/dev/null
