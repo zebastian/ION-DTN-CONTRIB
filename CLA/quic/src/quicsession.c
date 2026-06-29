@@ -1,9 +1,9 @@
 /*
-	quicsession.c:	ngtcp2 + GnuTLS QUIC engine for the QUIC CLA.
+	quicsession.c:	ngtcp2 QUIC engine for the QUICCL convergence layer.
 			Implements a single-connection client (quicclo) and
-			a multi-connection server (quiccli) carrying
-			length-prefixed bundles on one bidirectional stream
-			per connection.
+			a multi-connection server (quiccli).  Stream 0 carries
+			QUICCL signalling; bundles are carried as XFER_SEGMENT
+			messages on a separate data stream.
 								*/
 
 #include "quicsession.h"
@@ -58,16 +58,25 @@ typedef struct QuicConn
 	int	       sigRxLen;
 	int	       sigRxCap;
 
-	/*	Client data-stream send (single in-flight framed bundle).*/
+	/*	Client data-stream send: one in-flight bundle, framed as
+	 *	one or more XFER_SEGMENTs.				*/
 	const unsigned char *sendData;
 	int		     sendLen;
 	int		     sendOff;
 	int		     sendDone;
+	uint64_t	     nextTxId; /* next outbound Transfer ID.	*/
 
-	/*	Reassembly of the inbound data stream.			*/
+	/*	Raw inbound data-stream bytes (XFER_* messages).	*/
 	unsigned char *rxBuf;
 	int	       rxCap;
 	int	       rxLen;
+
+	/*	Reassembly of the current inbound transfer.		*/
+	unsigned char *xfer;
+	int	       xferCap;
+	int	       xferLen;
+	uint64_t       xferBundleLen;
+	int	       xferActive;
 } QuicConn;
 
 /*	QUICCL session states.						*/
@@ -467,36 +476,157 @@ static int sessRecvSig(QuicConn *qc, const uint8_t *data, size_t datalen)
 	return sessParseSig(qc);
 }
 
-/*	Append received stream bytes and extract whole length-prefixed
- *	bundles, delivering each via the session callback.		*/
+/*	Append one received XFER_SEGMENT's data to the reassembly buffer,
+ *	delivering the whole bundle on the END segment.			*/
 
-static int deliverBundles(QuicConn *qc)
+static int xferReassemble(QuicConn *qc, const QuicXferSegment *seg,
+		const uint8_t *segData)
 {
 	QuicSession *s = qc->owner;
-	int	     off = 0;
 
-	while (qc->rxLen - off >= QUIC_LEN_PREFIX)
+	if (seg->flags & QMSG_FLAG_START)
 	{
-		unsigned char *p = qc->rxBuf + off;
-		uint32_t blen = ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16)
-				| ((uint32_t) p[2] << 8) | (uint32_t) p[3];
+		qc->xferLen = 0;
+		qc->xferBundleLen = seg->bundleLength;
+		qc->xferActive = 1;
+	}
 
-		if (blen == 0 || blen > QUICCLA_BUFSZ)
+	if (!qc->xferActive)
+	{
+		return -1; /* Segment without a START.		*/
+	}
+
+	if (qc->xferLen + (int) seg->segmentLength > qc->xferCap)
+	{
+		int newCap = qc->xferCap ? qc->xferCap : QUICCLA_BUFSZ;
+		unsigned char *nb;
+
+		while (newCap < qc->xferLen + (int) seg->segmentLength)
 		{
-			return -1; /* Framing error.		*/
+			newCap *= 2;
 		}
 
-		if (qc->rxLen - off - QUIC_LEN_PREFIX < (int) blen)
-		{
-			break; /* Bundle not complete yet.	*/
-		}
-
-		if (s->cb && s->cb(s->cbUser, p + QUIC_LEN_PREFIX, (int) blen) < 0)
+		nb = MTAKE(newCap);
+		if (nb == NULL)
 		{
 			return -1;
 		}
 
-		off += QUIC_LEN_PREFIX + (int) blen;
+		if (qc->xferLen > 0)
+		{
+			memcpy(nb, qc->xfer, qc->xferLen);
+		}
+
+		if (qc->xfer)
+		{
+			MRELEASE(qc->xfer);
+		}
+
+		qc->xfer = nb;
+		qc->xferCap = newCap;
+	}
+
+	memcpy(qc->xfer + qc->xferLen, segData, seg->segmentLength);
+	qc->xferLen += (int) seg->segmentLength;
+
+	if (seg->flags & QMSG_FLAG_END)
+	{
+		qc->xferActive = 0;
+		if ((uint64_t) qc->xferLen != qc->xferBundleLen)
+		{
+			return -1; /* Length mismatch.		*/
+		}
+
+		if (s->cb && s->cb(s->cbUser, qc->xfer, qc->xferLen) < 0)
+		{
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/*	Parse XFER_* messages from the inbound data stream: reassemble and
+ *	deliver bundles (XFER_SEGMENT); ACK/REFUSE are accepted and, for
+ *	now, consumed without sender-side action.			*/
+
+static int deliverBundles(QuicConn *qc)
+{
+	int off = 0;
+
+	while (off < qc->rxLen)
+	{
+		const uint8_t *p = qc->rxBuf + off;
+		int	       avail = qc->rxLen - off;
+		int	       type = quicMsgType(p, avail);
+		int	       hdr;
+
+		if (type == QMSG_XFER_SEGMENT)
+		{
+			QuicXferSegment seg;
+
+			hdr = quicMsgDecodeXferSegmentHdr(p, avail, &seg);
+			if (hdr == 0)
+			{
+				break; /* Need more octets.		*/
+			}
+
+			if (hdr < 0 || seg.segmentLength > QUICCLA_BUFSZ
+					|| seg.bundleLength > QUICCLA_BUFSZ)
+			{
+				return -1;
+			}
+
+			if ((uint64_t) (avail - hdr) < seg.segmentLength)
+			{
+				break; /* Segment data not all here yet.	*/
+			}
+
+			if (xferReassemble(qc, &seg, p + hdr) < 0)
+			{
+				return -1;
+			}
+
+			off += hdr + (int) seg.segmentLength;
+		}
+		else if (type == QMSG_XFER_ACK)
+		{
+			QuicXferAck ack;
+
+			hdr = quicMsgDecodeXferAck(p, avail, &ack);
+			if (hdr == 0)
+			{
+				break;
+			}
+
+			if (hdr < 0)
+			{
+				return -1;
+			}
+
+			off += hdr;
+		}
+		else if (type == QMSG_XFER_REFUSE)
+		{
+			QuicXferRefuse ref;
+
+			hdr = quicMsgDecodeXferRefuse(p, avail, &ref);
+			if (hdr == 0)
+			{
+				break;
+			}
+
+			if (hdr < 0)
+			{
+				return -1;
+			}
+
+			off += hdr;
+		}
+		else
+		{
+			return -1; /* Unexpected message on a data stream.	*/
+		}
 	}
 
 	if (off > 0)
@@ -796,6 +926,11 @@ static void freeConn(QuicConn *qc)
 	if (qc->rxBuf)
 	{
 		MRELEASE(qc->rxBuf);
+	}
+
+	if (qc->xfer)
+	{
+		MRELEASE(qc->xfer);
 	}
 
 	if (qc->sigTx)
@@ -1141,28 +1276,94 @@ static void wakeIo(QuicSession *s)
 	}
 }
 
+/*	Frame one bundle as one or more reliable XFER_SEGMENTs into a newly
+ *	allocated buffer (segmented to the peer's Segment MRU); *outLen
+ *	receives the total length.  Returns NULL on failure.		*/
+
+static unsigned char *frameBundle(QuicConn *qc, const unsigned char *bundle,
+		int len, int *outLen)
+{
+	uint64_t segMru = qc->peerSegmentMru ? qc->peerSegmentMru : QUICCLA_BUFSZ;
+	uint64_t       txid = qc->nextTxId++;
+	int	       nSeg = (int) (((uint64_t) len + segMru - 1) / segMru);
+	int	       cap;
+	int	       pos = 0;
+	int	       segId;
+	int	       remaining = len;
+	const uint8_t *src = bundle;
+	unsigned char *framed;
+
+	if (nSeg < 1)
+	{
+		nSeg = 1; /* A zero-length bundle still gets one segment.	*/
+	}
+
+	cap = len + nSeg * 40; /* Worst-case header is < 40 octets.	*/
+	framed = MTAKE(cap);
+	if (framed == NULL)
+	{
+		return NULL;
+	}
+
+	for (segId = 0; segId < nSeg; segId++)
+	{
+		QuicXferSegment seg;
+		int thisLen = (uint64_t) remaining > segMru ? (int) segMru :
+							      remaining;
+		int hdr;
+
+		memset(&seg, 0, sizeof(seg));
+		if (segId == 0)
+		{
+			seg.flags |= QMSG_FLAG_START;
+		}
+
+		if (segId == nSeg - 1)
+		{
+			seg.flags |= QMSG_FLAG_END;
+		}
+
+		seg.segmentId = (uint16_t) segId;
+		seg.totalSegments = (uint16_t) nSeg;
+		seg.transferId = txid;
+		seg.segmentLength = (uint64_t) thisLen;
+		seg.bundleLength = (uint64_t) len;
+		seg.serviceMode = QMSG_SVC_RELIABLE;
+
+		hdr = quicMsgEncodeXferSegmentHdr(framed + pos, cap - pos, &seg);
+		if (hdr < 0)
+		{
+			MRELEASE(framed);
+			return NULL;
+		}
+
+		pos += hdr;
+		memcpy(framed + pos, src, thisLen);
+		pos += thisLen;
+		src += thisLen;
+		remaining -= thisLen;
+	}
+
+	*outLen = pos;
+	return framed;
+}
+
 int quicClientSend(QuicSession *s, const unsigned char *bundle, int len)
 {
 	QuicConn      *qc = s->client;
 	unsigned char *framed;
-	int	       flen = QUIC_LEN_PREFIX + len;
+	int	       flen;
 
 	if (qc->failed || qc->sessState != QSS_ESTABLISHED)
 	{
 		return -1;
 	}
 
-	framed = MTAKE(flen);
+	framed = frameBundle(qc, bundle, len, &flen);
 	if (framed == NULL)
 	{
 		return -1;
 	}
-
-	framed[0] = (len >> 24) & 0xff;
-	framed[1] = (len >> 16) & 0xff;
-	framed[2] = (len >> 8) & 0xff;
-	framed[3] = len & 0xff;
-	memcpy(framed + QUIC_LEN_PREFIX, bundle, len);
 
 	/*	Hand the bundle to the I/O thread; only that thread may
 	 *	touch the (non-thread-safe) ngtcp2_conn, including opening
