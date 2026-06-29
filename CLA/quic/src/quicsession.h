@@ -25,10 +25,13 @@ typedef int (*QuicBundleCb)(void *user, unsigned char *bundle, int len);
  *	connection serviced.  Returns NULL on failure.			*/
 QuicSession *quicClientStart(const QuicClaConfig *cfg);
 
-/*	Send one bundle (length-prefixed) on the connection.  Blocks
- *	until the data is handed to QUIC or the connection fails.
- *	Returns 0 on success, -1 on failure (caller should reconnect).	*/
-int quicClientSend(QuicSession *s, const unsigned char *bundle, int len);
+/*	Send one bundle on the connection, as QUICCL XFER_SEGMENT(s) on the
+ *	data stream selected by ordinal (the bundle's ECOS ordinal, 0-254;
+ *	higher is more urgent).  Blocks until the data is handed to QUIC or
+ *	the connection fails.  Returns 0 on success, -1 on failure (caller
+ *	should reconnect).						*/
+int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
+		int ordinal);
 
 void quicClientStop(QuicSession *s);
 

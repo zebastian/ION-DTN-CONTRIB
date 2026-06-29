@@ -189,7 +189,9 @@ int main(int argc, char *argv[])
 			pause = 0;
 		}
 
-		if (quicClientSend(session, buffer, bytesToSend) < 0)
+		if (quicClientSend(session, buffer, bytesToSend,
+				    ancillaryData.ordinal)
+				< 0)
 		{
 			writeMemo("[?] quicclo: send failed; reconnecting.");
 			quicClientStop(session);

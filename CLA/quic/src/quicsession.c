@@ -34,7 +34,10 @@ typedef struct QuicConn
 	socklen_t		remoteLen;
 	struct sockaddr_storage local;
 	socklen_t		localLen;
-	int64_t			streamId; /* data stream; -1 until open.	*/
+	int64_t			sendStreamId;	/* client: chosen send stream.*/
+	int64_t			ackStreamId;	/* server: current ack stream.*/
+	int64_t			dataStreams[4]; /* client priority streams.	*/
+	int			dataStreamsOpen;
 	int			handshakeDone;
 	int			failed;
 
@@ -682,13 +685,12 @@ static int recvStreamDataCb(ngtcp2_conn *conn, uint32_t flags,
 	}
 	else if (datalen > 0)
 	{
-		/*	Any other stream carries bundle data; remember it so
-		 *	the receiver can send XFER_ACKs back on it.		*/
+		/*	Any other stream carries bundle data; track the current
+		 *	transfer's stream so XFER_ACKs go back on it.  Transfers
+		 *	do not interleave (one in-flight bundle), so a single
+		 *	reassembly buffer suffices across the priority streams.	*/
 
-		if (qc->streamId < 0)
-		{
-			qc->streamId = stream_id;
-		}
+		qc->ackStreamId = stream_id;
 
 		if (qc->rxLen + (int) datalen > qc->rxCap)
 		{
@@ -738,7 +740,7 @@ static int ackedOffsetCb(ngtcp2_conn *conn, int64_t stream_id, uint64_t offset,
 	/*	Track acknowledgement of our XFER_ACKs on the data stream so
 	 *	the single ACK buffer can be reused once fully acked.	*/
 
-	if (stream_id == qc->streamId)
+	if (stream_id != QUICCL_SIG_STREAM)
 	{
 		qc->dataAckOff += datalen;
 		if (qc->ackBufOff >= qc->ackBufLen
@@ -823,7 +825,7 @@ static void prepareAck(QuicConn *qc)
 	QuicXferAck ack;
 	int	    n;
 
-	if (!qc->ackPending || qc->ackBufLen != 0 || qc->streamId < 0)
+	if (!qc->ackPending || qc->ackBufLen != 0 || qc->ackStreamId < 0)
 	{
 		return;
 	}
@@ -887,12 +889,12 @@ static int writeConn(QuicConn *qc)
 			chan = 1;
 		}
 		else if (qc->sendData != NULL && qc->sendOff < qc->sendLen
-				&& qc->streamId >= 0)
+				&& qc->sendStreamId >= 0)
 		{
 			curData = qc->sendData;
 			curOff = qc->sendOff;
 			curLen = qc->sendLen;
-			streamId = qc->streamId;
+			streamId = qc->sendStreamId;
 			chan = 2;
 		}
 
@@ -902,12 +904,12 @@ static int writeConn(QuicConn *qc)
 		 *	I/O-thread-only, so no lock needed).		*/
 
 		if (chan == 0 && qc->ackBufOff < qc->ackBufLen
-				&& qc->streamId >= 0)
+				&& qc->ackStreamId >= 0)
 		{
 			curData = qc->ackBuf;
 			curOff = qc->ackBufOff;
 			curLen = qc->ackBufLen;
-			streamId = qc->streamId;
+			streamId = qc->ackStreamId;
 			chan = 3;
 		}
 
@@ -1080,7 +1082,10 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 
 	memset(qc, 0, sizeof(*qc));
 	qc->owner = s;
-	qc->streamId = -1;
+	qc->sendStreamId = -1;
+	qc->ackStreamId = -1;
+	qc->dataStreams[0] = qc->dataStreams[1] = qc->dataStreams[2] =
+			qc->dataStreams[3] = -1;
 	qc->rxCap = QUICCLA_BUFSZ;
 	qc->rxBuf = MTAKE(qc->rxCap);
 	if (qc->rxBuf == NULL)
@@ -1240,7 +1245,6 @@ static void *clientIo(void *parm)
 		int	      timeoutMs = 1000;
 		uint8_t	      buf[2048];
 		ssize_t	      n;
-		int	      needOpen;
 
 		/*	Once the QUIC handshake completes, open stream 0
 		 *	(the first client bidi stream, == QUICCL_SIG_STREAM)
@@ -1258,21 +1262,26 @@ static void *clientIo(void *parm)
 			}
 		}
 
-		/*	Open the data stream (I/O thread owns the conn) once a
-		 *	bundle is queued, then send any pending packets.	*/
+		/*	Open the four priority data streams (4, 8, 12, 16) once
+		 *	the signalling stream exists, so each bundle can be
+		 *	mapped to a stream by class of service.			*/
 
-		pthread_mutex_lock(&s->mutex);
-		needOpen = (qc->sendData != NULL && qc->streamId < 0);
-		pthread_mutex_unlock(&s->mutex);
-		if (needOpen)
+		if (qc->sessInitSent && !qc->dataStreamsOpen)
 		{
-			if (ngtcp2_conn_open_bidi_stream(qc->conn,
-					    &qc->streamId, qc)
-					!= 0)
+			int i;
+
+			for (i = 0; i < 4; i++)
 			{
-				qc->failed = 1;
-				break;
+				if (ngtcp2_conn_open_bidi_stream(qc->conn,
+						    &qc->dataStreams[i], qc)
+						!= 0)
+				{
+					qc->failed = 1;
+					break;
+				}
 			}
+
+			qc->dataStreamsOpen = 1;
 		}
 
 		sessionTick(qc);
@@ -1441,7 +1450,36 @@ static unsigned char *frameBundle(QuicConn *qc, const unsigned char *bundle,
 	return framed;
 }
 
-int quicClientSend(QuicSession *s, const unsigned char *bundle, int len)
+/*	Map an ECOS ordinal (0-254, most urgent) to one of the four priority
+ *	data streams: stream 4 (expedited) ... stream 16 (no priority), per
+ *	the QUICCL default mapping.					*/
+
+static int64_t priorityStream(QuicConn *qc, int ordinal)
+{
+	int idx;
+
+	if (ordinal >= 192)
+	{
+		idx = 0; /* stream 4  (expedited)	*/
+	}
+	else if (ordinal >= 128)
+	{
+		idx = 1; /* stream 8  (normal)		*/
+	}
+	else if (ordinal >= 1)
+	{
+		idx = 2; /* stream 12 (bulk)		*/
+	}
+	else
+	{
+		idx = 3; /* stream 16 (no priority)	*/
+	}
+
+	return qc->dataStreams[idx];
+}
+
+int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
+		int ordinal)
 {
 	QuicConn      *qc = s->client;
 	unsigned char *framed;
@@ -1459,14 +1497,15 @@ int quicClientSend(QuicSession *s, const unsigned char *bundle, int len)
 	}
 
 	/*	Hand the bundle to the I/O thread; only that thread may
-	 *	touch the (non-thread-safe) ngtcp2_conn, including opening
-	 *	the stream.					*/
+	 *	touch the (non-thread-safe) ngtcp2_conn.  Route it to the
+	 *	priority-appropriate data stream.			*/
 
 	pthread_mutex_lock(&s->mutex);
 	qc->sendData = framed;
 	qc->sendLen = flen;
 	qc->sendOff = 0;
 	qc->sendDone = 0;
+	qc->sendStreamId = priorityStream(qc, ordinal);
 	pthread_mutex_unlock(&s->mutex);
 
 	wakeIo(s);
@@ -1641,7 +1680,10 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 
 	memset(qc, 0, sizeof(*qc));
 	qc->owner = s;
-	qc->streamId = -1;
+	qc->sendStreamId = -1;
+	qc->ackStreamId = -1;
+	qc->dataStreams[0] = qc->dataStreams[1] = qc->dataStreams[2] =
+			qc->dataStreams[3] = -1;
 	qc->rxCap = QUICCLA_BUFSZ;
 	qc->rxBuf = MTAKE(qc->rxCap);
 	if (qc->rxBuf == NULL)
