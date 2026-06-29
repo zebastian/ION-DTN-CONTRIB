@@ -7,7 +7,6 @@
 								*/
 
 #include "quicsession.h"
-#include "quictls.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -18,6 +17,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
+#include "quicmsg.h"
+#include "quictls.h"
 
 #define QUIC_MAX_UDP 1452 /* Conservative QUIC datagram.	*/
 
@@ -33,28 +34,57 @@ typedef struct QuicConn
 	socklen_t		remoteLen;
 	struct sockaddr_storage local;
 	socklen_t		localLen;
-	int64_t			streamId;
+	int64_t			streamId; /* data stream; -1 until open.	*/
 	int			handshakeDone;
 	int			failed;
 
-	/*	Client send (single in-flight framed bundle).		*/
+	/*	QUICCL session state (draft-caini-dtn-quiccl).		*/
+	int	      sessState;      /* QSS_*			*/
+	int	      sessInitSent;   /* our SESS_INIT queued.	*/
+	int	      termSent;	      /* our SESS_TERM queued.	*/
+	uint16_t      keepalive;      /* negotiated, seconds.	*/
+	uint64_t      peerSegmentMru; /* peer's advertised segment MRU.	*/
+	uint64_t      peerTransferMru;
+	ngtcp2_tstamp lastTx; /* last stream-data send (keepalive timer).*/
+
+	/*	Stream-0 signalling send channel (conn-owned bytes).	*/
+	unsigned char *sigTx;
+	int	       sigTxLen;
+	int	       sigTxOff;
+	int	       sigTxCap;
+
+	/*	Stream-0 signalling receive reassembly.			*/
+	unsigned char *sigRx;
+	int	       sigRxLen;
+	int	       sigRxCap;
+
+	/*	Client data-stream send (single in-flight framed bundle).*/
 	const unsigned char *sendData;
 	int		     sendLen;
 	int		     sendOff;
 	int		     sendDone;
 
-	/*	Server reassembly of the inbound stream.		*/
+	/*	Reassembly of the inbound data stream.			*/
 	unsigned char *rxBuf;
 	int	       rxCap;
 	int	       rxLen;
 } QuicConn;
 
+/*	QUICCL session states.						*/
+#define QSS_CONNECTING	  0 /* QUIC up, SESS_INIT not yet exchanged.	*/
+#define QSS_ESTABLISHED	  1 /* SESS_INIT exchanged both ways.		*/
+#define QSS_ENDING	  2 /* SESS_TERM exchanged; closing.		*/
+
+/*	Stream 0 carries all signalling; bundle data uses a separate
+ *	client-initiated bidirectional stream.				*/
+#define QUICCL_SIG_STREAM 0
+
 struct QuicSession
 {
-	int				 fd;
-	int				 isServer;
-	QuicClaConfig			 cfg;
-	QuicTlsCreds			*creds;
+	int	      fd;
+	int	      isServer;
+	QuicClaConfig cfg;
+	QuicTlsCreds *creds;
 
 	/*	Client.							*/
 	QuicConn       *client;
@@ -124,6 +154,319 @@ static int handshakeDoneCb(ngtcp2_conn *conn, void *user_data)
 	return 0;
 }
 
+/*	*	*	QUICCL session layer	*	*	*	*/
+
+/*	Append signalling bytes to the conn's stream-0 send channel.  The
+ *	buffer is append-only for the connection's lifetime (signalling
+ *	volume is tiny) so the bytes stay valid until ngtcp2 acks them.	*/
+
+static int sigQueue(QuicConn *qc, const unsigned char *bytes, int len)
+{
+	QuicSession *s = qc->owner;
+	int	     rc = 0;
+
+	pthread_mutex_lock(&s->mutex);
+	if (qc->sigTxLen + len > qc->sigTxCap)
+	{
+		int	       newCap = qc->sigTxCap ? qc->sigTxCap : 256;
+		unsigned char *nb;
+
+		while (newCap < qc->sigTxLen + len)
+		{
+			newCap *= 2;
+		}
+
+		nb = MTAKE(newCap);
+		if (nb == NULL)
+		{
+			rc = -1;
+		}
+		else
+		{
+			if (qc->sigTxLen > 0)
+			{
+				memcpy(nb, qc->sigTx, qc->sigTxLen);
+			}
+
+			if (qc->sigTx)
+			{
+				MRELEASE(qc->sigTx);
+			}
+
+			qc->sigTx = nb;
+			qc->sigTxCap = newCap;
+		}
+	}
+
+	if (rc == 0)
+	{
+		memcpy(qc->sigTx + qc->sigTxLen, bytes, len);
+		qc->sigTxLen += len;
+	}
+
+	pthread_mutex_unlock(&s->mutex);
+	return rc;
+}
+
+/*	Build and queue this entity's SESS_INIT on stream 0.		*/
+
+static int sendSessInit(QuicConn *qc)
+{
+	QuicSession  *s = qc->owner;
+	QuicSessInit  init;
+	unsigned char out[128];
+	char	      nodeId[32];
+	int	      n;
+
+	memset(&init, 0, sizeof(init));
+
+	/*	Offer a keepalive interval comfortably below the QUIC idle
+	 *	timeout (cfg.idleSec) so the session stays live when idle.	*/
+
+	init.keepalive = (uint16_t) (s->cfg.idleSec > 1 ? s->cfg.idleSec / 2 : 1);
+	init.segmentMru = QUICCLA_BUFSZ;
+	init.datagramMru = 0;
+	init.transferMru = QUICCLA_BUFSZ;
+	isprintf(nodeId, sizeof(nodeId), "ipn:" UVAST_FIELDSPEC ".0",
+			getOwnFqnn());
+	init.nodeId = (const uint8_t *) nodeId;
+	init.nodeIdLen = (uint16_t) strlen(nodeId);
+
+	n = quicMsgEncodeSessInit(out, sizeof(out), &init);
+	if (n < 0)
+	{
+		return -1;
+	}
+
+	qc->sessInitSent = 1;
+	qc->lastTx = quicNow();
+	return sigQueue(qc, out, n);
+}
+
+/*	Adopt the negotiated session parameters from the peer's SESS_INIT
+ *	(keepalive = min of the two; MRUs as advertised by the receiver).*/
+
+static void sessNegotiate(QuicConn *qc, const QuicSessInit *peer)
+{
+	int	 idle = qc->owner->cfg.idleSec;
+	uint16_t ours = (uint16_t) (idle > 1 ? idle / 2 : 1);
+
+	qc->keepalive = peer->keepalive < ours ? peer->keepalive : ours;
+	qc->peerSegmentMru = peer->segmentMru;
+	qc->peerTransferMru = peer->transferMru;
+}
+
+static int handleSessInit(QuicConn *qc, const QuicSessInit *peer)
+{
+	QuicSession *s = qc->owner;
+
+	sessNegotiate(qc, peer);
+
+	/*	The passive entity (server) replies with its own SESS_INIT.*/
+
+	if (s->isServer && !qc->sessInitSent)
+	{
+		if (sendSessInit(qc) < 0)
+		{
+			return -1;
+		}
+	}
+
+	pthread_mutex_lock(&s->mutex);
+	qc->sessState = QSS_ESTABLISHED;
+	pthread_cond_broadcast(&s->cond);
+	pthread_mutex_unlock(&s->mutex);
+	return 0;
+}
+
+static int sendKeepalive(QuicConn *qc)
+{
+	unsigned char out[1];
+	int	      n = quicMsgEncodeKeepalive(out, sizeof(out));
+
+	return n < 0 ? -1 : sigQueue(qc, out, n);
+}
+
+static int sendSessTerm(QuicConn *qc, uint8_t reason, int reply)
+{
+	QuicSessTerm  term;
+	unsigned char out[16];
+	int	      n;
+
+	memset(&term, 0, sizeof(term));
+	term.flags = reply ? QMSG_TERM_FLAG_REPLY : 0;
+	term.reason = reason;
+	n = quicMsgEncodeSessTerm(out, sizeof(out), &term);
+	if (n < 0)
+	{
+		return -1;
+	}
+
+	qc->termSent = 1;
+	return sigQueue(qc, out, n);
+}
+
+static int sendMsgReject(QuicConn *qc, uint8_t rejectedType, uint8_t reason)
+{
+	QuicMsgReject rej;
+	unsigned char out[8];
+	int	      n;
+
+	rej.rejectedType = rejectedType;
+	rej.reason = reason;
+	n = quicMsgEncodeMsgReject(out, sizeof(out), &rej);
+	return n < 0 ? -1 : sigQueue(qc, out, n);
+}
+
+/*	Send a KEEPALIVE on stream 0 once the negotiated keepalive interval
+ *	elapses with no stream-data transmission (i.e. the session is idle).
+ *	Called once per I/O loop iteration.				*/
+
+static void sessionTick(QuicConn *qc)
+{
+	ngtcp2_tstamp now = quicNow();
+
+	if (qc->sessState == QSS_ESTABLISHED && qc->keepalive > 0
+			&& now - qc->lastTx >= (ngtcp2_tstamp) qc->keepalive
+							* NGTCP2_SECONDS)
+	{
+		oK(sendKeepalive(qc));
+		qc->lastTx = now;
+	}
+}
+
+/*	Parse and dispatch complete signalling messages buffered from
+ *	stream 0.  Returns 0 on success, -1 on a fatal protocol error.	*/
+
+static int sessParseSig(QuicConn *qc)
+{
+	int off = 0;
+
+	while (off < qc->sigRxLen)
+	{
+		const uint8_t *p = qc->sigRx + off;
+		int	       avail = qc->sigRxLen - off;
+		int	       type = quicMsgType(p, avail);
+		int	       n;
+
+		if (type == QMSG_SESS_INIT)
+		{
+			QuicSessInit init;
+
+			n = quicMsgDecodeSessInit(p, avail, &init);
+			if (n == 0)
+			{
+				break; /* Need more octets.		*/
+			}
+
+			if (n < 0 || handleSessInit(qc, &init) < 0)
+			{
+				return -1;
+			}
+		}
+		else if (type == QMSG_KEEPALIVE)
+		{
+			n = 1;
+		}
+		else if (type == QMSG_SESS_TERM)
+		{
+			QuicSessTerm term;
+
+			n = quicMsgDecodeSessTerm(p, avail, &term);
+			if (n == 0)
+			{
+				break;
+			}
+
+			if (n < 0)
+			{
+				return -1;
+			}
+
+			qc->sessState = QSS_ENDING;
+			if (!qc->termSent)
+			{
+				oK(sendSessTerm(qc, QMSG_TERM_UNKNOWN, 1));
+			}
+		}
+		else if (type == QMSG_MSG_REJECT)
+		{
+			QuicMsgReject rej;
+
+			n = quicMsgDecodeMsgReject(p, avail, &rej);
+			if (n == 0)
+			{
+				break;
+			}
+
+			if (n < 0)
+			{
+				return -1;
+			}
+		}
+		else
+		{
+			/*	Unexpected/unknown message: reject and, since
+			 *	we cannot determine its length to resync,
+			 *	treat it as fatal.			*/
+
+			oK(sendMsgReject(qc, (uint8_t) type,
+					QMSG_REJECT_UNSUPPORTED));
+			return -1;
+		}
+
+		off += n;
+	}
+
+	if (off > 0)
+	{
+		memmove(qc->sigRx, qc->sigRx + off, qc->sigRxLen - off);
+		qc->sigRxLen -= off;
+	}
+
+	return 0;
+}
+
+/*	Append received stream-0 octets to the signalling reassembly
+ *	buffer, then parse out whole messages.				*/
+
+static int sessRecvSig(QuicConn *qc, const uint8_t *data, size_t datalen)
+{
+	if (qc->sigRxLen + (int) datalen > qc->sigRxCap)
+	{
+		int	       newCap = qc->sigRxCap ? qc->sigRxCap : 256;
+		unsigned char *nb;
+
+		while (newCap < qc->sigRxLen + (int) datalen)
+		{
+			newCap *= 2;
+		}
+
+		nb = MTAKE(newCap);
+		if (nb == NULL)
+		{
+			return -1;
+		}
+
+		if (qc->sigRxLen > 0)
+		{
+			memcpy(nb, qc->sigRx, qc->sigRxLen);
+		}
+
+		if (qc->sigRx)
+		{
+			MRELEASE(qc->sigRx);
+		}
+
+		qc->sigRx = nb;
+		qc->sigRxCap = newCap;
+	}
+
+	memcpy(qc->sigRx + qc->sigRxLen, data, datalen);
+	qc->sigRxLen += (int) datalen;
+	return sessParseSig(qc);
+}
+
 /*	Append received stream bytes and extract whole length-prefixed
  *	bundles, delivering each via the session callback.		*/
 
@@ -173,12 +516,22 @@ static int recvStreamDataCb(ngtcp2_conn *conn, uint32_t flags,
 
 	(void) conn;
 	(void) flags;
-	(void) stream_id;
 	(void) offset;
 	(void) stream_user_data;
 
-	if (datalen > 0)
+	if (datalen > 0 && stream_id == QUICCL_SIG_STREAM)
 	{
+		/*	Stream 0 carries QUICCL signalling.		*/
+
+		if (sessRecvSig(qc, data, datalen) < 0)
+		{
+			return NGTCP2_ERR_CALLBACK_FAILURE;
+		}
+	}
+	else if (datalen > 0)
+	{
+		/*	Any other stream carries bundle data.		*/
+
 		if (qc->rxLen + (int) datalen > qc->rxCap)
 		{
 			int	       newCap = qc->rxCap * 2;
@@ -308,30 +661,46 @@ static int writeConn(QuicConn *qc)
 		ngtcp2_vec	     datav;
 		ngtcp2_vec	    *pv = NULL;
 		size_t		     pvcnt = 0;
-		const unsigned char *curData;
-		int		     curOff;
-		int		     curLen;
+		const unsigned char *curData = NULL;
+		int		     curOff = 0;
+		int		     curLen = 0;
+		int		     chan = 0; /* 1 = signalling, 2 = data.	*/
 
 		ngtcp2_path_storage_init(&ps, (struct sockaddr *) &qc->local,
 				qc->localLen, (struct sockaddr *) &qc->remote,
 				qc->remoteLen, NULL);
 
-		/*	Snapshot the (sender-thread-set) send state under the
-		 *	lock so sendData/sendOff/sendLen are consistent.	*/
+		/*	Pick the next channel to drain under the lock:
+		 *	stream-0 signalling first (precedence), then the data
+		 *	stream.  Both buffers are sender-thread-set.		*/
 
 		pthread_mutex_lock(&s->mutex);
-		curData = qc->sendData;
-		curOff = qc->sendOff;
-		curLen = qc->sendLen;
+		if (qc->sigTxOff < qc->sigTxLen)
+		{
+			curData = qc->sigTx;
+			curOff = qc->sigTxOff;
+			curLen = qc->sigTxLen;
+			streamId = QUICCL_SIG_STREAM;
+			chan = 1;
+		}
+		else if (qc->sendData != NULL && qc->sendOff < qc->sendLen
+				&& qc->streamId >= 0)
+		{
+			curData = qc->sendData;
+			curOff = qc->sendOff;
+			curLen = qc->sendLen;
+			streamId = qc->streamId;
+			chan = 2;
+		}
+
 		pthread_mutex_unlock(&s->mutex);
 
-		if (curData != NULL && curOff < curLen && qc->streamId >= 0)
+		if (chan != 0)
 		{
 			datav.base = (uint8_t *) curData + curOff;
 			datav.len = curLen - curOff;
 			pv = &datav;
 			pvcnt = 1;
-			streamId = qc->streamId;
 		}
 
 		nwrite = ngtcp2_conn_writev_stream(qc->conn, &ps.path, &pi, buf,
@@ -348,8 +717,17 @@ static int writeConn(QuicConn *qc)
 		if (pdatalen > 0)
 		{
 			pthread_mutex_lock(&s->mutex);
-			qc->sendOff += (int) pdatalen;
+			if (chan == 1)
+			{
+				qc->sigTxOff += (int) pdatalen;
+			}
+			else if (chan == 2)
+			{
+				qc->sendOff += (int) pdatalen;
+			}
+
 			pthread_mutex_unlock(&s->mutex);
+			qc->lastTx = ts; /* keepalive timer baseline.	*/
 		}
 
 		if (nwrite == 0)
@@ -418,6 +796,16 @@ static void freeConn(QuicConn *qc)
 	if (qc->rxBuf)
 	{
 		MRELEASE(qc->rxBuf);
+	}
+
+	if (qc->sigTx)
+	{
+		MRELEASE(qc->sigTx);
+	}
+
+	if (qc->sigRx)
+	{
+		MRELEASE(qc->sigRx);
 	}
 
 	MRELEASE(qc);
@@ -536,8 +924,7 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 		goto fail;
 	}
 
-	ngtcp2_conn_set_tls_native_handle(qc->conn,
-			quicTlsNativeHandle(qc->tls));
+	ngtcp2_conn_set_tls_native_handle(qc->conn, quicTlsNativeHandle(qc->tls));
 
 	if (pipe(s->wakePipe) < 0)
 	{
@@ -556,11 +943,12 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 		goto fail;
 	}
 
-	/*	Wait for handshake (up to idle timeout).		*/
+	/*	Wait for the QUIC handshake and the QUICCL SESS_INIT
+	 *	exchange to complete (up to idle timeout).		*/
 
 	deadline = cfg->idleSec * 1000;
 	pthread_mutex_lock(&s->mutex);
-	while (!qc->handshakeDone && !qc->failed && deadline > 0)
+	while (qc->sessState != QSS_ESTABLISHED && !qc->failed && deadline > 0)
 	{
 		struct timespec tw;
 
@@ -578,14 +966,14 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 
 	pthread_mutex_unlock(&s->mutex);
 
-	if (!qc->handshakeDone || qc->failed)
+	if (qc->sessState != QSS_ESTABLISHED || qc->failed)
 	{
-		putErrmsg("quicclo: handshake did not complete.", NULL);
+		putErrmsg("quicclo: QUICCL session did not establish.", NULL);
 		quicClientStop(s);
 		return NULL;
 	}
 
-	writeMemo("[i] quic: client handshake complete.");
+	writeMemo("[i] quic: QUICCL session established.");
 	return s;
 
 fail:
@@ -626,10 +1014,24 @@ static void *clientIo(void *parm)
 		ssize_t	      n;
 		int	      needOpen;
 
-		/*	Open the stream here (I/O thread owns the conn)
-		 *	once a bundle is queued, then send any pending
-		 *	packets (Initial, ACKs, stream data) so the
-		 *	handshake is not delayed.			*/
+		/*	Once the QUIC handshake completes, open stream 0
+		 *	(the first client bidi stream, == QUICCL_SIG_STREAM)
+		 *	and send our SESS_INIT to begin the QUICCL session.	*/
+
+		if (qc->handshakeDone && !qc->sessInitSent)
+		{
+			int64_t sid;
+
+			if (ngtcp2_conn_open_bidi_stream(qc->conn, &sid, qc) != 0
+					|| sendSessInit(qc) < 0)
+			{
+				qc->failed = 1;
+				break;
+			}
+		}
+
+		/*	Open the data stream (I/O thread owns the conn) once a
+		 *	bundle is queued, then send any pending packets.	*/
 
 		pthread_mutex_lock(&s->mutex);
 		needOpen = (qc->sendData != NULL && qc->streamId < 0);
@@ -645,6 +1047,7 @@ static void *clientIo(void *parm)
 			}
 		}
 
+		sessionTick(qc);
 		oK(writeConn(qc));
 
 		pthread_mutex_lock(&s->mutex);
@@ -744,7 +1147,7 @@ int quicClientSend(QuicSession *s, const unsigned char *bundle, int len)
 	unsigned char *framed;
 	int	       flen = QUIC_LEN_PREFIX + len;
 
-	if (qc->failed)
+	if (qc->failed || qc->sessState != QSS_ESTABLISHED)
 	{
 		return -1;
 	}
@@ -796,6 +1199,17 @@ void quicClientStop(QuicSession *s)
 
 	if (s->running)
 	{
+		/*	Cleanly terminate the QUICCL session: queue SESS_TERM
+		 *	and let the I/O thread flush it before shutting down.	*/
+
+		if (s->client && s->client->sessState == QSS_ESTABLISHED
+				&& !s->client->termSent)
+		{
+			oK(sendSessTerm(s->client, QMSG_TERM_UNKNOWN, 0));
+			wakeIo(s);
+			microsnooze(200000);
+		}
+
 		s->running = 0;
 		wakeIo(s);
 		pthread_join(s->ioThread, NULL);
@@ -975,8 +1389,7 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 		return NULL;
 	}
 
-	ngtcp2_conn_set_tls_native_handle(qc->conn,
-			quicTlsNativeHandle(qc->tls));
+	ngtcp2_conn_set_tls_native_handle(qc->conn, quicTlsNativeHandle(qc->tls));
 
 	qc->next = s->conns;
 	s->conns = qc;
@@ -1068,6 +1481,7 @@ int quicServerRun(QuicSession *s, QuicBundleCb cb, void *user,
 				}
 				else
 				{
+					sessionTick(qc);
 					oK(writeConn(qc));
 				}
 			}
@@ -1090,6 +1504,19 @@ void quicServerStop(QuicSession *s)
 	if (s == NULL)
 	{
 		return;
+	}
+
+	/*	Cleanly terminate each established session with a SESS_TERM,
+	 *	flushed inline since the server loop has already stopped.	*/
+
+	for (qc = s->conns; qc != NULL; qc = qc->next)
+	{
+		if (!qc->failed && qc->sessState == QSS_ESTABLISHED
+				&& !qc->termSent)
+		{
+			oK(sendSessTerm(qc, QMSG_TERM_UNKNOWN, 0));
+			oK(writeConn(qc));
+		}
 	}
 
 	for (qc = s->conns; qc != NULL; qc = next)
