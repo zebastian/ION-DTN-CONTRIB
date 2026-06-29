@@ -86,7 +86,19 @@ tests/loopback-quic-dgram/   single-node unreliable loopback (.optional)
 bench/bench-quic             throughput benchmark
 ```
 
-Run `make check` for the codec unit tests.
+## Testing
+
+- `make check` — codec round-trip unit tests for every message type.
+- `tests/loopback-quic` — reliable service: single- and multi-segment
+  transfers, multiple streamed bundles, priority-to-stream routing
+  (a high-ordinal bundle must use stream 4), and graceful SESS_TERM.
+- `tests/loopback-quic-dgram` — unreliable service over multiple datagrams.
+
+Some behaviours are verified by inspection rather than by the automated
+suite, as they are awkward to drive with the standard BP tools:
+cumulative `XFER_ACK` transmission (the sender does not block on it),
+`KEEPALIVE` emission on a long-idle session, and `MSG_REJECT` generation.
+`XFER_REFUSE` is decoded but never originated by this implementation.
 
 ## License
 
