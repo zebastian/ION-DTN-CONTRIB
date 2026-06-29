@@ -1,0 +1,19 @@
+# test / bench run artifacts
+tests/*/ion.log
+tests/*/config/*_runtime.*
+tests/*/server.pem
+tests/*/server.key
+bench/ion.log
+bench/results.csv
+bench/server.pem
+bench/server.key
+bench/config/*_runtime.*
+bench/bpacq.*
+bench/bpdriverAduFile
+
+# Generated man pages
+doc/*.1
+
+# Built daemons
+quiccli
+quicclo

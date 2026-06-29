@@ -68,6 +68,7 @@ AM_CONDITIONAL([HAVE_POD2MAN], [test "x$POD2MAN" != "x"])
 # One include per contribution (the configure analogue of SUBDIRS).
 m4_include([CLA/mqtt/configure.m4])
 m4_include([CLA/mysql/configure.m4])
+m4_include([CLA/quic/configure.m4])
 m4_include([APP/bpsh/configure.m4])
 
 AS_IF([test "x$contrib_selected" = xno],

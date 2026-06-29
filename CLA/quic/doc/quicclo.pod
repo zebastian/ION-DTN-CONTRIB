@@ -1,0 +1,77 @@
+=head1 NAME
+
+quicclo - DTN QUIC convergence layer output task
+
+=head1 SYNOPSIS
+
+B<quicclo> [B<-C> I<cafile>] [B<-c> I<cert>] [B<-k> I<key>] [B<-A> I<alpn>]
+[B<-n>] [B<-t> I<idlesec>] I<host>[:I<port>]
+
+=head1 DESCRIPTION
+
+B<quicclo> is a background "daemon" task that transmits bundles to a remote
+node over QUIC (RFC 9000), using ngtcp2 with the GnuTLS crypto backend.  It
+opens a QUIC connection to I<host>:I<port> (default port 4556) and writes
+each outbound bundle, length-prefixed, on a single bidirectional stream.
+
+The duct name format is I<host>[:I<port>], identifying the B<quiccli> server.
+By default the server's certificate is verified against the system trust
+store (or the file given with B<-C>); B<-n> disables verification, which is
+useful with self-signed certificates.
+
+B<quicclo> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the spawning command text is supplied when the "quic"
+convergence layer protocol is added to the BP database.  The task is
+terminated by B<bpadmin> in response to an 'x' (STOP) command.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-C> I<cafile>
+
+PEM file of trusted CA certificates used to verify the server.
+
+=item B<-c> I<cert>
+
+Client certificate (PEM) for mutual TLS.
+
+=item B<-k> I<key>
+
+Client private key (PEM) for mutual TLS.
+
+=item B<-A> I<alpn>
+
+ALPN protocol identifier (default C<dtn>); must match the server.
+
+=item B<-n>
+
+Do not verify the server certificate.
+
+=item B<-t> I<idlesec>
+
+QUIC idle timeout in seconds (default 30).
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<quicclo> terminated normally.
+
+=item "1"
+
+B<quicclo> terminated abnormally; see the B<ion.log> file.
+
+=back
+
+=head1 EXAMPLES
+
+    a outduct quic peer.example:4556 'quicclo -C /etc/quic/ca.pem'
+
+=head1 SEE ALSO
+
+bpadmin(1), quiccli(1), bprc(5)

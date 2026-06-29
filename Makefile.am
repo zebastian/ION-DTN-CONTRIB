@@ -9,6 +9,9 @@ endif
 if ENABLE_CLA_MYSQL
 SUBDIRS += CLA/mysql
 endif
+if ENABLE_CLA_QUIC
+SUBDIRS += CLA/quic
+endif
 if ENABLE_APP_BPSH
 SUBDIRS += APP/bpsh
 endif

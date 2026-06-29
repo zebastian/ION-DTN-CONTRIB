@@ -1,0 +1,72 @@
+=head1 NAME
+
+quiccli - DTN QUIC convergence layer input task
+
+=head1 SYNOPSIS
+
+B<quiccli> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-A> I<alpn>]
+[B<-t> I<idlesec>] I<host>[:I<port>]
+
+=head1 DESCRIPTION
+
+B<quiccli> is a background "daemon" task that receives bundles from remote
+nodes over QUIC (RFC 9000), using ngtcp2 with the GnuTLS crypto backend.  It
+binds a UDP socket to I<host>:I<port> (default port 4556), accepts QUIC
+connections, reassembles the length-prefixed bundles carried on each
+connection's bidirectional stream, and injects them into ION.
+
+A server certificate (B<-c>) and private key (B<-k>) are required.  The duct
+name format is I<host>[:I<port>]; an empty I<host> binds all interfaces.
+
+B<quiccli> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the spawning command text is supplied when the "quic"
+convergence layer protocol is added to the BP database.  The task is
+terminated by B<bpadmin> in response to an 'x' (STOP) command.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-c> I<cert>
+
+Server certificate (PEM).  Required.
+
+=item B<-k> I<key>
+
+Server private key (PEM).  Required.
+
+=item B<-C> I<cafile>
+
+PEM file of trusted CA certificates for verifying clients (mutual TLS).
+
+=item B<-A> I<alpn>
+
+ALPN protocol identifier (default C<dtn>); must match the client.
+
+=item B<-t> I<idlesec>
+
+QUIC idle timeout in seconds (default 30).
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<quiccli> terminated normally.
+
+=item "1"
+
+B<quiccli> terminated abnormally; see the B<ion.log> file.
+
+=back
+
+=head1 EXAMPLES
+
+    a induct quic 0.0.0.0:4556 'quiccli -c /etc/quic/server.pem -k /etc/quic/server.key'
+
+=head1 SEE ALSO
+
+bpadmin(1), quicclo(1), bprc(5)

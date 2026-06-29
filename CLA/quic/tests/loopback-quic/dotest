@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# Loopback test for the QUIC CLA (quiccli / quicclo).
+#
+# A single ION node sends a file to itself over QUIC: quicclo (client)
+# connects to quiccli (server) on 127.0.0.1 and the bundle is carried on
+# a QUIC stream, then injected and delivered locally.
+#
+# Requires openssl (to generate a throwaway self-signed cert).
+#
+
+QUIC_PORT="${QUIC_PORT:-4656}"
+QUICDUCT="127.0.0.1:${QUIC_PORT}"
+CONFIGDIR="./config"
+CERT="$(pwd)/server.pem"
+KEY="$(pwd)/server.key"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the QUIC CLA with a single-node loopback."
+echo
+echo "########################################"
+
+FAIL=0
+
+if ! command -v quiccli >/dev/null 2>&1 || ! command -v quicclo >/dev/null 2>&1; then
+	echo "SKIP: quiccli/quicclo not found. Build with --enable-cla-quic."
+	exit 2
+fi
+
+if ! command -v openssl >/dev/null 2>&1; then
+	echo "SKIP: openssl not found (needed to generate a test certificate)."
+	exit 2
+fi
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -f "quiccli" 2>/dev/null
+pkill -9 -f "quicclo" 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile1 sendfile "$CERT" "$KEY"
+
+echo "Generating self-signed certificate..."
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+# Generate runtime configs.
+sed -e "s|QUICDUCT|${QUICDUCT}|g" -e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
+	"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+sed -e "s|QUICDUCT|${QUICDUCT}|g" \
+	"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+
+echo "Waiting for QUIC CLAs to start..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	if pgrep -f "quiccli" >/dev/null && pgrep -f "quicclo" >/dev/null; then
+		echo "QUIC CLAs are running."
+		break
+	fi
+	sleep 1
+done
+sleep 2
+
+if ! pgrep -f "quiccli" >/dev/null || ! pgrep -f "quicclo" >/dev/null; then
+	echo "ERROR: QUIC CLAs did not start."
+	tail -30 ion.log 2>/dev/null
+	ionstop
+	killm
+	exit 1
+fi
+
+echo "QUIC CLA loopback test payload" > sendfile
+
+echo "Starting bprecvfile on ipn:1.2..."
+bprecvfile ipn:1.2 &
+BPRECV_PID=$!
+sleep 1
+
+echo "Sending file from ipn:1.1 to ipn:1.2..."
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 6
+
+echo "Checking received data..."
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "SUCCESS: file received via QUIC CLA loopback."
+else
+	echo "FAILURE: file not received or mismatched."
+	tail -30 ion.log 2>/dev/null
+	FAIL=1
+fi
+
+echo "Cleaning up..."
+kill $BPRECV_PID 2>/dev/null
+wait $BPRECV_PID 2>/dev/null
+pkill -9 -f "quiccli" 2>/dev/null
+pkill -9 -f "quicclo" 2>/dev/null
+sleep 1
+ionstop
+sleep 1
+killm
+
+rm -f testfile1 sendfile "$CERT" "$KEY"
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL
