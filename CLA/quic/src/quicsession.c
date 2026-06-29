@@ -22,6 +22,15 @@
 
 #define QUIC_MAX_UDP 1452 /* Conservative QUIC datagram.	*/
 
+/*	One queued outbound QUIC DATAGRAM (a single XFER_SEGMENT) for the
+ *	unreliable service.						*/
+typedef struct DgNode
+{
+	struct DgNode *next;
+	int	       len;
+	unsigned char  data[1]; /* flexible; allocated len octets.	*/
+} DgNode;
+
 typedef struct QuicConn
 {
 	struct QuicConn	       *next;
@@ -94,6 +103,18 @@ typedef struct QuicConn
 	int	      ackBufOff;  /* octets handed to ngtcp2.		*/
 	uint64_t      dataTxOff;  /* octets we sent on the data stream.	*/
 	uint64_t      dataAckOff; /* octets of those acked.		*/
+
+	/*	Unreliable (QUIC DATAGRAM) service.			*/
+	DgNode	      *dgHead;	  /* outbound datagram queue (client).	*/
+	DgNode	      *dgTail;
+	int	       dgPending; /* queued datagrams not yet sent.	*/
+	uint64_t       dgRxId;	  /* current inbound transfer (receiver).	*/
+	int	       dgRxActive;
+	int	       dgRxTotal;
+	int	       dgRxCount;
+	uint64_t       dgRxBundleLen;
+	unsigned char *dgRxBuf;
+	int	       dgRxCap;
 } QuicConn;
 
 /*	QUICCL session states.						*/
@@ -728,6 +749,107 @@ static int recvStreamDataCb(ngtcp2_conn *conn, uint32_t flags,
 	return 0;
 }
 
+/*	Place one received unreliable XFER_SEGMENT into the datagram
+ *	reassembly buffer and deliver the bundle once all segments are in.
+ *	Each segment is self-locating: a full (non-END) segment sits at
+ *	segmentId * its length; the END segment sits at the bundle tail.
+ *	Loss simply leaves a transfer incomplete (dropped) until the next
+ *	transfer's segments arrive.  Returns 0, or -1 on a fatal error.	*/
+
+static int dgReassemble(QuicConn *qc, const QuicXferSegment *seg,
+		const uint8_t *segData)
+{
+	QuicSession *s = qc->owner;
+	int	     offset;
+
+	if (seg->bundleLength > QUICCLA_BUFSZ
+			|| seg->segmentLength > QUICCLA_BUFSZ)
+	{
+		return 0; /* Drop implausible segment.		*/
+	}
+
+	if ((seg->flags & QMSG_FLAG_START) || !qc->dgRxActive
+			|| seg->transferId != qc->dgRxId)
+	{
+		qc->dgRxId = seg->transferId;
+		qc->dgRxActive = 1;
+		qc->dgRxTotal = seg->totalSegments;
+		qc->dgRxCount = 0;
+		qc->dgRxBundleLen = seg->bundleLength;
+		if ((int) seg->bundleLength > qc->dgRxCap)
+		{
+			int newCap = qc->dgRxCap ? qc->dgRxCap : QUICCLA_BUFSZ;
+			unsigned char *nb;
+
+			while (newCap < (int) seg->bundleLength)
+			{
+				newCap *= 2;
+			}
+
+			nb = MTAKE(newCap);
+			if (nb == NULL)
+			{
+				qc->dgRxActive = 0;
+				return 0;
+			}
+
+			if (qc->dgRxBuf)
+			{
+				MRELEASE(qc->dgRxBuf);
+			}
+
+			qc->dgRxBuf = nb;
+			qc->dgRxCap = newCap;
+		}
+	}
+
+	offset = (seg->flags & QMSG_FLAG_END) ?
+			(int) (seg->bundleLength - seg->segmentLength) :
+			(int) (seg->segmentId * seg->segmentLength);
+	if (offset < 0 || offset + (int) seg->segmentLength > qc->dgRxCap)
+	{
+		return 0; /* Drop inconsistent segment.		*/
+	}
+
+	memcpy(qc->dgRxBuf + offset, segData, seg->segmentLength);
+	qc->dgRxCount++;
+
+	if (qc->dgRxCount >= qc->dgRxTotal)
+	{
+		qc->dgRxActive = 0;
+		if (s->cb
+				&& s->cb(s->cbUser, qc->dgRxBuf,
+						   (int) qc->dgRxBundleLen)
+						< 0)
+		{
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int recvDatagramCb(ngtcp2_conn *conn, uint32_t flags,
+		const uint8_t *data, size_t datalen, void *user_data)
+{
+	QuicConn       *qc = user_data;
+	QuicXferSegment seg;
+	int		hdr;
+
+	(void) conn;
+	(void) flags;
+
+	hdr = quicMsgDecodeXferSegmentHdr(data, datalen, &seg);
+	if (hdr <= 0 || (size_t) (datalen - hdr) < seg.segmentLength)
+	{
+		return 0; /* Drop malformed/incomplete datagram.	*/
+	}
+
+	return dgReassemble(qc, &seg, data + hdr) < 0 ?
+			NGTCP2_ERR_CALLBACK_FAILURE :
+			0;
+}
+
 static int ackedOffsetCb(ngtcp2_conn *conn, int64_t stream_id, uint64_t offset,
 		uint64_t datalen, void *user_data, void *stream_user_data)
 {
@@ -780,6 +902,7 @@ static void setCallbacks(ngtcp2_callbacks *cb, int isServer)
 	cb->handshake_completed = handshakeDoneCb;
 	cb->recv_stream_data = recvStreamDataCb;
 	cb->acked_stream_data_offset = ackedOffsetCb;
+	cb->recv_datagram = recvDatagramCb;
 	cb->rand = randCb;
 	cb->get_new_connection_id = getNewCidCb;
 }
@@ -794,6 +917,10 @@ static void defaultTransportParams(const QuicClaConfig *cfg,
 	params->initial_max_stream_data_bidi_remote = QUICCLA_BUFSZ;
 	params->initial_max_data = QUICCLA_BUFSZ * 4;
 	params->max_idle_timeout = (ngtcp2_tstamp) cfg->idleSec * NGTCP2_SECONDS;
+
+	/*	Enable the QUIC DATAGRAM extension for the unreliable service.*/
+
+	params->max_datagram_frame_size = QUIC_MAX_UDP;
 }
 
 /*	Wire the ngtcp2 conn-ref (used by the crypto layer to recover the
@@ -977,6 +1104,94 @@ static int writeConn(QuicConn *qc)
 	return 0;
 }
 
+/*	Drain the outbound datagram queue (unreliable service): each queued
+ *	XFER_SEGMENT is sent in one QUIC DATAGRAM frame.  A datagram that
+ *	cannot be framed is dropped (unreliable semantics) so the sender
+ *	never stalls.  Runs on the I/O thread.				*/
+
+static int writeDatagrams(QuicConn *qc)
+{
+	QuicSession	   *s = qc->owner;
+	uint8_t		    buf[QUIC_MAX_UDP];
+	ngtcp2_path_storage ps;
+	ngtcp2_pkt_info	    pi;
+	ngtcp2_tstamp	    ts = quicNow();
+
+	for (;;)
+	{
+		DgNode	    *node;
+		ngtcp2_vec   datav;
+		int	     accepted = 0;
+		ngtcp2_ssize nwrite;
+
+		pthread_mutex_lock(&s->mutex);
+		node = qc->dgHead;
+		pthread_mutex_unlock(&s->mutex);
+		if (node == NULL)
+		{
+			break;
+		}
+
+		ngtcp2_path_storage_init(&ps, (struct sockaddr *) &qc->local,
+				qc->localLen, (struct sockaddr *) &qc->remote,
+				qc->remoteLen, NULL);
+		datav.base = node->data;
+		datav.len = node->len;
+		nwrite = ngtcp2_conn_writev_datagram(qc->conn, &ps.path, &pi,
+				buf, sizeof(buf), &accepted,
+				NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &datav, 1,
+				ts);
+		if (nwrite < 0)
+		{
+			/*	Datagram cannot be framed: drop it so the
+			 *	sender does not stall.			*/
+
+			accepted = 1;
+			nwrite = 0;
+		}
+
+		if (nwrite > 0
+				&& sendto(s->fd, buf, nwrite, 0,
+						   (struct sockaddr *) &qc->remote,
+						   qc->remoteLen)
+						< 0)
+		{
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				break;
+			}
+
+			qc->failed = 1;
+			return -1;
+		}
+
+		if (nwrite > 0)
+		{
+			qc->lastTx = ts;
+		}
+
+		if (accepted)
+		{
+			pthread_mutex_lock(&s->mutex);
+			qc->dgHead = node->next;
+			if (qc->dgHead == NULL)
+			{
+				qc->dgTail = NULL;
+			}
+
+			qc->dgPending--;
+			pthread_mutex_unlock(&s->mutex);
+			MRELEASE(node);
+		}
+		else if (nwrite == 0)
+		{
+			break; /* Cannot send now; retry later.	*/
+		}
+	}
+
+	return 0;
+}
+
 static int feedConn(QuicConn *qc, const uint8_t *pkt, size_t pktlen)
 {
 	ngtcp2_path_storage ps;
@@ -1036,6 +1251,19 @@ static void freeConn(QuicConn *qc)
 	if (qc->sigRx)
 	{
 		MRELEASE(qc->sigRx);
+	}
+
+	if (qc->dgRxBuf)
+	{
+		MRELEASE(qc->dgRxBuf);
+	}
+
+	while (qc->dgHead)
+	{
+		DgNode *node = qc->dgHead;
+
+		qc->dgHead = node->next;
+		MRELEASE(node);
 	}
 
 	MRELEASE(qc);
@@ -1266,7 +1494,7 @@ static void *clientIo(void *parm)
 		 *	the signalling stream exists, so each bundle can be
 		 *	mapped to a stream by class of service.			*/
 
-		if (qc->sessInitSent && !qc->dataStreamsOpen)
+		if (!s->cfg.unreliable && qc->sessInitSent && !qc->dataStreamsOpen)
 		{
 			int i;
 
@@ -1286,6 +1514,7 @@ static void *clientIo(void *parm)
 
 		sessionTick(qc);
 		oK(writeConn(qc));
+		oK(writeDatagrams(qc));
 
 		pthread_mutex_lock(&s->mutex);
 		if (qc->sendData && qc->sendOff >= qc->sendLen)
@@ -1350,6 +1579,7 @@ static void *clientIo(void *parm)
 		}
 
 		oK(writeConn(qc));
+		oK(writeDatagrams(qc));
 
 		pthread_mutex_lock(&s->mutex);
 		if (qc->sendData && qc->sendOff >= qc->sendLen)
@@ -1478,6 +1708,108 @@ static int64_t priorityStream(QuicConn *qc, int ordinal)
 	return qc->dataStreams[idx];
 }
 
+/*	Datagram payload (XFER_SEGMENT data) per segment for the unreliable
+ *	service; kept well under the QUIC datagram frame size.		*/
+#define QUIC_DG_SEG 1024
+
+/*	Send one bundle as unreliable QUIC DATAGRAM segments.  Returns 0 on
+ *	success (all datagrams handed to QUIC), -1 on failure.		*/
+
+static int quicClientSendDatagram(QuicSession *s, QuicConn *qc,
+		const unsigned char *bundle, int len)
+{
+	int	       nSeg = (len + QUIC_DG_SEG - 1) / QUIC_DG_SEG;
+	uint64_t       txid = qc->nextTxId++;
+	int	       remaining = len;
+	const uint8_t *src = bundle;
+	DgNode	      *head = NULL;
+	DgNode	      *tail = NULL;
+	int	       i;
+
+	if (nSeg < 1)
+	{
+		nSeg = 1;
+	}
+
+	for (i = 0; i < nSeg; i++)
+	{
+		QuicXferSegment seg;
+		int thisLen = remaining > QUIC_DG_SEG ? QUIC_DG_SEG : remaining;
+		DgNode *node = MTAKE(sizeof(DgNode) + 40 + thisLen);
+		int	hdr;
+
+		if (node == NULL)
+		{
+			break;
+		}
+
+		node->next = NULL;
+		memset(&seg, 0, sizeof(seg));
+		if (i == 0)
+		{
+			seg.flags |= QMSG_FLAG_START;
+		}
+
+		if (i == nSeg - 1)
+		{
+			seg.flags |= QMSG_FLAG_END;
+		}
+
+		seg.segmentId = (uint16_t) i;
+		seg.totalSegments = (uint16_t) nSeg;
+		seg.transferId = txid;
+		seg.segmentLength = (uint64_t) thisLen;
+		seg.bundleLength = (uint64_t) len;
+		seg.serviceMode = QMSG_SVC_UNRELIABLE;
+		hdr = quicMsgEncodeXferSegmentHdr(node->data, 40 + thisLen, &seg);
+		if (hdr < 0)
+		{
+			MRELEASE(node);
+			break;
+		}
+
+		memcpy(node->data + hdr, src, thisLen);
+		node->len = hdr + thisLen;
+		if (tail)
+		{
+			tail->next = node;
+		}
+		else
+		{
+			head = node;
+		}
+
+		tail = node;
+		src += thisLen;
+		remaining -= thisLen;
+	}
+
+	pthread_mutex_lock(&s->mutex);
+	if (qc->dgTail)
+	{
+		qc->dgTail->next = head;
+	}
+	else
+	{
+		qc->dgHead = head;
+	}
+
+	if (tail)
+	{
+		qc->dgTail = tail;
+	}
+
+	qc->dgPending += nSeg;
+	wakeIo(s);
+	while (qc->dgPending > 0 && !qc->failed)
+	{
+		pthread_cond_wait(&s->cond, &s->mutex);
+	}
+
+	pthread_mutex_unlock(&s->mutex);
+	return qc->failed ? -1 : 0;
+}
+
 int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
 		int ordinal)
 {
@@ -1488,6 +1820,11 @@ int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
 	if (qc->failed || qc->sessState != QSS_ESTABLISHED)
 	{
 		return -1;
+	}
+
+	if (s->cfg.unreliable)
+	{
+		return quicClientSendDatagram(s, qc, bundle, len);
 	}
 
 	framed = frameBundle(qc, bundle, len, &flen);

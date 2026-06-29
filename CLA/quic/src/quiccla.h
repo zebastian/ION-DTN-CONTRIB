@@ -2,10 +2,10 @@
 	quiccla.h:	common definitions for the QUIC convergence layer
 			adapter (ngtcp2 + GnuTLS).
 
-	quicclo (outduct) is the QUIC client: it connects to a peer and
-	writes each bundle, length-prefixed, on a single bidirectional
-	stream.  quiccli (induct) is the QUIC server: it accepts
-	connections and reassembles the length-prefixed bundles.
+	quicclo (outduct) is the QUICCL active entity (QUIC client); quiccli
+	(induct) is the passive entity (QUIC server).  Bundles are carried
+	as XFER_SEGMENT messages on QUIC streams (reliable) or, with -u, as
+	QUIC datagrams (unreliable).
 								*/
 
 #ifndef QUICCLA_H
@@ -43,6 +43,7 @@ typedef struct
 	int  noVerify;			  /* client: skip verify.	*/
 	char alpn[QUIC_MAX_ALPN_LEN];
 	int  idleSec;
+	int  unreliable;		  /* use QUIC datagrams, not streams.	*/
 } QuicClaConfig;
 
 /*
@@ -97,6 +98,7 @@ static int parseQuicDuctName(const char *ductName, char *host, int *port)
  *   -C <cafile>    CA trust anchors (PEM)
  *   -A <alpn>      ALPN protocol id (default "quicclav1")
  *   -n             client: do not verify server certificate
+ *   -u             use the unreliable (QUIC datagram) service
  *   -t <seconds>   idle timeout (default 30)
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
@@ -133,6 +135,10 @@ static int parseQuicArgs(int argc, char *argv[], QuicClaConfig *cfg)
 		else if (strcmp(argv[i], "-n") == 0)
 		{
 			cfg->noVerify = 1;
+		}
+		else if (strcmp(argv[i], "-u") == 0)
+		{
+			cfg->unreliable = 1;
 		}
 		else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)
 		{
