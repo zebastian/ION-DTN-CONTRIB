@@ -18,8 +18,8 @@
 extern "C" {
 #endif
 
-#define QUIC_DEFAULT_PORT     4556
-#define QUIC_ALPN	      "dtn"	   /* ALPN protocol id.	*/
+#define QUIC_DEFAULT_PORT     4560	   /* draft-caini-dtn-quiccl.	*/
+#define QUIC_ALPN	      "quicclav1"  /* ALPN protocol id (QUICCLv1).*/
 #define QUICCLA_BUFSZ	      (256 * 1024) /* Max bundle handled.	*/
 #define QUIC_LEN_PREFIX	      4		   /* uint32 BE per bundle.*/
 #define QUIC_DEFAULT_IDLE_SEC 30
@@ -95,7 +95,7 @@ static int parseQuicDuctName(const char *ductName, char *host, int *port)
  *   -c <certfile>  server certificate (PEM)        [required: quiccli]
  *   -k <keyfile>   server private key (PEM)        [required: quiccli]
  *   -C <cafile>    CA trust anchors (PEM)
- *   -A <alpn>      ALPN protocol id (default "dtn")
+ *   -A <alpn>      ALPN protocol id (default "quicclav1")
  *   -n             client: do not verify server certificate
  *   -t <seconds>   idle timeout (default 30)
  *
