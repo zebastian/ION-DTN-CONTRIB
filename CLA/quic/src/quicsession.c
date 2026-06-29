@@ -7,15 +7,13 @@
 								*/
 
 #include "quicsession.h"
+#include "quictls.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <gnutls/crypto.h>
-#include <gnutls/gnutls.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_gnutls.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -28,7 +26,7 @@ typedef struct QuicConn
 	struct QuicConn	       *next;
 	QuicSession	       *owner;
 	ngtcp2_conn	       *conn;
-	gnutls_session_t	tls;
+	QuicTlsConn	       *tls;
 	ngtcp2_crypto_conn_ref	connRef;
 	ngtcp2_cid		scid; /* our source CID (demux key).	*/
 	struct sockaddr_storage remote;
@@ -56,7 +54,7 @@ struct QuicSession
 	int				 fd;
 	int				 isServer;
 	QuicClaConfig			 cfg;
-	gnutls_certificate_credentials_t cred;
+	QuicTlsCreds			*creds;
 
 	/*	Client.							*/
 	QuicConn       *client;
@@ -95,7 +93,7 @@ static ngtcp2_conn *getConnRef(ngtcp2_crypto_conn_ref *ref)
 static void randCb(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *rand_ctx)
 {
 	(void) rand_ctx;
-	gnutls_rnd(GNUTLS_RND_RANDOM, dest, destlen);
+	oK(quicTlsRand(dest, destlen));
 }
 
 static int getNewCidCb(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
@@ -103,14 +101,13 @@ static int getNewCidCb(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
 {
 	(void) conn;
 	(void) user_data;
-	if (gnutls_rnd(GNUTLS_RND_RANDOM, cid->data, cidlen) != 0)
+	if (quicTlsRand(cid->data, cidlen) != 0)
 	{
 		return NGTCP2_ERR_CALLBACK_FAILURE;
 	}
 
 	cid->datalen = cidlen;
-	if (gnutls_rnd(GNUTLS_RND_RANDOM, token, NGTCP2_STATELESS_RESET_TOKENLEN)
-			!= 0)
+	if (quicTlsRand(token, NGTCP2_STATELESS_RESET_TOKENLEN) != 0)
 	{
 		return NGTCP2_ERR_CALLBACK_FAILURE;
 	}
@@ -273,90 +270,15 @@ static void defaultTransportParams(const QuicClaConfig *cfg,
 	params->max_idle_timeout = (ngtcp2_tstamp) cfg->idleSec * NGTCP2_SECONDS;
 }
 
-/*	*	*	GnuTLS setup	*	*	*	*	*/
+/*	Wire the ngtcp2 conn-ref (used by the crypto layer to recover the
+ *	ngtcp2_conn) and create the backend TLS session.		*/
 
-static int setupClientTls(QuicSession *s, QuicConn *qc)
+static int setupTls(QuicSession *s, QuicConn *qc, int isServer)
 {
-	const QuicClaConfig *cfg = &s->cfg;
-	gnutls_datum_t	     alpn;
-
-	if (gnutls_certificate_allocate_credentials(&s->cred) != 0)
-	{
-		return -1;
-	}
-
-	if (cfg->caFile[0] != '\0')
-	{
-		gnutls_certificate_set_x509_trust_file(s->cred, cfg->caFile,
-				GNUTLS_X509_FMT_PEM);
-	}
-	else
-	{
-		gnutls_certificate_set_x509_system_trust(s->cred);
-	}
-
-	if (cfg->certFile[0] != '\0' && cfg->keyFile[0] != '\0')
-	{
-		gnutls_certificate_set_x509_key_file(s->cred, cfg->certFile,
-				cfg->keyFile, GNUTLS_X509_FMT_PEM);
-	}
-
-	if (gnutls_init(&qc->tls, GNUTLS_CLIENT) != 0)
-	{
-		return -1;
-	}
-
-	if (ngtcp2_crypto_gnutls_configure_client_session(qc->tls) != 0)
-	{
-		return -1;
-	}
-
-	gnutls_set_default_priority(qc->tls);
-	gnutls_credentials_set(qc->tls, GNUTLS_CRD_CERTIFICATE, s->cred);
-	gnutls_server_name_set(qc->tls, GNUTLS_NAME_DNS, cfg->host,
-			strlen(cfg->host));
-
-	if (!cfg->noVerify)
-	{
-		gnutls_session_set_verify_cert(qc->tls, cfg->host, 0);
-	}
-
-	alpn.data = (unsigned char *) cfg->alpn;
-	alpn.size = strlen(cfg->alpn);
-	gnutls_alpn_set_protocols(qc->tls, &alpn, 1, 0);
-
 	qc->connRef.get_conn = getConnRef;
 	qc->connRef.user_data = qc;
-	gnutls_session_set_ptr(qc->tls, &qc->connRef);
-	return 0;
-}
-
-static int setupServerTls(QuicSession *s, QuicConn *qc)
-{
-	const QuicClaConfig *cfg = &s->cfg;
-	gnutls_datum_t	     alpn;
-
-	if (gnutls_init(&qc->tls, GNUTLS_SERVER) != 0)
-	{
-		return -1;
-	}
-
-	if (ngtcp2_crypto_gnutls_configure_server_session(qc->tls) != 0)
-	{
-		return -1;
-	}
-
-	gnutls_set_default_priority(qc->tls);
-	gnutls_credentials_set(qc->tls, GNUTLS_CRD_CERTIFICATE, s->cred);
-
-	alpn.data = (unsigned char *) cfg->alpn;
-	alpn.size = strlen(cfg->alpn);
-	gnutls_alpn_set_protocols(qc->tls, &alpn, 1, 0);
-
-	qc->connRef.get_conn = getConnRef;
-	qc->connRef.user_data = qc;
-	gnutls_session_set_ptr(qc->tls, &qc->connRef);
-	return 0;
+	qc->tls = quicTlsConnNew(&s->cfg, s->creds, &qc->connRef, isServer);
+	return qc->tls == NULL ? -1 : 0;
 }
 
 /*	*	*	UDP / packet I/O	*	*	*	*/
@@ -490,7 +412,7 @@ static void freeConn(QuicConn *qc)
 
 	if (qc->tls)
 	{
-		gnutls_deinit(qc->tls);
+		quicTlsConnFree(qc->tls);
 	}
 
 	if (qc->rxBuf)
@@ -583,7 +505,8 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 	freeaddrinfo(res);
 	res = NULL;
 
-	if (setupClientTls(s, qc) < 0)
+	s->creds = quicTlsCredsNew(cfg, 0);
+	if (s->creds == NULL || setupTls(s, qc, 0) < 0)
 	{
 		putErrmsg("quicclo: TLS setup failed.", NULL);
 		goto fail;
@@ -591,8 +514,8 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 
 	dcid.datalen = NGTCP2_MAX_CIDLEN;
 	scid.datalen = NGTCP2_MAX_CIDLEN;
-	gnutls_rnd(GNUTLS_RND_RANDOM, dcid.data, dcid.datalen);
-	gnutls_rnd(GNUTLS_RND_RANDOM, scid.data, scid.datalen);
+	oK(quicTlsRand(dcid.data, dcid.datalen));
+	oK(quicTlsRand(scid.data, scid.datalen));
 	memcpy(&qc->scid, &scid, sizeof(ngtcp2_cid));
 
 	ngtcp2_settings_default(&settings);
@@ -613,7 +536,8 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 		goto fail;
 	}
 
-	ngtcp2_conn_set_tls_native_handle(qc->conn, qc->tls);
+	ngtcp2_conn_set_tls_native_handle(qc->conn,
+			quicTlsNativeHandle(qc->tls));
 
 	if (pipe(s->wakePipe) < 0)
 	{
@@ -889,11 +813,7 @@ void quicClientStop(QuicSession *s)
 	}
 
 	freeConn(s->client);
-	if (s->cred)
-	{
-		gnutls_certificate_free_credentials(s->cred);
-	}
-
+	quicTlsCredsFree(s->creds);
 	pthread_mutex_destroy(&s->mutex);
 	pthread_cond_destroy(&s->cond);
 	MRELEASE(s);
@@ -927,23 +847,9 @@ QuicSession *quicServerStart(const QuicClaConfig *cfg)
 	pthread_mutex_init(&s->mutex, NULL);
 	pthread_cond_init(&s->cond, NULL);
 
-	if (gnutls_certificate_allocate_credentials(&s->cred) != 0)
+	s->creds = quicTlsCredsNew(cfg, 1);
+	if (s->creds == NULL)
 	{
-		MRELEASE(s);
-		return NULL;
-	}
-
-	if (cfg->caFile[0] != '\0')
-	{
-		gnutls_certificate_set_x509_trust_file(s->cred, cfg->caFile,
-				GNUTLS_X509_FMT_PEM);
-	}
-
-	if (gnutls_certificate_set_x509_key_file(s->cred, cfg->certFile,
-			    cfg->keyFile, GNUTLS_X509_FMT_PEM)
-			!= 0)
-	{
-		putErrmsg("quiccli: can't load cert/key.", NULL);
 		goto fail;
 	}
 
@@ -981,10 +887,7 @@ fail:
 		close(s->fd);
 	}
 
-	if (s->cred)
-	{
-		gnutls_certificate_free_credentials(s->cred);
-	}
+	quicTlsCredsFree(s->creds);
 
 	MRELEASE(s);
 	return NULL;
@@ -1044,14 +947,14 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 	qc->localLen = sizeof(qc->local);
 	oK(getsockname(s->fd, (struct sockaddr *) &qc->local, &qc->localLen));
 
-	if (setupServerTls(s, qc) < 0)
+	if (setupTls(s, qc, 1) < 0)
 	{
 		freeConn(qc);
 		return NULL;
 	}
 
 	scid.datalen = NGTCP2_MAX_CIDLEN;
-	gnutls_rnd(GNUTLS_RND_RANDOM, scid.data, scid.datalen);
+	oK(quicTlsRand(scid.data, scid.datalen));
 	memcpy(&qc->scid, &scid, sizeof(ngtcp2_cid));
 
 	ngtcp2_settings_default(&settings);
@@ -1072,7 +975,8 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 		return NULL;
 	}
 
-	ngtcp2_conn_set_tls_native_handle(qc->conn, qc->tls);
+	ngtcp2_conn_set_tls_native_handle(qc->conn,
+			quicTlsNativeHandle(qc->tls));
 
 	qc->next = s->conns;
 	s->conns = qc;
@@ -1199,10 +1103,7 @@ void quicServerStop(QuicSession *s)
 		close(s->fd);
 	}
 
-	if (s->cred)
-	{
-		gnutls_certificate_free_credentials(s->cred);
-	}
+	quicTlsCredsFree(s->creds);
 
 	MRELEASE(s);
 }

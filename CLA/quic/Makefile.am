@@ -8,12 +8,16 @@ AM_CPPFLAGS = -I$(top_srcdir)/include $(ION_CFLAGS) $(QUIC_CFLAGS)
 
 bin_PROGRAMS = quiccli quicclo
 
-noinst_HEADERS = src/quiccla.h src/quicsession.h
+noinst_HEADERS = src/quiccla.h src/quicsession.h src/quictls.h
 
-quiccli_SOURCES = src/quiccli.c src/quicsession.c
+# TLS backend (GnuTLS is the only one apt-installable today; an OpenSSL or
+# wolfSSL quictls_*.c can be swapped in here behind the same interface).
+QUIC_TLS_SOURCES = src/quictls_gnutls.c
+
+quiccli_SOURCES = src/quiccli.c src/quicsession.c $(QUIC_TLS_SOURCES)
 quiccli_LDADD = $(ION_LIBS) $(QUIC_LIBS) -lpthread
 
-quicclo_SOURCES = src/quicclo.c src/quicsession.c
+quicclo_SOURCES = src/quicclo.c src/quicsession.c $(QUIC_TLS_SOURCES)
 quicclo_LDADD = $(ION_LIBS) $(QUIC_LIBS) -lpthread
 
 # --- man pages (generated from POD when pod2man is available) --- #
