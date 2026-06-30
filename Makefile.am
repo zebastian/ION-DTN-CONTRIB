@@ -15,6 +15,9 @@ endif
 if ENABLE_APP_BPSH
 SUBDIRS += APP/bpsh
 endif
+if ENABLE_APP_BPCMD
+SUBDIRS += APP/bpcmd
+endif
 
 # Vendored ION-DTN private headers, shared by all contributions (see
 # include/README).

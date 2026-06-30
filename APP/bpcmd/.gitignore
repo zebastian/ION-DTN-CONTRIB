@@ -1,0 +1,12 @@
+# Generated man pages
+doc/*.1
+
+# Built daemon
+bpcmdd
+
+tests/*/*.log
+tests/*/out.case*
+tests/*/err.case*
+tests/*/marker.case*
+tests/*/*.pid
+tests/*/req*.dat

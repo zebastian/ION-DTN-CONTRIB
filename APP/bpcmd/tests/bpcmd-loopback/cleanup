@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+killm f >/dev/null 2>&1
+pkill -f "bpcmdd ipn:1.5" >/dev/null 2>&1
+pkill -f "bpcmdd -n ipn:1.7" >/dev/null 2>&1
+rm -f ion.log bpcmdd1.log bpcmdd1.pid bpcmdd2.log bpcmdd2.pid \
+	req1.dat req2.dat \
+	marker.case1 marker.case2 \
+	out.case1 out.case2

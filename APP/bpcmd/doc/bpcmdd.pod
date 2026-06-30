@@ -1,0 +1,111 @@
+=head1 NAME
+
+bpcmdd - Bundle Protocol command daemon
+
+=head1 SYNOPSIS
+
+B<bpcmdd> [B<-n>] [B<-t> I<ttl>] I<ownEndpointID> I<command> [I<arg> ...]
+
+=head1 DESCRIPTION
+
+B<bpcmdd> listens on the BP endpoint I<ownEndpointID>.  For every delivered
+bundle it forks I<command>, pipes the bundle payload to that command's
+standard input, and, unless B<-n> is given, returns whatever the command
+writes to its standard output back to the bundle's source endpoint ID as a
+reply bundle.
+
+One child process is spawned per bundle (fork-per-bundle), and bundles are
+processed serially: a long-running command blocks reception of the next
+bundle until it exits.
+
+The command is invoked with these environment variables set:
+B<BP_SOURCE_EID> (the received bundle's source EID), B<BP_DEST_EID>
+(I<ownEndpointID>), and B<BP_PAYLOAD_LEN> (the payload length in bytes).  The
+command's standard error is inherited and appears on B<bpcmdd>'s standard
+error.
+
+No reply is sent when B<-n> is in effect, when the bundle source is the
+anonymous EID B<dtn:none>, or when the command produces no standard output.
+
+There is no command whitelisting at the protocol level; I<command> is fixed
+at launch and applies to every bundle.  Restrict the endpoint and use
+OS-level controls as needed.
+
+B<bpcmdd> runs until it receives SIGINT, at which point it detaches from BP.
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<bpcmdd> terminated normally after receiving SIGINT.
+
+=item "1"
+
+B<bpcmdd> terminated due to a usage error or a startup or BP failure.
+Details are noted in the B<ion.log> log file.
+
+=back
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-n>
+
+Do not send the command's standard output back to the bundle source.
+
+=item B<-t> I<ttl>
+
+Reply bundle lifetime, in seconds.  Defaults to 86400.
+
+=item I<ownEndpointID>
+
+The local endpoint ID on which B<bpcmdd> listens.  Mandatory.
+
+=item I<command> [I<arg> ...]
+
+The command (and optional arguments) to fork for each received bundle.
+Mandatory.
+
+=back
+
+=head1 FILES
+
+No configuration files are needed.
+
+=head1 DIAGNOSTICS
+
+The following diagnostics may be issued to the B<ion.log> log file:
+
+=over 4
+
+=item bpcmdd can't attach to BP.
+
+B<bpadmin> has not yet initialized Bundle Protocol operations.
+
+=item bpcmdd can't open own endpoint.
+
+Another application has already opened I<ownEndpointID>.  Terminate that
+application and rerun, or choose a different endpoint.
+
+=item bpcmdd can't fork command.
+
+System error.  Check for earlier diagnostic messages describing the cause of
+the error; correct problem and rerun.
+
+=item bpcmdd can't send reply bundle.
+
+System error.  Check for earlier diagnostic messages describing the cause of
+the error; correct problem and rerun.
+
+=back
+
+=head1 BUGS
+
+Report bugs to <https://github.com/nasa-jpl/ION-DTN/issues>
+
+=head1 SEE ALSO
+
+bpsink(1), bpsource(1), bp(3)

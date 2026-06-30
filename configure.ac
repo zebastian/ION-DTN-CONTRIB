@@ -70,6 +70,7 @@ m4_include([CLA/mqtt/configure.m4])
 m4_include([CLA/mysql/configure.m4])
 m4_include([CLA/quic/configure.m4])
 m4_include([APP/bpsh/configure.m4])
+m4_include([APP/bpcmd/configure.m4])
 
 AS_IF([test "x$contrib_selected" = xno],
   [AC_MSG_WARN([no contributions selected; pass --enable-all or --enable-<contrib> (e.g. --enable-app-bpsh)])])

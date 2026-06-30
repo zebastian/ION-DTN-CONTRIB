@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+trap 'killm f >/dev/null 2>&1' EXIT
+#
+# Loopback test for bpcmdd (Bundle Protocol command daemon).
+# Validates:
+#   - each bundle is handed to the forked command on stdin
+#   - BP_SOURCE_EID / BP_PAYLOAD_LEN reach the command's environment
+#   - the command's stdout is returned to the source as a reply bundle
+#   - "-n" suppresses the reply while still running the command
+#
+
+CONFIGFILES="./config/host1.rc"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: bpcmdd — payload-to-stdin, env propagation, stdout reply,"
+echo "         and -n reply suppression."
+echo
+echo "CONFIG: single-node loopback"
+echo
+for N in $CONFIGFILES; do
+	echo "$N:"
+	cat "$N"
+	echo "# EOF"
+	echo
+done
+echo "########################################"
+
+FAIL=0
+
+./cleanup
+sleep 1
+
+chmod +x ./config/handler.sh
+
+echo "Starting ION..."
+ionstart -I config/host1.rc
+
+MARKER1="$PWD/marker.case1"
+MARKER2="$PWD/marker.case2"
+rm -f "$MARKER1" "$MARKER2"
+
+echo "Starting bpcmdd (default, replies) on ipn:1.5..."
+BPCMD_MARKER="$MARKER1" bpcmdd ipn:1.5 ./config/handler.sh > bpcmdd1.log 2>&1 &
+BPCMDD1_PID=$!
+echo "$BPCMDD1_PID" > bpcmdd1.pid
+
+echo "Starting bpcmdd (-n, no reply) on ipn:1.7..."
+BPCMD_MARKER="$MARKER2" bpcmdd -n ipn:1.7 ./config/handler.sh > bpcmdd2.log 2>&1 &
+BPCMDD2_PID=$!
+echo "$BPCMDD2_PID" > bpcmdd2.pid
+
+sleep 2
+for P in "$BPCMDD1_PID:1.5" "$BPCMDD2_PID:1.7"; do
+	PID=${P%%:*}
+	if ! kill -0 "$PID" 2>/dev/null; then
+		echo "ERROR: bpcmdd (${P#*:}) died at startup"
+		cat bpcmdd1.log bpcmdd2.log
+		ionstop
+		exit 1
+	fi
+done
+
+# ----------------------------------------------------------------------
+# Case 1: default — payload to stdin, env propagation, stdout reply.
+# Send "hello dtn" from ipn:1.6; bpcmdd runs the handler, which records
+# "<src>|<len>|<payload>" to its marker and replies the upper-cased
+# payload to the source (ipn:1.6), where bpsink picks it up.
+# ----------------------------------------------------------------------
+echo
+echo "Case 1: payload on stdin, env vars, stdout returned as reply"
+printf 'hello dtn' > req1.dat
+bpsendfile ipn:1.6 ipn:1.5 req1.dat
+sleep 2
+bpsink ipn:1.6 > out.case1 2>&1 &
+SINK1_PID=$!
+sleep 3
+kill "$SINK1_PID" 2>/dev/null
+wait "$SINK1_PID" 2>/dev/null
+
+CASE1_FAIL=0
+if [ "$(cat "$MARKER1" 2>/dev/null)" != "ipn:1.6|9|hello dtn" ]; then
+	echo "  handler did not receive payload/env as expected"
+	echo "  marker: '$(cat "$MARKER1" 2>/dev/null)' (want 'ipn:1.6|9|hello dtn')"
+	CASE1_FAIL=1
+fi
+if ! grep -q "HELLO DTN" out.case1; then
+	echo "  reply bundle (upper-cased payload) not received"
+	CASE1_FAIL=1
+fi
+
+if [ $CASE1_FAIL -eq 0 ]; then
+	echo "  Case 1 PASS"
+else
+	echo "  Case 1 FAIL"
+	echo "  --- bpcmdd1.log ---"; cat bpcmdd1.log
+	echo "  --- out.case1 ---"; cat out.case1
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 2: -n — the command still runs (marker is written) but NO reply
+# bundle is sent back to the source.  Send "quiet one" from ipn:1.8 to
+# the -n daemon on ipn:1.7, then confirm ipn:1.8 receives nothing.
+# ----------------------------------------------------------------------
+echo
+echo "Case 2: -n suppresses the reply (command still runs)"
+printf 'quiet one' > req2.dat
+bpsendfile ipn:1.8 ipn:1.7 req2.dat
+sleep 2
+bpsink ipn:1.8 > out.case2 2>&1 &
+SINK2_PID=$!
+sleep 3
+kill "$SINK2_PID" 2>/dev/null
+wait "$SINK2_PID" 2>/dev/null
+
+CASE2_FAIL=0
+if [ "$(cat "$MARKER2" 2>/dev/null)" != "ipn:1.8|9|quiet one" ]; then
+	echo "  handler did not run under -n as expected"
+	echo "  marker: '$(cat "$MARKER2" 2>/dev/null)' (want 'ipn:1.8|9|quiet one')"
+	CASE2_FAIL=1
+fi
+if grep -q "QUIET ONE" out.case2; then
+	echo "  a reply was sent despite -n"
+	CASE2_FAIL=1
+fi
+
+if [ $CASE2_FAIL -eq 0 ]; then
+	echo "  Case 2 PASS"
+else
+	echo "  Case 2 FAIL"
+	echo "  --- bpcmdd2.log ---"; cat bpcmdd2.log
+	echo "  --- out.case2 ---"; cat out.case2
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Teardown
+# ----------------------------------------------------------------------
+echo
+echo "Stopping bpcmdd..."
+kill "$BPCMDD1_PID" "$BPCMDD2_PID" 2>/dev/null
+wait "$BPCMDD1_PID" 2>/dev/null
+wait "$BPCMDD2_PID" 2>/dev/null
+
+echo "Stopping ION..."
+ionstop
+
+exit $FAIL
