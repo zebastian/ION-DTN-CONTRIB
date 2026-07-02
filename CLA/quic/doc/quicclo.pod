@@ -5,7 +5,8 @@ quicclo - DTN QUIC convergence layer output task
 =head1 SYNOPSIS
 
 B<quicclo> [B<-C> I<cafile>] [B<-c> I<cert>] [B<-k> I<key>] [B<-A> I<alpn>]
-[B<-n>] [B<-u>] [B<-t> I<idlesec>] I<host>[:I<port>]
+[B<-n>] [B<-u>] [B<-r> I<bytes>] [B<-w> I<bytes>] [B<-t> I<idlesec>]
+I<host>[:I<port>]
 
 =head1 DESCRIPTION
 
@@ -55,6 +56,16 @@ Do not verify the server certificate.
 
 Use the unreliable service, carrying bundles in QUIC datagrams (no
 acknowledgement) rather than on reliable streams.
+
+=item B<-r> I<bytes>
+
+UDP socket receive buffer (B<SO_RCVBUF>), in bytes; 0 (default) leaves the
+operating-system default.
+
+=item B<-w> I<bytes>
+
+UDP socket send buffer (B<SO_SNDBUF>), in bytes; 0 (default) leaves the
+operating-system default.
 
 =item B<-t> I<idlesec>
 

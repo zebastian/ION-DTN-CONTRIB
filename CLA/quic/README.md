@@ -68,7 +68,13 @@ a outduct quic 'peer.example:4560' 'quicclo -C ca.pem'
 ```
 
 Flags: `-c`/`-k` cert/key, `-C` CA file, `-A` ALPN, `-n` no-verify, `-t` idle
-timeout (s), `-u` unreliable (datagram) service.
+timeout (s), `-u` unreliable (datagram) service, `-r`/`-w` UDP socket
+receive/send buffer sizes in bytes (`SO_RCVBUF`/`SO_SNDBUF`; 0 = OS default).
+
+On Linux the datapath uses UDP GSO (segmentation offload) on transmit and GRO
+on receive when the kernel supports them, coalescing many QUIC packets into a
+single `sendmsg`/`recvmsg` to cut per-packet syscall overhead; it falls back to
+one datagram per packet otherwise.
 
 ## Layout
 
@@ -83,6 +89,7 @@ src/quiccli.c          input daemon  (passive entity / server)
 doc/*.pod              man page sources
 tests/loopback-quic/         single-node reliable loopback (.optional)
 tests/loopback-quic-dgram/   single-node unreliable loopback (.optional)
+tests/interop-unibo-bp/      ION <-> Unibo-BP cross-project interop (.optional)
 bench/bench-quic             throughput benchmark
 ```
 
@@ -93,6 +100,9 @@ bench/bench-quic             throughput benchmark
   transfers, multiple streamed bundles, priority-to-stream routing
   (a high-ordinal bundle must use stream 4), and graceful SESS_TERM.
 - `tests/loopback-quic-dgram` — unreliable service over multiple datagrams.
+- `tests/interop-unibo-bp` — live cross-project interop against a Unibo-BP
+  node (picoquic/OpenSSL): a bundle each way over one QUIC connection.
+  SKIPs unless the `unibo-bp*` tools are on `PATH` (or `UNIBO_BP_BIN_DIR`).
 
 Some behaviours are verified by inspection rather than by the automated
 suite, as they are awkward to drive with the standard BP tools:

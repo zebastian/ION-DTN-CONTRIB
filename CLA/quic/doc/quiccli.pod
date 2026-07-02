@@ -5,7 +5,7 @@ quiccli - DTN QUIC convergence layer input task
 =head1 SYNOPSIS
 
 B<quiccli> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-A> I<alpn>]
-[B<-t> I<idlesec>] I<host>[:I<port>]
+[B<-r> I<bytes>] [B<-w> I<bytes>] [B<-t> I<idlesec>] I<host>[:I<port>]
 
 =head1 DESCRIPTION
 
@@ -43,6 +43,16 @@ PEM file of trusted CA certificates for verifying clients (mutual TLS).
 =item B<-A> I<alpn>
 
 ALPN protocol identifier (default C<quicclav1>); must match the client.
+
+=item B<-r> I<bytes>
+
+UDP socket receive buffer (B<SO_RCVBUF>), in bytes; 0 (default) leaves the
+operating-system default.
+
+=item B<-w> I<bytes>
+
+UDP socket send buffer (B<SO_SNDBUF>), in bytes; 0 (default) leaves the
+operating-system default.
 
 =item B<-t> I<idlesec>
 

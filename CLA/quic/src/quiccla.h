@@ -45,6 +45,8 @@ typedef struct
 	int  idleSec;
 	int  unreliable;		  /* use QUIC datagrams, not streams.	*/
 	int  segmentMru; /* advertised Segment MRU; 0 = default.	*/
+	int  rcvBufSize; /* SO_RCVBUF, bytes; 0 = OS default.		*/
+	int  sndBufSize; /* SO_SNDBUF, bytes; 0 = OS default.		*/
 } QuicClaConfig;
 
 /*
@@ -101,6 +103,8 @@ static int parseQuicDuctName(const char *ductName, char *host, int *port)
  *   -n             client: do not verify server certificate
  *   -u             use the unreliable (QUIC datagram) service
  *   -S <bytes>     advertised Segment MRU (default = max bundle size)
+ *   -r <bytes>     UDP socket receive buffer (SO_RCVBUF; 0 = OS default)
+ *   -w <bytes>     UDP socket send buffer (SO_SNDBUF; 0 = OS default)
  *   -t <seconds>   idle timeout (default 30)
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
@@ -145,6 +149,14 @@ static int parseQuicArgs(int argc, char *argv[], QuicClaConfig *cfg)
 		else if (strcmp(argv[i], "-S") == 0 && i + 1 < argc)
 		{
 			cfg->segmentMru = atoi(argv[++i]);
+		}
+		else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc)
+		{
+			cfg->rcvBufSize = atoi(argv[++i]);
+		}
+		else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc)
+		{
+			cfg->sndBufSize = atoi(argv[++i]);
 		}
 		else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)
 		{

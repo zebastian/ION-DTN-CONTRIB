@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <poll.h>
@@ -19,8 +20,7 @@
 #include <time.h>
 #include "quicmsg.h"
 #include "quictls.h"
-
-#define QUIC_MAX_UDP 1452 /* Conservative QUIC datagram.	*/
+#include "quicudp.h"
 
 /*	One queued outbound QUIC DATAGRAM (a single XFER_SEGMENT) for the
  *	unreliable service.						*/
@@ -131,6 +131,8 @@ struct QuicSession
 {
 	int	      fd;
 	int	      isServer;
+	int	      useGso; /* UDP_SEGMENT available (TX coalescing).	*/
+	int	      useGro; /* UDP_GRO enabled (RX coalescing).		*/
 	QuicClaConfig cfg;
 	QuicTlsCreds *creds;
 
@@ -981,15 +983,22 @@ static void prepareAck(QuicConn *qc)
 static int writeConn(QuicConn *qc)
 {
 	QuicSession	   *s = qc->owner;
-	uint8_t		    buf[QUIC_MAX_UDP];
+	/*	Client socket is connected (no destination); server names the
+	 *	peer per send.						*/
+	struct sockaddr	   *dest = s->isServer
+			? (struct sockaddr *) &qc->remote : NULL;
+	socklen_t	    destLen = s->isServer ? qc->remoteLen : 0;
+	QuicTxBatch	    batch;
 	ngtcp2_path_storage ps;
 	ngtcp2_pkt_info	    pi;
 	ngtcp2_tstamp	    ts = quicNow();
 
 	prepareAck(qc);
+	quicTxBatchInit(&batch, s->fd, &s->useGso, dest, destLen);
 
 	for (;;)
 	{
+		int		     rc;
 		ngtcp2_ssize	     nwrite;
 		ngtcp2_ssize	     pdatalen = -1;
 		int64_t		     streamId = -1;
@@ -1051,9 +1060,24 @@ static int writeConn(QuicConn *qc)
 			pvcnt = 1;
 		}
 
-		nwrite = ngtcp2_conn_writev_stream(qc->conn, &ps.path, &pi, buf,
-				sizeof(buf), &pdatalen, 0, streamId, pv, pvcnt,
-				ts);
+		/*	Make room for the next packet (may flush the batch),
+		 *	then let ngtcp2 produce it into the batch buffer.	*/
+
+		rc = quicTxBatchReserve(&batch);
+		if (rc != 0)
+		{
+			if (rc < 0)
+			{
+				qc->failed = 1;
+			}
+
+			return rc < 0 ? -1 : 0;
+		}
+
+		nwrite = ngtcp2_conn_writev_stream(qc->conn, &ps.path, &pi,
+				quicTxBatchTail(&batch),
+				quicTxBatchLimit(&batch), &pdatalen, 0,
+				streamId, pv, pvcnt, ts);
 		if (nwrite < 0)
 		{
 			writeMemoNote("[?] quic: writev_stream failed",
@@ -1087,20 +1111,26 @@ static int writeConn(QuicConn *qc)
 
 		if (nwrite == 0)
 		{
-			break; /* Nothing more to send.		*/
-		}
+			/*	Nothing more to send: flush the batch.	*/
 
-		if (sendto(s->fd, buf, nwrite, 0, (struct sockaddr *) &qc->remote,
-				    qc->remoteLen)
-				< 0)
-		{
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			rc = quicTxBatchFlush(&batch);
+			if (rc < 0)
 			{
-				break;
+				qc->failed = 1;
 			}
 
-			qc->failed = 1;
-			return -1;
+			return rc < 0 ? -1 : 0;
+		}
+
+		rc = quicTxBatchCommit(&batch, (size_t) nwrite);
+		if (rc != 0)
+		{
+			if (rc < 0)
+			{
+				qc->failed = 1;
+			}
+
+			return rc < 0 ? -1 : 0;
 		}
 	}
 
@@ -1276,6 +1306,14 @@ static void freeConn(QuicConn *qc)
 
 static void *clientIo(void *parm);
 
+/*	Feed one received packet (from a possibly GRO-coalesced read) into the
+ *	client connection.  Stops the read drain if the connection fails.	*/
+
+static int clientFeedPacket(void *user, const uint8_t *pkt, size_t len)
+{
+	return feedConn((QuicConn *) user, pkt, len);
+}
+
 QuicSession *quicClientStart(const QuicClaConfig *cfg)
 {
 	QuicSession	       *s;
@@ -1354,6 +1392,9 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 		putSysErrmsg("quicclo: getsockname failed", NULL);
 		goto fail;
 	}
+
+	quicUdpApplyOpts(s->fd, cfg->rcvBufSize, cfg->sndBufSize,
+			&s->useGso, &s->useGro);
 
 	freeaddrinfo(res);
 	res = NULL;
@@ -1475,8 +1516,9 @@ static void *clientIo(void *parm)
 		struct pollfd pfds[2];
 		ngtcp2_tstamp expiry;
 		int	      timeoutMs = 1000;
-		uint8_t	      buf[2048];
+		uint8_t	      buf[QUIC_RX_BUFSZ];
 		ssize_t	      n;
+		int	      seg;
 
 		/*	Once the QUIC handshake completes, open stream 0
 		 *	(the first client bidi stream, == QUICCL_SIG_STREAM)
@@ -1569,9 +1611,16 @@ static void *clientIo(void *parm)
 			}
 		}
 
-		while ((n = recv(s->fd, buf, sizeof(buf), 0)) > 0)
+		/*	Each read may be a GRO-coalesced train of seg-byte
+		 *	datagrams; split it back into individual QUIC packets.	*/
+
+		while ((n = quicUdpRecv(s->fd, s->useGro, buf, sizeof(buf),
+				NULL, NULL, &seg))
+				> 0)
 		{
-			if (feedConn(qc, buf, n) < 0)
+			if (quicUdpForEachPacket(buf, (size_t) n, seg,
+					clientFeedPacket, qc)
+					< 0)
 			{
 				break;
 			}
@@ -1971,6 +2020,8 @@ QuicSession *quicServerStart(const QuicClaConfig *cfg)
 		goto fail;
 	}
 
+	quicUdpApplyOpts(s->fd, cfg->rcvBufSize, cfg->sndBufSize,
+			&s->useGso, &s->useGro);
 	freeaddrinfo(res);
 	oK(fcntl(s->fd, F_SETFL, O_NONBLOCK));
 	return s;
@@ -2101,6 +2152,47 @@ static void removeConn(QuicSession *s, QuicConn *dead)
 	freeConn(dead);
 }
 
+/*	Per-read context for serverFeedPacket: the peer of the current UDP
+ *	read (its GRO-coalesced packets all share one source).		*/
+typedef struct
+{
+	QuicSession		*s;
+	struct sockaddr_storage *remote;
+	socklen_t		 remoteLen;
+} ServerRxCtx;
+
+/*	Dispatch one received packet (from a possibly GRO-coalesced read) to
+ *	its connection, accepting a new connection when needed.  Malformed or
+ *	unacceptable packets are dropped; the drain never stops early.	*/
+
+static int serverFeedPacket(void *user, const uint8_t *pkt, size_t len)
+{
+	ServerRxCtx	  *ctx = user;
+	ngtcp2_version_cid vc;
+	QuicConn	  *qc;
+
+	if (ngtcp2_pkt_decode_version_cid(&vc, pkt, len, NGTCP2_MAX_CIDLEN)
+			!= 0)
+	{
+		return 0;
+	}
+
+	qc = findConn(ctx->s, vc.dcid, vc.dcidlen);
+	if (qc == NULL)
+	{
+		qc = acceptConn(ctx->s, pkt, len,
+				(struct sockaddr *) ctx->remote,
+				ctx->remoteLen);
+		if (qc == NULL)
+		{
+			return 0;
+		}
+	}
+
+	oK(feedConn(qc, pkt, len));
+	return 0;
+}
+
 int quicServerRun(QuicSession *s, QuicBundleCb cb, void *user,
 		volatile int *running)
 {
@@ -2110,14 +2202,15 @@ int quicServerRun(QuicSession *s, QuicBundleCb cb, void *user,
 	while (*running)
 	{
 		struct pollfd		pfd;
-		uint8_t			buf[2048];
+		uint8_t			buf[QUIC_RX_BUFSZ];
 		ssize_t			n;
 		struct sockaddr_storage remote;
 		socklen_t		remoteLen;
 		QuicConn	       *qc;
 		QuicConn	       *next;
-		ngtcp2_version_cid	vc;
+		ServerRxCtx		ctx;
 		int			timeoutMs = 1000;
+		int			seg;
 
 		pfd.fd = s->fd;
 		pfd.events = POLLIN;
@@ -2128,34 +2221,18 @@ int quicServerRun(QuicSession *s, QuicBundleCb cb, void *user,
 			return -1;
 		}
 
-		remoteLen = sizeof(remote);
-		while ((n = recvfrom(s->fd, buf, sizeof(buf), 0,
-					(struct sockaddr *) &remote, &remoteLen))
+		/*	Each read may be a GRO-coalesced train of seg-byte
+		 *	datagrams; split it back into individual QUIC packets.	*/
+
+		while ((n = quicUdpRecv(s->fd, s->useGro, buf, sizeof(buf),
+				&remote, &remoteLen, &seg))
 				> 0)
 		{
-			if (ngtcp2_pkt_decode_version_cid(&vc, buf, n,
-					    NGTCP2_MAX_CIDLEN)
-					!= 0)
-			{
-				remoteLen = sizeof(remote);
-				continue;
-			}
-
-			qc = findConn(s, vc.dcid, vc.dcidlen);
-			if (qc == NULL)
-			{
-				qc = acceptConn(s, buf, n,
-						(struct sockaddr *) &remote,
-						remoteLen);
-				if (qc == NULL)
-				{
-					remoteLen = sizeof(remote);
-					continue;
-				}
-			}
-
-			oK(feedConn(qc, buf, n));
-			remoteLen = sizeof(remote);
+			ctx.s = s;
+			ctx.remote = &remote;
+			ctx.remoteLen = remoteLen;
+			oK(quicUdpForEachPacket(buf, (size_t) n, seg,
+					serverFeedPacket, &ctx));
 		}
 
 		for (qc = s->conns; qc != NULL; qc = next)

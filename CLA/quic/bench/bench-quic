@@ -11,6 +11,8 @@
 #   MESSAGE_SIZE_MAX  largest payload, bytes    (default 65536)
 #   CYCLES            bundles sent per size     (default 2000)
 #   QUIC_PORT         UDP port for the link     (default 4656)
+#   QUIC_RCVBUF       UDP SO_RCVBUF, bytes      (default 0 = OS default)
+#   QUIC_SNDBUF       UDP SO_SNDBUF, bytes      (default 0 = OS default)
 #
 # Output: a table on stdout and results.csv (size,bundles,seconds,mbps,bundles_per_s).
 #
@@ -23,7 +25,14 @@ MESSAGE_SIZE_MIN="${MESSAGE_SIZE_MIN:-1024}"
 MESSAGE_SIZE_MAX="${MESSAGE_SIZE_MAX:-65536}"
 CYCLES="${CYCLES:-2000}"
 QUIC_PORT="${QUIC_PORT:-4656}"
+QUIC_RCVBUF="${QUIC_RCVBUF:-0}"
+QUIC_SNDBUF="${QUIC_SNDBUF:-0}"
 QUICDUCT="127.0.0.1:${QUIC_PORT}"
+
+# Optional UDP socket-buffer sizing, passed to both CLAs (-r/-w).
+SOCKOPTS=""
+[ "$QUIC_RCVBUF" -gt 0 ] && SOCKOPTS="$SOCKOPTS -r $QUIC_RCVBUF"
+[ "$QUIC_SNDBUF" -gt 0 ] && SOCKOPTS="$SOCKOPTS -w $QUIC_SNDBUF"
 
 CONFIGDIR="./config"
 CERT="$(pwd)/server.pem"
@@ -66,6 +75,11 @@ sed -e "s|QUICDUCT|${QUICDUCT}|g" \
 	"${CONFIGDIR}/bench.ipnrc" > "${CONFIGDIR}/bench_runtime.ipnrc"
 sed -i "s|config/bench.ipnrc|config/bench_runtime.ipnrc|g" \
 	"${CONFIGDIR}/bench_runtime.bprc"
+if [ -n "$SOCKOPTS" ]; then
+	sed -i -e "s|'quiccli |'quiccli${SOCKOPTS} |" \
+		-e "s|'quicclo |'quicclo${SOCKOPTS} |" \
+		"${CONFIGDIR}/bench_runtime.bprc"
+fi
 
 echo "Starting ION..."
 ionadmin "${CONFIGDIR}/bench.ionrc" >/dev/null 2>&1

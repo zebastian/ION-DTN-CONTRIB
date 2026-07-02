@@ -8,18 +8,19 @@ AM_CPPFLAGS = -I$(top_srcdir)/include $(ION_CFLAGS) $(QUIC_CFLAGS)
 
 bin_PROGRAMS = quiccli quicclo
 
-noinst_HEADERS = src/quiccla.h src/quicsession.h src/quictls.h src/quicmsg.h
+noinst_HEADERS = src/quiccla.h src/quicsession.h src/quictls.h \
+	src/quicmsg.h src/quicudp.h
 
 # TLS backend (GnuTLS is the only one apt-installable today; an OpenSSL or
 # wolfSSL quictls_*.c can be swapped in here behind the same interface).
 QUIC_TLS_SOURCES = src/quictls_gnutls.c
 
 quiccli_SOURCES = src/quiccli.c src/quicsession.c src/quicmsg.c \
-	$(QUIC_TLS_SOURCES)
+	src/quicudp.c $(QUIC_TLS_SOURCES)
 quiccli_LDADD = $(ION_LIBS) $(QUIC_LIBS) -lpthread
 
 quicclo_SOURCES = src/quicclo.c src/quicsession.c src/quicmsg.c \
-	$(QUIC_TLS_SOURCES)
+	src/quicudp.c $(QUIC_TLS_SOURCES)
 quicclo_LDADD = $(ION_LIBS) $(QUIC_LIBS) -lpthread
 
 # --- unit tests (make check) --- #

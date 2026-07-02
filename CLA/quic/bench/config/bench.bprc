@@ -3,6 +3,7 @@
 a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
+m payloadcrc 0
 a protocol quic 1400 100
 a induct  quic QUICDUCT 'quiccli -c CERT -k KEY'
 a outduct quic QUICDUCT 'quicclo -n'
