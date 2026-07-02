@@ -1,0 +1,8 @@
+#!/bin/bash
+# Cleanup script for mail CLA loopback test
+pkill -9 -f "mailcli" 2>/dev/null
+pkill -9 -f "mailclo" 2>/dev/null
+pkill -9 -f "mailmock.py" 2>/dev/null
+killm
+rm -f ./config/loopback_runtime.bprc
+rm -f testfile2

@@ -1,0 +1,1 @@
+Requires python3 (bundled SMTP/POP3 mock) and libcurl; not part of standard regression suite.

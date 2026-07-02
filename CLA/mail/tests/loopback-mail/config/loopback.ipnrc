@@ -1,0 +1,5 @@
+# ipnrc configuration file for the mail CLA loopback test.
+# Command: % ipnadmin loopback.ipnrc
+
+# Bundles to node 1 go via the mail outduct.
+a plan 1 mail/node1@localhost

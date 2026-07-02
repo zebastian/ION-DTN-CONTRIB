@@ -66,6 +66,7 @@ AC_CHECK_PROG([POD2MAN], [pod2man], [pod2man])
 AM_CONDITIONAL([HAVE_POD2MAN], [test "x$POD2MAN" != "x"])
 
 # One include per contribution (the configure analogue of SUBDIRS).
+m4_include([CLA/mail/configure.m4])
 m4_include([CLA/mqtt/configure.m4])
 m4_include([CLA/mysql/configure.m4])
 m4_include([CLA/quic/configure.m4])

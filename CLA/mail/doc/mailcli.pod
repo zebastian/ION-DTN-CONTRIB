@@ -1,0 +1,103 @@
+=head1 NAME
+
+mailcli - DTN mail (POP3) convergence layer input task
+
+=head1 SYNOPSIS
+
+B<mailcli> I<mailbox> B<-S> I<host>[:I<port>] [B<-u> I<user>]
+[B<-p> I<password>] [B<-s>] [B<-t>] [B<-C> I<cafile>] [B<-n>]
+[B<-e> attach|b64|raw] [B<-i> I<pollsecs>]
+
+=head1 DESCRIPTION
+
+B<mailcli> is a background "daemon" task that receives bundles by
+electronic mail.  It polls a POP3 mailbox at a fixed interval, extracts
+one or more bundles from each message, and injects them into the local
+BP node.  A message is deleted once at least one bundle has been
+recovered from it; messages that carry no recoverable bundle are left in
+the mailbox.
+
+The duct name I<mailbox> is a local label identifying the induct; the
+mailbox actually polled is determined by the POP3 server (B<-S>) and the
+login credentials (B<-u>, B<-p>).
+
+The B<-e> option selects how message payloads are decoded and matches
+the encoding used by the sending B<mailclo> (C<attach>, C<b64>, or
+C<raw>; default C<attach>).  The advisory C<X-ION-Bundle-Encoding>
+header set by B<mailclo> is not required for reception.
+
+B<mailcli> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the command text is provided when the "mail"
+convergence layer protocol induct is added to the BP database.  The task
+is terminated by B<bpadmin> in response to an 'x' (STOP) command.
+
+B<mailcli> requires libcurl with POP3 support.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-S> I<host>[:I<port>]
+
+POP3 server.  If I<port> is omitted it defaults to 995 with B<-s>,
+otherwise 110.
+
+=item B<-u> I<user>
+
+POP3 authentication user name.
+
+=item B<-p> I<password>
+
+POP3 authentication password.
+
+=item B<-s>
+
+Use implicit TLS (POP3S).
+
+=item B<-t>
+
+Use STLS on the plain POP3 port.
+
+=item B<-C> I<cafile>
+
+PEM file of trusted CA certificates for server verification.
+
+=item B<-n>
+
+Do not verify the server certificate.
+
+=item B<-e> attach|b64|raw
+
+Payload decoding mode (default C<attach>).
+
+=item B<-i> I<pollsecs>
+
+Mailbox polling interval in seconds (default 30).
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<mailcli> terminated normally.
+
+=item "1"
+
+B<mailcli> terminated abnormally; check the B<ion.log> file, then use
+B<bpadmin> to restart B<mailcli>.
+
+=back
+
+=head1 EXAMPLES
+
+    a induct mail node1@example.org 'mailcli -S pop.example.org:995 -s -u node1 -p secret'
+
+ION appends the duct name to the command automatically, so it is not
+repeated in the command text.
+
+=head1 SEE ALSO
+
+bpadmin(1), mailclo(1), bprc(5)

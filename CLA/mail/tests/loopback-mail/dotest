@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+#
+# Mail CLA Loopback Test
+#
+# A single ION node sends a bundle to itself over the mail CLA: mailclo
+# submits it via SMTP to a bundled in-memory mock server, and mailcli
+# polls that mailbox over POP3 and injects the bundle back into ION.
+#
+# Prerequisites:
+#   - ION built with the mail CLA (mailcli / mailclo on PATH)
+#   - python3 (runs the bundled SMTP/POP3 mock; no real mail server)
+#
+
+CONFIGFILES=" \
+./config/loopback.ionrc \
+./config/loopback.bprc \
+./config/loopback.ipnrc \
+"
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the mail CLA (SMTP send + POP3 poll) in loopback."
+echo
+echo "CONFIG: Custom loopback configuration: "
+echo
+for N in $CONFIGFILES
+do
+    echo "$N:"
+    cat $N
+    echo "# EOF"
+    echo
+done
+echo "OUTPUT: Uses bpsource and bpsink to send and receive a bundle via mail."
+echo
+echo "########################################"
+
+FAIL=0
+
+if ! command -v mailcli >/dev/null 2>&1; then
+    echo "SKIP: mailcli not found. Build the mail CLA."
+    exit 2
+fi
+
+if ! command -v mailclo >/dev/null 2>&1; then
+    echo "SKIP: mailclo not found. Build the mail CLA."
+    exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "SKIP: python3 not found (needed for the mail mock server)."
+    exit 2
+fi
+
+SMTP_PORT=12525
+POP_PORT=11110
+
+echo "Killing old ION..."
+killm
+pkill -9 -f "mailcli" 2>/dev/null
+pkill -9 -f "mailclo" 2>/dev/null
+pkill -9 -f "mailmock.py" 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+
+rm -f ion.log testfile2
+
+echo "Starting mail mock (SMTP ${SMTP_PORT}, POP3 ${POP_PORT})..."
+python3 ./mailmock.py ${SMTP_PORT} ${POP_PORT} &
+MOCK_PID=$!
+sleep 1
+
+if ! kill -0 ${MOCK_PID} 2>/dev/null; then
+    echo "SKIP: mail mock failed to start."
+    exit 2
+fi
+
+# --- Generate runtime bprc with the chosen ports ---
+
+CONFIGDIR="./config"
+sed -e "s|SMTPPORT|${SMTP_PORT}|g" -e "s|POPPORT|${POP_PORT}|g" \
+    "${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+
+# --- Start ION ---
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+
+echo "Waiting for mail CLAs to start..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if pgrep -f "mailcli" > /dev/null && pgrep -f "mailclo" > /dev/null; then
+        echo "Mail CLAs are running."
+        break
+    fi
+    echo "  Waiting... ($i)"
+    sleep 1
+done
+sleep 2
+
+if ! pgrep -f "mailcli" > /dev/null || ! pgrep -f "mailclo" > /dev/null; then
+    echo "ERROR: mail CLAs did not start."
+    tail -30 ion.log 2>/dev/null
+    kill ${MOCK_PID} 2>/dev/null
+    ionstop
+    killm
+    exit 1
+fi
+
+# --- Send and receive a bundle ---
+
+echo "Starting bpsink..."
+bpsink ipn:1.1 > testfile2 &
+BPSINK_PID=$!
+sleep 1
+
+echo "Sending bundle via bpsource..."
+bpsource ipn:1.1 "mail CLA loopback test message"
+sleep 8
+
+echo "Checking received data..."
+if grep -q "mail CLA loopback test message" testfile2; then
+    echo "SUCCESS: Bundle received correctly via mail CLA loopback!"
+else
+    echo "ERROR: Bundle not received or content mismatch."
+    echo "Received:"
+    cat testfile2
+    echo ""
+    echo "ion.log tail:"
+    tail -30 ion.log 2>/dev/null
+    FAIL=1
+fi
+
+# --- Cleanup ---
+
+echo "Cleaning up..."
+kill $BPSINK_PID 2>/dev/null
+wait $BPSINK_PID 2>/dev/null
+
+pkill -9 -f "mailcli" 2>/dev/null
+pkill -9 -f "mailclo" 2>/dev/null
+sleep 1
+
+ionstop
+sleep 1
+killm
+
+kill ${MOCK_PID} 2>/dev/null
+pkill -9 -f "mailmock.py" 2>/dev/null
+
+rm -f testfile2
+rm -f "${CONFIGDIR}/loopback_runtime.bprc"
+
+exit $FAIL

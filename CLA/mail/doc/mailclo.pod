@@ -1,0 +1,141 @@
+=head1 NAME
+
+mailclo - DTN mail (SMTP) convergence layer output task
+
+=head1 SYNOPSIS
+
+B<mailclo> I<recipient> B<-S> I<host>[:I<port>] B<-f> I<sender>
+[B<-u> I<user>] [B<-p> I<password>] [B<-s>] [B<-t>] [B<-C> I<cafile>]
+[B<-n>] [B<-e> attach|b64|raw] [B<-d> I<secs>] [B<-m> I<maxbundles>]
+[B<-M> I<maxbytes>]
+
+=head1 DESCRIPTION
+
+B<mailclo> is a background "daemon" task that transmits bundles by
+electronic mail.  Each outbound bundle is serialized and sent, via SMTP,
+to the mailbox named by the duct name I<recipient>.  The peer node runs
+B<mailcli> to poll that mailbox and recover the bundles.
+
+The duct name is the recipient e-mail address.  The SMTP relay is given
+with B<-S>, and the envelope/header sender address with B<-f>.
+
+The payload encoding is selected with B<-e>:
+
+=over 4
+
+=item B<attach> (default)
+
+Each bundle is carried as a separate base64 MIME attachment; a message
+may therefore carry several bundles.
+
+=item B<b64>
+
+The bundle is base64-encoded into the message body.
+
+=item B<raw>
+
+The raw serialized bundle bytes are placed in the message body.
+
+=back
+
+When more than one bundle is carried in a body encoding (B<b64> or
+B<raw>), the bundles are delimited by a line containing
+C<--ION-BUNDLE-MAIL-SEPARATOR-->.
+
+By default each bundle is sent immediately in its own message.  If a
+digest interval is set with B<-d>, bundles are accumulated for up to
+that many seconds and then sent together in one message; B<-m> and B<-M>
+bound the number of bundles and total bytes held before an early flush.
+
+B<mailclo> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the command text is provided when the "mail"
+convergence layer protocol outduct is added to the BP database.  The
+task is terminated by B<bpadmin> in response to an 'x' (STOP) command.
+
+B<mailclo> requires libcurl with SMTP support.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-S> I<host>[:I<port>]
+
+SMTP relay.  If I<port> is omitted it defaults to 465 with B<-s>, 587
+with B<-t>, otherwise 25.
+
+=item B<-f> I<sender>
+
+Envelope and header sender address.
+
+=item B<-u> I<user>
+
+SMTP authentication user name.
+
+=item B<-p> I<password>
+
+SMTP authentication password.
+
+=item B<-s>
+
+Use implicit TLS (SMTPS).
+
+=item B<-t>
+
+Use STARTTLS on the plain SMTP port.
+
+=item B<-C> I<cafile>
+
+PEM file of trusted CA certificates for server verification.
+
+=item B<-n>
+
+Do not verify the server certificate (e.g. self-signed relays).
+
+=item B<-e> attach|b64|raw
+
+Payload encoding (default C<attach>).
+
+=item B<-d> I<secs>
+
+Digest interval in seconds (default 0, send immediately).
+
+=item B<-m> I<maxbundles>
+
+Maximum bundles per digest before an early flush (default 64).
+
+=item B<-M> I<maxbytes>
+
+Maximum accumulated bundle bytes per digest before an early flush
+(default 0, no byte limit).
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<mailclo> terminated normally.
+
+=item "1"
+
+B<mailclo> terminated abnormally; check the B<ion.log> file, then use
+B<bpadmin> to restart B<mailclo>.
+
+=back
+
+=head1 EXAMPLES
+
+    a outduct mail node2@example.org 'mailclo -S smtp.example.org:587 -t -f node1@example.org -u node1 -p secret'
+
+With a 30-second digest of raw bundles:
+
+    a outduct mail node2@example.org 'mailclo -S smtp.example.org:587 -t -f node1@example.org -u node1 -p secret -e raw -d 30'
+
+ION appends the duct name (the recipient address) to the command
+automatically, so it is not repeated in the command text.
+
+=head1 SEE ALSO
+
+bpadmin(1), mailcli(1), bprc(5)

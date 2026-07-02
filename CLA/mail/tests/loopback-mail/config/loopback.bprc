@@ -1,0 +1,22 @@
+# bprc configuration file for the mail CLA loopback test.
+# Command: % bpadmin loopback.bprc
+
+1
+
+a scheme ipn 'ipnfw' 'ipnadminep'
+
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+
+a protocol mail
+
+# Induct polls the mock POP3 mailbox; outduct sends via the mock SMTP relay.
+# ION appends the duct name to each command, so it is not repeated here.
+# Credentials are folded into -S ([user:pass@]host) to stay within ION's
+# 11-token command limit.
+a induct mail node1@localhost 'mailcli -S node1:pass@127.0.0.1:POPPORT -i 2'
+a outduct mail node1@localhost 'mailclo -S 127.0.0.1:SMTPPORT -f node1@localhost'
+
+r 'ipnadmin config/loopback.ipnrc'
+
+s
