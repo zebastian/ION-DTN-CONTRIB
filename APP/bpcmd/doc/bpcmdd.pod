@@ -4,7 +4,7 @@ bpcmdd - Bundle Protocol command daemon
 
 =head1 SYNOPSIS
 
-B<bpcmdd> [B<-n>] [B<-t> I<ttl>] I<ownEndpointID> I<command> [I<arg> ...]
+B<bpcmdd> [B<-a>] [B<-n>] [B<-t> I<ttl>] I<ownEndpointID> I<command> [I<arg> ...]
 
 =head1 DESCRIPTION
 
@@ -13,6 +13,9 @@ bundle it forks I<command>, pipes the bundle payload to that command's
 standard input, and, unless B<-n> is given, returns whatever the command
 writes to its standard output back to the bundle's source endpoint ID as a
 reply bundle.
+
+If B<-a> is given, the payload is instead appended as a final argument to
+I<command> and the command's standard input is left empty.
 
 One child process is spawned per bundle (fork-per-bundle), and bundles are
 processed serially: a long-running command blocks reception of the next
@@ -51,6 +54,12 @@ Details are noted in the B<ion.log> log file.
 =head1 OPTIONS
 
 =over 4
+
+=item B<-a>
+
+Pass the payload as an extra final argument to I<command> instead of on its
+standard input.  The argument is NUL-terminated, so a payload containing
+embedded NUL bytes is truncated at the first one.
 
 =item B<-n>
 

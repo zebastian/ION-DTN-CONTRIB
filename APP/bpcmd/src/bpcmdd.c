@@ -31,10 +31,13 @@ static Sdr   sdr;
 static int   running = 1;
 
 static const char usage[] =
-		"Usage: bpcmdd [-n] [-t ttl] <own endpoint ID> <command> [arg ...]\n\n"
+		"Usage: bpcmdd [-a] [-n] [-t ttl] <own endpoint ID> <command> "
+		"[arg ...]\n\n"
 		"Listens on the given BP endpoint.  For each delivered bundle, forks\n"
 		"<command>, pipes the bundle payload to its stdin, and returns its\n"
 		"stdout to the bundle source as a reply bundle.\n\n"
+		"  -a        pass the payload as a final command argument instead of\n"
+		"            on stdin (stdin is left empty; embedded NULs truncate)\n"
 		"  -n        do not send the command's stdout back to the source\n"
 		"  -t ttl    reply bundle lifetime in seconds (default 86400)\n\n"
 		"The command sees BP_SOURCE_EID, BP_DEST_EID and BP_PAYLOAD_LEN in its\n"
@@ -97,14 +100,16 @@ static char *readPayload(Object adu, int *length)
 	return buffer;
 }
 
-/*	Forks the command, feeds it the payload on stdin (via a dedicated
- *	feeder child to avoid stdin/stdout pipe deadlock), and collects
- *	its stdout into a malloc'd buffer.  Returns the command's exit
- *	code (or -1 if it could not be run); *replyBuf / *replyLen receive
- *	the captured stdout (caller frees *replyBuf when non-NULL).	*/
+/*	Forks the command, delivers it the payload (on stdin via a
+ *	dedicated feeder child to avoid stdin/stdout pipe deadlock, or as
+ *	a final command argument when argMode is set), and collects its
+ *	stdout into a malloc'd buffer.  Returns the command's exit code
+ *	(or -1 if it could not be run); *replyBuf / *replyLen receive the
+ *	captured stdout (caller frees *replyBuf when non-NULL).		*/
 
 static int runCommand(char **cmdArgv, char *payload, int payloadLen,
-		char *srcEid, char *ownEid, char **replyBuf, int *replyLen)
+		char *srcEid, char *ownEid, int argMode, char **replyBuf,
+		int *replyLen)
 {
 	int    inPipe[2];
 	int    outPipe[2];
@@ -150,6 +155,33 @@ static int runCommand(char **cmdArgv, char *payload, int payloadLen,
 		setenv("BP_DEST_EID", ownEid, 1);
 		isprintf(lenStr, sizeof lenStr, "%d", payloadLen);
 		setenv("BP_PAYLOAD_LEN", lenStr, 1);
+		if (argMode)
+		{
+			int	 nargs = 0;
+			char	*arg;
+			char   **newArgv;
+
+			while (cmdArgv[nargs])
+			{
+				nargs++;
+			}
+
+			arg = malloc((size_t) payloadLen + 1);
+			newArgv = malloc((nargs + 2) * sizeof(char *));
+			if (arg == NULL || newArgv == NULL)
+			{
+				_exit(127);
+			}
+
+			memcpy(arg, payload, payloadLen);
+			arg[payloadLen] = '\0';
+			memcpy(newArgv, cmdArgv, nargs * sizeof(char *));
+			newArgv[nargs] = arg;
+			newArgv[nargs + 1] = NULL;
+			execvp(newArgv[0], newArgv);
+			_exit(127); /*	exec failed.	*/
+		}
+
 		execvp(cmdArgv[0], cmdArgv);
 		_exit(127); /*	exec failed.	*/
 	}
@@ -167,38 +199,49 @@ static int runCommand(char **cmdArgv, char *payload, int payloadLen,
 	close(inPipe[0]);
 	close(outPipe[1]);
 
-	feederPid = fork();
-	if (feederPid == 0) /*	Feeder child.	*/
+	feederPid = -1;
+	if (argMode)
 	{
-		int off = 0;
-		int n;
-
-		close(outPipe[0]);
-		while (off < payloadLen)
+		/*	Payload goes on the command line; leave stdin
+		 *	empty so the command sees EOF immediately.	*/
+		close(inPipe[1]);
+	}
+	else
+	{
+		feederPid = fork();
+		if (feederPid == 0) /*	Feeder child.	*/
 		{
-			n = write(inPipe[1], payload + off, payloadLen - off);
-			if (n < 0)
+			int off = 0;
+			int n;
+
+			close(outPipe[0]);
+			while (off < payloadLen)
 			{
-				if (errno == EINTR)
+				n = write(inPipe[1], payload + off,
+						payloadLen - off);
+				if (n < 0)
 				{
-					continue;
+					if (errno == EINTR)
+					{
+						continue;
+					}
+
+					break; /*	e.g. EPIPE.	*/
 				}
 
-				break; /*	e.g. EPIPE.	*/
+				off += n;
 			}
 
-			off += n;
+			close(inPipe[1]);
+			_exit(0);
 		}
 
 		close(inPipe[1]);
-		_exit(0);
-	}
-
-	close(inPipe[1]);
-	if (feederPid < 0)
-	{
-		putSysErrmsg("bpcmdd can't fork payload feeder.", NULL);
-		/*	Command child still drains stdin to EOF on close.*/
+		if (feederPid < 0)
+		{
+			putSysErrmsg("bpcmdd can't fork payload feeder.", NULL);
+			/*	Command drains stdin to EOF on close.	*/
+		}
 	}
 
 	buffer = malloc(cap);
@@ -318,16 +361,21 @@ static void sendReply(char *destEid, char *data, int dataLen, int replyTtl)
 int main(int argc, char **argv)
 {
 	int	   reply = 1;
+	int	   argMode = 0;
 	int	   replyTtl = 86400;
 	char	  *ownEid;
 	char	 **cmdArgv;
 	BpDelivery dlv;
 	int	   c;
 
-	while ((c = getopt(argc, argv, "nt:")) != -1)
+	while ((c = getopt(argc, argv, "ant:")) != -1)
 	{
 		switch (c)
 		{
+		case 'a':
+			argMode = 1;
+			break;
+
 		case 'n':
 			reply = 0;
 			break;
@@ -416,7 +464,7 @@ int main(int argc, char **argv)
 		}
 
 		oK(runCommand(cmdArgv, payload, payloadLen, dlv.bundleSourceEid,
-				ownEid, &replyBuf, &replyLen));
+				ownEid, argMode, &replyBuf, &replyLen));
 		MRELEASE(payload);
 
 		if (reply && replyBuf && replyLen > 0 && dlv.bundleSourceEid &&

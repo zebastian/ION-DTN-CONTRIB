@@ -21,15 +21,19 @@ sudo make install
 ## Usage
 
 ```
-bpcmdd [-n] [-t ttl] <own endpoint ID> <command> [arg ...]
+bpcmdd [-a] [-n] [-t ttl] <own endpoint ID> <command> [arg ...]
 ```
 
+- `-a` — pass the payload as an extra final command argument instead of
+  on stdin (stdin is left empty). The argument is NUL-terminated, so a
+  payload containing embedded NUL bytes is truncated at the first one.
 - `-n` — do not send the command's stdout back to the source.
 - `-t ttl` — reply bundle lifetime in seconds (default 86400).
 
 For every bundle, `bpcmdd` spawns a fresh `<command>` process
-(fork-per-bundle, processed serially). The command receives the bundle
-payload on **stdin** and these environment variables:
+(fork-per-bundle, processed serially). Unless `-a` is given, the command
+receives the bundle payload on **stdin**. Either way it sees these
+environment variables:
 
 | Variable          | Meaning                              |
 |-------------------|--------------------------------------|
@@ -65,6 +69,13 @@ bpcmdd ipn:1.5 /opt/handlers/process-telemetry.sh
 
 where `process-telemetry.sh` reads the payload on stdin, uses
 `$BP_SOURCE_EID` to know who asked, and writes its response to stdout.
+
+Pass the payload as an argument instead of on stdin (`-a`) — useful for
+commands that take their input as a parameter:
+
+```sh
+bpcmdd -a ipn:1.5 logger -t dtn      # each payload becomes: logger -t dtn <payload>
+```
 
 ## Notes
 
