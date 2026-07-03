@@ -1,0 +1,14 @@
+# bprc for the ION node (ipn:1). Tokens are substituted by dotest:
+#   ION_INDUCT     host:port the quiccli server binds (peer's outduct target)
+#   UNIBO_OUTDUCT  host:port of the Unibo-BP quiccl induct (quicclo connects)
+#   CERT / KEY     server certificate and key for quiccli
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.0 q
+a endpoint ipn:1.2 q
+a endpoint ipn:1.4 q
+a protocol quic 1400 100
+a induct  quic ION_INDUCT 'quiccli -c CERT -k KEY'
+a outduct quic UNIBO_OUTDUCT 'quicclo -n'
+r 'ipnadmin config/interop_runtime.ipnrc'
+s

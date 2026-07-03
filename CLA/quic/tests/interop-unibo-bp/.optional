@@ -1,0 +1,1 @@
+Requires a Unibo-BP install (unibo-bp*) plus openssl; cross-project interop, not part of the standard regression suite.
