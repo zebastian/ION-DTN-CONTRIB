@@ -1,9 +1,9 @@
 # bpcmdd — Bundle Protocol command daemon, for ION-DTN.
 #
-# Listens on a BP endpoint and, for each delivered bundle, forks a
-# user-supplied command, pipes the payload to its stdin, and returns its
-# stdout to the source.  Builds against an installed ION-DTN; only ION's
-# public header (bp.h) is used.
+# Listens on a BP endpoint; each bundle's payload is a command line, which
+# is run if a whitelist file permits it, and the command's stdout returned
+# to the source.  Builds against an installed ION-DTN; only ION's public
+# header (bp.h) is used.
 
 AM_CPPFLAGS = $(ION_CFLAGS)
 
@@ -27,4 +27,7 @@ endif
 
 EXTRA_DIST = \
 	README.md \
+	examples/gpio.py \
+	examples/health.sh \
+	examples/clock.sh \
 	$(POD1)

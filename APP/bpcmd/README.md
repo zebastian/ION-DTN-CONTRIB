@@ -1,12 +1,18 @@
 # bpcmdd — Bundle Protocol command daemon
 
-`bpcmdd` listens on a BP endpoint and, for **each** delivered bundle,
-forks a user-supplied command, pipes the bundle payload to that command's
-standard input, and (by default) returns whatever the command writes to
-its standard output back to the bundle's source EID as a reply bundle.
+`bpcmdd` listens on a BP endpoint and treats **each delivered bundle's
+payload as a command line**. It tokenises the payload on whitespace,
+checks the result against a whitelist, and — if permitted — execs the
+command directly (no shell), returning whatever the command writes to its
+standard output back to the bundle's source EID as a reply bundle.
 
-It is the BP analogue of `inetd`/`xinetd` "wait" services: plug in any
-script or program and it processes one bundle per invocation.
+It is the BP analogue of `inetd`/`xinetd`: remote nodes invoke commands
+by name, and a whitelist decides what may run.
+
+Because the command is exec'd directly from the tokenised payload, shell
+metacharacters (`;`, `|`, `$(…)`, backticks) are inert — they become
+literal arguments and can do nothing unless a whitelist rule explicitly
+permits a shell.
 
 ## Build
 
@@ -21,66 +27,98 @@ sudo make install
 ## Usage
 
 ```
-bpcmdd [-a] [-n] [-t ttl] <own endpoint ID> <command> [arg ...]
+bpcmdd [-n] [-t ttl] <own endpoint ID> <whitelist file>
 ```
 
-- `-a` — pass the payload as an extra final command argument instead of
-  on stdin (stdin is left empty). The argument is NUL-terminated, so a
-  payload containing embedded NUL bytes is truncated at the first one.
 - `-n` — do not send the command's stdout back to the source.
 - `-t ttl` — reply bundle lifetime in seconds (default 86400).
 
-For every bundle, `bpcmdd` spawns a fresh `<command>` process
-(fork-per-bundle, processed serially). Unless `-a` is given, the command
-receives the bundle payload on **stdin**. Either way it sees these
-environment variables:
+For every bundle, `bpcmdd` splits the payload into an argument vector,
+matches it against the whitelist, and — if allowed — spawns a fresh
+process (fork-per-bundle, processed serially) with an **empty stdin**. The
+command sees these environment variables:
 
-| Variable          | Meaning                              |
-|-------------------|--------------------------------------|
-| `BP_SOURCE_EID`   | source EID of the received bundle    |
-| `BP_DEST_EID`     | own endpoint ID (`<own endpoint ID>`)|
-| `BP_PAYLOAD_LEN`  | payload length in bytes              |
+| Variable        | Meaning                               |
+|-----------------|---------------------------------------|
+| `BP_SOURCE_EID` | source EID of the received bundle     |
+| `BP_DEST_EID`   | own endpoint ID (`<own endpoint ID>`) |
 
 Anything the command writes to **stdout** is returned as a reply bundle
 to `BP_SOURCE_EID` (unless `-n`, the source is anonymous `dtn:none`, or
-the output is empty). The command's **stderr** is inherited and appears
-on `bpcmdd`'s own stderr.
+the output is empty). A refused command is not run; instead a
+`command not permitted` reply is returned (unless `-n`). The command's
+**stderr** is inherited and appears on `bpcmdd`'s own stderr.
+
+## Whitelist file
+
+One rule per line; `#` comments and blank lines are ignored. Each rule
+is `[mode] <pattern>`, where `mode` is one of:
+
+| Mode    | Matches                                          |
+|---------|--------------------------------------------------|
+| `exact` | a literal string, matched whole                  |
+| `glob`  | shell wildcards `*` and `?`                      |
+| `regex` | a POSIX extended regular expression              |
+
+The mode keyword is optional; a bare rule is treated as `regex`. Every
+rule is **anchored** — it must match the *entire* normalised command line
+(the argv tokens rejoined with single spaces), so a rule for `gpio` can
+never authorise `gpionuke`. A command runs if it matches **any** rule. An
+empty or unreadable whitelist denies everything (fail-closed).
+
+```
+# examples
+exact gpio info
+glob  gpio get *
+glob  gpio set * [01]
+regex (echo|printf) .+
+```
 
 ## Example
 
-Echo service — reply with the upper-cased payload:
+GPIO control service. Whitelist (`gpio.acl`):
 
-```sh
-bpcmdd ipn:1.5 tr a-z A-Z
+```
+glob gpio.py get *
+glob gpio.py set * [01]
+exact gpio.py info
 ```
 
-From another node:
+Run it:
 
 ```sh
-echo "hello dtn" | bpsource ipn:1.5      # send a request
-bpsink ipn:2.5                           # receive the reply
+bpcmdd ipn:1.5 gpio.acl
 ```
 
-Run an arbitrary handler script:
+From another node, the payload *is* the command:
 
 ```sh
-bpcmdd ipn:1.5 /opt/handlers/process-telemetry.sh
+printf 'gpio.py set 17 1' | bpsource ipn:1.5   # run: gpio.py set 17 1
+bpsink ipn:2.5                                  # receive "17=1"
 ```
 
-where `process-telemetry.sh` reads the payload on stdin, uses
-`$BP_SOURCE_EID` to know who asked, and writes its response to stdout.
+A runnable `gpio.py` is provided under `examples/`. Because the command
+is looked up via `execvp`, it must be on `PATH` (or named with a path,
+e.g. `/opt/handlers/gpio.py`, matched textually by the whitelist).
 
-Pass the payload as an argument instead of on stdin (`-a`) — useful for
-commands that take their input as a parameter:
+## More examples
 
-```sh
-bpcmdd -a ipn:1.5 logger -t dtn      # each payload becomes: logger -t dtn <payload>
-```
+`examples/` holds a few small handlers illustrating typical spacecraft
+ground→onboard operations:
+
+| Script      | Commands                                  | Purpose                                                     |
+|-------------|-------------------------------------------|-------------------------------------------------------------|
+| `gpio.py`   | `gpio.py get\|set\|info ...`              | Read/set GPIO pins via `/sys/class/gpio`.                   |
+| `health.sh` | `health.sh`                               | One-line OBC health snapshot (uptime, load, memory, temp).  |
+| `clock.sh`  | `clock.sh get` / `clock.sh set <d> <e>`   | Read/set ION's UTC correction (`utcdelta`, `utcerror`) via `ionadmin`. |
+
+Each script's header lists suggested whitelist rules.
 
 ## Notes
 
-- There is **no command whitelisting** at the protocol level — the
-  command is fixed at launch and applies to every bundle. Restrict the
-  endpoint and use OS-level controls as needed.
+- The whitelist is the only access control at the protocol level; the
+  endpoint itself is not authenticated. Restrict the endpoint and use
+  OS-level controls as needed, and keep rules as tight as possible
+  (`glob *` or `regex .*` authorise everything).
 - Long-running commands block subsequent bundles (serial processing).
   Wrap with your own dispatcher if you need concurrency.

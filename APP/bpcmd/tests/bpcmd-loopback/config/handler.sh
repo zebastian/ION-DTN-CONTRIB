@@ -1,14 +1,9 @@
 #!/bin/sh
-# bpcmdd test handler.  bpcmdd forks this per bundle, pipes the payload to
-# stdin, and returns whatever we write to stdout.
+# bpcmdd loopback test handler.  In the new model the bundle payload IS the
+# command line, so bpcmdd execs this script directly (empty stdin) with the
+# payload's remaining tokens as our arguments.
 #
-# Side-effect (proof of exec + env propagation): record the source EID, the
-# payload length, and the payload to $BPCMD_MARKER.
-# Reply (proof of the reply path): the upper-cased payload on stdout.
-
-payload=$(cat)
-
-printf '%s|%s|%s\n' "$BP_SOURCE_EID" "$BP_PAYLOAD_LEN" "$payload" \
-	> "${BPCMD_MARKER:-/dev/null}"
-
-printf '%s' "$payload" | tr 'a-z' 'A-Z'
+# Proof of exec + env propagation: record "<source EID>|<args>" to
+# $BPCMD_MARKER.  Reply path: echo the arguments back upper-cased on stdout.
+printf '%s|%s\n' "$BP_SOURCE_EID" "$*" > "${BPCMD_MARKER:-/dev/null}"
+printf '%s' "$*" | tr 'a-z' 'A-Z'

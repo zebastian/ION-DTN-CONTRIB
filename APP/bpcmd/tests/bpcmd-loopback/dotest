@@ -2,21 +2,31 @@
 trap 'killm f >/dev/null 2>&1' EXIT
 #
 # Loopback test for bpcmdd (Bundle Protocol command daemon).
+#
+# In this model the bundle payload IS the command line: bpcmdd tokenises it,
+# checks it against a whitelist file, and (if permitted) execs it directly
+# with an empty stdin, returning the command's stdout as a reply bundle.
+#
 # Validates:
-#   - each bundle is handed to the forked command on stdin
-#   - BP_SOURCE_EID / BP_PAYLOAD_LEN reach the command's environment
-#   - the command's stdout is returned to the source as a reply bundle
+#   - a glob-whitelisted command runs and its stdout is returned as a reply
+#   - a regex-whitelisted command runs (different match mode)
+#   - a non-whitelisted command is refused (not run; "not permitted" reply)
 #   - "-n" suppresses the reply while still running the command
+#   - BP_SOURCE_EID reaches the command's environment
 #
 
-CONFIGFILES="./config/host1.rc"
+# Allow running against a freshly built, not-yet-installed binary:
+#   BPCMDD=../../bpcmdd ./dotest
+BPCMDD=${BPCMDD:-bpcmdd}
+
+CONFIGFILES="./config/host1.rc ./config/whitelist"
 
 echo "########################################"
 echo
 pwd | sed "s/\/.*\///" | xargs echo "NAME: "
 echo
-echo "PURPOSE: bpcmdd — payload-to-stdin, env propagation, stdout reply,"
-echo "         and -n reply suppression."
+echo "PURPOSE: bpcmdd — payload-as-command, whitelist allow/deny (exact,"
+echo "         glob, regex), stdout reply, and -n reply suppression."
 echo
 echo "CONFIG: single-node loopback"
 echo
@@ -38,17 +48,20 @@ chmod +x ./config/handler.sh
 echo "Starting ION..."
 ionstart -I config/host1.rc
 
-MARKER1="$PWD/marker.case1"
-MARKER2="$PWD/marker.case2"
-rm -f "$MARKER1" "$MARKER2"
+# Daemon A (ipn:1.5) replies; daemon B (ipn:1.7) runs with -n (no reply).
+MARKER_A="$PWD/marker.case1"
+MARKER_B="$PWD/marker.case2"
+rm -f "$MARKER_A" "$MARKER_B"
 
 echo "Starting bpcmdd (default, replies) on ipn:1.5..."
-BPCMD_MARKER="$MARKER1" bpcmdd ipn:1.5 ./config/handler.sh > bpcmdd1.log 2>&1 &
+BPCMD_MARKER="$MARKER_A" $BPCMDD ipn:1.5 ./config/whitelist \
+	> bpcmdd1.log 2>&1 &
 BPCMDD1_PID=$!
 echo "$BPCMDD1_PID" > bpcmdd1.pid
 
 echo "Starting bpcmdd (-n, no reply) on ipn:1.7..."
-BPCMD_MARKER="$MARKER2" bpcmdd -n ipn:1.7 ./config/handler.sh > bpcmdd2.log 2>&1 &
+BPCMD_MARKER="$MARKER_B" $BPCMDD -n ipn:1.7 ./config/whitelist \
+	> bpcmdd2.log 2>&1 &
 BPCMDD2_PID=$!
 echo "$BPCMDD2_PID" > bpcmdd2.pid
 
@@ -63,31 +76,41 @@ for P in "$BPCMDD1_PID:1.5" "$BPCMDD2_PID:1.7"; do
 	fi
 done
 
+# send_cmd <srcEid> <destEid> <reqfile> <command line>
+send_cmd()
+{
+	printf '%s' "$4" > "$3"
+	bpsendfile "$1" "$2" "$3"
+}
+
+# recv_reply <srcEid> <outfile>
+recv_reply()
+{
+	bpsink "$1" > "$2" 2>&1 &
+	local sp=$!
+	sleep 3
+	kill "$sp" 2>/dev/null
+	wait "$sp" 2>/dev/null
+}
+
 # ----------------------------------------------------------------------
-# Case 1: default — payload to stdin, env propagation, stdout reply.
-# Send "hello dtn" from ipn:1.6; bpcmdd runs the handler, which records
-# "<src>|<len>|<payload>" to its marker and replies the upper-cased
-# payload to the source (ipn:1.6), where bpsink picks it up.
+# Case 1: glob-whitelisted command runs; stdout returned as reply.
+# 'glob  ./config/handler.sh set *' permits "handler.sh set 17 on".
 # ----------------------------------------------------------------------
 echo
-echo "Case 1: payload on stdin, env vars, stdout returned as reply"
-printf 'hello dtn' > req1.dat
-bpsendfile ipn:1.6 ipn:1.5 req1.dat
+echo "Case 1: glob-whitelisted command runs, stdout returned as reply"
+send_cmd ipn:1.6 ipn:1.5 req1.dat './config/handler.sh set 17 on'
 sleep 2
-bpsink ipn:1.6 > out.case1 2>&1 &
-SINK1_PID=$!
-sleep 3
-kill "$SINK1_PID" 2>/dev/null
-wait "$SINK1_PID" 2>/dev/null
+recv_reply ipn:1.6 out.case1
 
 CASE1_FAIL=0
-if [ "$(cat "$MARKER1" 2>/dev/null)" != "ipn:1.6|9|hello dtn" ]; then
-	echo "  handler did not receive payload/env as expected"
-	echo "  marker: '$(cat "$MARKER1" 2>/dev/null)' (want 'ipn:1.6|9|hello dtn')"
+if [ "$(cat "$MARKER_A" 2>/dev/null)" != "ipn:1.6|set 17 on" ]; then
+	echo "  command did not run / env not propagated"
+	echo "  marker: '$(cat "$MARKER_A" 2>/dev/null)' (want 'ipn:1.6|set 17 on')"
 	CASE1_FAIL=1
 fi
-if ! grep -q "HELLO DTN" out.case1; then
-	echo "  reply bundle (upper-cased payload) not received"
+if ! grep -q "SET 17 ON" out.case1; then
+	echo "  reply bundle (upper-cased args) not received"
 	CASE1_FAIL=1
 fi
 
@@ -101,29 +124,23 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# Case 2: -n — the command still runs (marker is written) but NO reply
-# bundle is sent back to the source.  Send "quiet one" from ipn:1.8 to
-# the -n daemon on ipn:1.7, then confirm ipn:1.8 receives nothing.
+# Case 2: regex-whitelisted command runs (different match mode).
+# 'regex ./config/handler\.sh get [0-9]+' permits "handler.sh get 42".
 # ----------------------------------------------------------------------
 echo
-echo "Case 2: -n suppresses the reply (command still runs)"
-printf 'quiet one' > req2.dat
-bpsendfile ipn:1.8 ipn:1.7 req2.dat
+echo "Case 2: regex-whitelisted command runs, stdout returned as reply"
+send_cmd ipn:1.10 ipn:1.5 req2.dat './config/handler.sh get 42'
 sleep 2
-bpsink ipn:1.8 > out.case2 2>&1 &
-SINK2_PID=$!
-sleep 3
-kill "$SINK2_PID" 2>/dev/null
-wait "$SINK2_PID" 2>/dev/null
+recv_reply ipn:1.10 out.case2
 
 CASE2_FAIL=0
-if [ "$(cat "$MARKER2" 2>/dev/null)" != "ipn:1.8|9|quiet one" ]; then
-	echo "  handler did not run under -n as expected"
-	echo "  marker: '$(cat "$MARKER2" 2>/dev/null)' (want 'ipn:1.8|9|quiet one')"
+if [ "$(cat "$MARKER_A" 2>/dev/null)" != "ipn:1.10|get 42" ]; then
+	echo "  regex-permitted command did not run"
+	echo "  marker: '$(cat "$MARKER_A" 2>/dev/null)' (want 'ipn:1.10|get 42')"
 	CASE2_FAIL=1
 fi
-if grep -q "QUIET ONE" out.case2; then
-	echo "  a reply was sent despite -n"
+if ! grep -q "GET 42" out.case2; then
+	echo "  reply bundle not received"
 	CASE2_FAIL=1
 fi
 
@@ -131,8 +148,69 @@ if [ $CASE2_FAIL -eq 0 ]; then
 	echo "  Case 2 PASS"
 else
 	echo "  Case 2 FAIL"
-	echo "  --- bpcmdd2.log ---"; cat bpcmdd2.log
+	echo "  --- bpcmdd1.log ---"; cat bpcmdd1.log
 	echo "  --- out.case2 ---"; cat out.case2
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 3: non-whitelisted command is refused.  It must NOT run (marker
+# stays absent) and the source gets a "command not permitted" reply.
+# ----------------------------------------------------------------------
+echo
+echo "Case 3: non-whitelisted command refused (not run, error reply)"
+rm -f "$MARKER_A"
+send_cmd ipn:1.12 ipn:1.5 req3.dat './config/handler.sh delete all'
+sleep 2
+recv_reply ipn:1.12 out.case3
+
+CASE3_FAIL=0
+if [ -f "$MARKER_A" ]; then
+	echo "  refused command was executed anyway"
+	echo "  marker: '$(cat "$MARKER_A" 2>/dev/null)'"
+	CASE3_FAIL=1
+fi
+if ! grep -q "not permitted" out.case3; then
+	echo "  expected 'command not permitted' reply not received"
+	CASE3_FAIL=1
+fi
+
+if [ $CASE3_FAIL -eq 0 ]; then
+	echo "  Case 3 PASS"
+else
+	echo "  Case 3 FAIL"
+	echo "  --- bpcmdd1.log ---"; cat bpcmdd1.log
+	echo "  --- out.case3 ---"; cat out.case3
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 4: -n — an exact-whitelisted command still runs (marker written)
+# but NO reply bundle is returned to the source.
+# ----------------------------------------------------------------------
+echo
+echo "Case 4: -n suppresses the reply (command still runs)"
+send_cmd ipn:1.8 ipn:1.7 req4.dat './config/handler.sh ping'
+sleep 2
+recv_reply ipn:1.8 out.case4
+
+CASE4_FAIL=0
+if [ "$(cat "$MARKER_B" 2>/dev/null)" != "ipn:1.8|ping" ]; then
+	echo "  command did not run under -n as expected"
+	echo "  marker: '$(cat "$MARKER_B" 2>/dev/null)' (want 'ipn:1.8|ping')"
+	CASE4_FAIL=1
+fi
+if grep -q "PING" out.case4; then
+	echo "  a reply was sent despite -n"
+	CASE4_FAIL=1
+fi
+
+if [ $CASE4_FAIL -eq 0 ]; then
+	echo "  Case 4 PASS"
+else
+	echo "  Case 4 FAIL"
+	echo "  --- bpcmdd2.log ---"; cat bpcmdd2.log
+	echo "  --- out.case4 ---"; cat out.case4
 	FAIL=1
 fi
 

@@ -1,0 +1,9 @@
+# bpcmdd command whitelist for the loopback test.
+#
+# One rule per line:  [exact|glob|regex] <pattern>
+# A bare rule (no mode keyword) is treated as a regex.  A command runs
+# only if the whole normalised command line matches some rule.
+
+exact ./config/handler.sh ping
+glob  ./config/handler.sh set *
+regex ./config/handler\.sh get [0-9]+

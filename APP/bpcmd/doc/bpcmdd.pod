@@ -4,37 +4,67 @@ bpcmdd - Bundle Protocol command daemon
 
 =head1 SYNOPSIS
 
-B<bpcmdd> [B<-a>] [B<-n>] [B<-t> I<ttl>] I<ownEndpointID> I<command> [I<arg> ...]
+B<bpcmdd> [B<-n>] [B<-t> I<ttl>] I<ownEndpointID> I<whitelistFile>
 
 =head1 DESCRIPTION
 
-B<bpcmdd> listens on the BP endpoint I<ownEndpointID>.  For every delivered
-bundle it forks I<command>, pipes the bundle payload to that command's
-standard input, and, unless B<-n> is given, returns whatever the command
-writes to its standard output back to the bundle's source endpoint ID as a
-reply bundle.
+B<bpcmdd> listens on the BP endpoint I<ownEndpointID> and treats each
+delivered bundle's payload as a command line.  It tokenises the payload on
+whitespace, checks the resulting command against the rules in
+I<whitelistFile>, and, if the command is permitted, execs it directly (with
+no intervening shell) and, unless B<-n> is given, returns whatever the
+command writes to its standard output back to the bundle's source endpoint
+ID as a reply bundle.
 
-If B<-a> is given, the payload is instead appended as a final argument to
-I<command> and the command's standard input is left empty.
+Because the command is exec'd directly from the tokenised payload, shell
+metacharacters (C<;>, C<|>, C<$()>, backticks) are inert: they become
+literal arguments and can do nothing unless a whitelist rule explicitly
+permits a shell.  The command is run with an empty standard input.
 
 One child process is spawned per bundle (fork-per-bundle), and bundles are
 processed serially: a long-running command blocks reception of the next
 bundle until it exits.
 
 The command is invoked with these environment variables set:
-B<BP_SOURCE_EID> (the received bundle's source EID), B<BP_DEST_EID>
-(I<ownEndpointID>), and B<BP_PAYLOAD_LEN> (the payload length in bytes).  The
-command's standard error is inherited and appears on B<bpcmdd>'s standard
-error.
+B<BP_SOURCE_EID> (the received bundle's source EID) and B<BP_DEST_EID>
+(I<ownEndpointID>).  The command's standard error is inherited and appears
+on B<bpcmdd>'s standard error.
 
+A command that is not permitted by the whitelist is not run; instead a
+C<command not permitted> reply is returned to the source (unless B<-n>).
 No reply is sent when B<-n> is in effect, when the bundle source is the
-anonymous EID B<dtn:none>, or when the command produces no standard output.
-
-There is no command whitelisting at the protocol level; I<command> is fixed
-at launch and applies to every bundle.  Restrict the endpoint and use
-OS-level controls as needed.
+anonymous EID B<dtn:none>, or when a permitted command produces no standard
+output.
 
 B<bpcmdd> runs until it receives SIGINT, at which point it detaches from BP.
+
+=head1 WHITELIST FILE
+
+I<whitelistFile> holds one rule per line; blank lines and lines beginning
+with C<#> are ignored.  Each rule has the form C<[mode] pattern>, where the
+optional I<mode> keyword is one of:
+
+=over 4
+
+=item B<exact>
+
+I<pattern> is a literal string, matched against the whole command line.
+
+=item B<glob>
+
+I<pattern> is a shell-style wildcard using C<*> and C<?>.
+
+=item B<regex>
+
+I<pattern> is a POSIX extended regular expression.  This is the default
+when the mode keyword is omitted.
+
+=back
+
+Every rule is anchored: it must match the entire normalised command line
+(the argument tokens rejoined with single spaces), so a rule for C<gpio>
+cannot authorise C<gpionuke>.  A command runs if it matches any rule.  A
+whitelist that is empty or cannot be read denies every command.
 
 =head1 EXIT STATUS
 
@@ -46,8 +76,9 @@ B<bpcmdd> terminated normally after receiving SIGINT.
 
 =item "1"
 
-B<bpcmdd> terminated due to a usage error or a startup or BP failure.
-Details are noted in the B<ion.log> log file.
+B<bpcmdd> terminated due to a usage error, an unreadable or malformed
+whitelist, or a startup or BP failure.  Details are noted in the
+B<ion.log> log file.
 
 =back
 
@@ -55,15 +86,10 @@ Details are noted in the B<ion.log> log file.
 
 =over 4
 
-=item B<-a>
-
-Pass the payload as an extra final argument to I<command> instead of on its
-standard input.  The argument is NUL-terminated, so a payload containing
-embedded NUL bytes is truncated at the first one.
-
 =item B<-n>
 
-Do not send the command's standard output back to the bundle source.
+Do not send any reply (neither command output nor refusal notices) back to
+the bundle source.
 
 =item B<-t> I<ttl>
 
@@ -73,16 +99,15 @@ Reply bundle lifetime, in seconds.  Defaults to 86400.
 
 The local endpoint ID on which B<bpcmdd> listens.  Mandatory.
 
-=item I<command> [I<arg> ...]
+=item I<whitelistFile>
 
-The command (and optional arguments) to fork for each received bundle.
-Mandatory.
+Path to the whitelist file governing which commands may run.  Mandatory.
 
 =back
 
 =head1 FILES
 
-No configuration files are needed.
+I<whitelistFile>, as described under B<WHITELIST FILE>.
 
 =head1 DIAGNOSTICS
 
@@ -98,6 +123,16 @@ B<bpadmin> has not yet initialized Bundle Protocol operations.
 
 Another application has already opened I<ownEndpointID>.  Terminate that
 application and rerun, or choose a different endpoint.
+
+=item bpcmdd can't load whitelist.
+
+I<whitelistFile> could not be opened or contains a malformed regular
+expression.  Correct the file and rerun.
+
+=item bpcmdd denied command
+
+An incoming command line did not match any whitelist rule and was refused.
+The offending command line is noted with the message.
 
 =item bpcmdd can't fork command.
 

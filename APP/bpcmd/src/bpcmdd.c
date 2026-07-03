@@ -1,15 +1,28 @@
 /*
 	bpcmdd.c:	a Bundle Protocol command daemon.
 
-	Listens on a BP endpoint.  For every delivered bundle it forks a
-	user-supplied command, pipes the bundle payload to that command's
-	standard input, and (unless disabled) returns whatever the command
-	writes to its standard output back to the bundle's source EID as a
-	reply bundle.
+	Listens on a BP endpoint.  Each delivered bundle's payload IS a
+	command line: bpcmdd tokenises it on whitespace and, if the
+	resulting command is permitted by a whitelist, forks and execs it
+	directly (no shell), returning the command's standard output to the
+	bundle's source EID as a reply bundle.
 
-	One child process is spawned per bundle (fork-per-bundle); bundles
-	are processed serially.  The child sees BP_SOURCE_EID, BP_DEST_EID
-	and BP_PAYLOAD_LEN in its environment.
+	Because the command is exec'd directly from the tokenised payload,
+	shell metacharacters (; | $() ``) are inert: they become literal
+	arguments and can do nothing unless a whitelist rule explicitly
+	permits a shell.
+
+	The set of runnable commands is fixed by a whitelist file, not by
+	bpcmdd's own arguments.  Each whitelist rule is one of:
+
+		exact  <command line>      literal, whole-line match
+		glob   <pattern>           shell wildcards * and ?
+		regex  <ERE>               POSIX extended regex
+
+	The mode keyword is optional; a bare rule is treated as a regex.
+	Every rule is anchored: it must match the entire normalised command
+	line (argv joined by single spaces), so a rule for "gpio" can never
+	authorise "gpionuke".
 
 	Built against an installed ION-DTN; uses only ION's public bp.h API.
 
@@ -17,7 +30,11 @@
 									*/
 
 #include <bp.h>
+#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <fnmatch.h>
+#include <regex.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,22 +43,47 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+typedef enum
+{
+	MatchExact,
+	MatchGlob,
+	MatchRegex
+} MatchMode;
+
+typedef struct
+{
+	MatchMode mode;
+	char	 *pattern; /*	Original text (exact/glob/logging).	*/
+	regex_t	  re;	   /*	Compiled iff mode == MatchRegex.	*/
+} Rule;
+
 static BpSAP sap;
 static Sdr   sdr;
 static int   running = 1;
+static Rule *rules;
+static int   numRules;
 
 static const char usage[] =
-		"Usage: bpcmdd [-a] [-n] [-t ttl] <own endpoint ID> <command> "
-		"[arg ...]\n\n"
-		"Listens on the given BP endpoint.  For each delivered bundle, forks\n"
-		"<command>, pipes the bundle payload to its stdin, and returns its\n"
-		"stdout to the bundle source as a reply bundle.\n\n"
-		"  -a        pass the payload as a final command argument instead of\n"
-		"            on stdin (stdin is left empty; embedded NULs truncate)\n"
-		"  -n        do not send the command's stdout back to the source\n"
-		"  -t ttl    reply bundle lifetime in seconds (default 86400)\n\n"
-		"The command sees BP_SOURCE_EID, BP_DEST_EID and BP_PAYLOAD_LEN in its\n"
-		"environment.  Its stderr is inherited (appears on bpcmdd's stderr).\n";
+		"Usage: bpcmdd [-n] [-t ttl] <own endpoint ID> "
+		"<whitelist file>\n\n"
+		"Each delivered bundle's payload is a command line: bpcmdd "
+		"splits it on\nwhitespace and, if the whitelist permits it, "
+		"execs it directly (no\nshell) and returns its stdout to the "
+		"bundle source as a reply bundle.\n\n"
+		"  -n        do not send the command's stdout back to the "
+		"source\n"
+		"  -t ttl    reply bundle lifetime in seconds (default 86400)"
+		"\n\n"
+		"Whitelist file: one rule per line; '#' comments and blank "
+		"lines are\nignored.  Each rule is\n"
+		"  exact <command line>   literal whole-line match\n"
+		"  glob  <pattern>        shell wildcards * and ?\n"
+		"  regex <ERE>            POSIX extended regex (assumed when "
+		"the mode\n"
+		"                         keyword is omitted)\n"
+		"Rules are anchored to the whole normalised command line.\n"
+		"The command sees BP_SOURCE_EID and BP_DEST_EID in its "
+		"environment.\n";
 
 static void handleQuit(int signum)
 {
@@ -53,6 +95,206 @@ static void handleQuit(int signum)
 	fflush(NULL);
 	running = 0;
 	bp_interrupt(sap);
+}
+
+/*	Strips trailing whitespace (including the newline) in place.	*/
+
+static void rstrip(char *s)
+{
+	size_t n = strlen(s);
+
+	while (n > 0 && isspace((unsigned char) s[n - 1]))
+	{
+		s[--n] = '\0';
+	}
+}
+
+/*	Appends one rule to the global table.  Returns 0, or -1 on error
+ *	(allocation failure or a malformed regex).			*/
+
+static int addRule(MatchMode mode, const char *pattern)
+{
+	Rule *bigger;
+	Rule *r;
+
+	bigger = realloc(rules, (numRules + 1) * sizeof(Rule));
+	if (bigger == NULL)
+	{
+		return -1;
+	}
+
+	rules = bigger;
+	r = &rules[numRules];
+	r->mode = mode;
+	r->pattern = strdup(pattern);
+	if (r->pattern == NULL)
+	{
+		return -1;
+	}
+
+	if (mode == MatchRegex)
+	{
+		char *anchored;
+		int   code;
+
+		/*	Anchor to the whole command line: ^( ... )$	*/
+
+		anchored = malloc(strlen(pattern) + 5);
+		if (anchored == NULL)
+		{
+			free(r->pattern);
+			return -1;
+		}
+
+		isprintf(anchored, (int) strlen(pattern) + 5, "^(%s)$",
+				pattern);
+		code = regcomp(&r->re, anchored, REG_EXTENDED | REG_NOSUB);
+		free(anchored);
+		if (code != 0)
+		{
+			char errbuf[256];
+
+			regerror(code, &r->re, errbuf, sizeof errbuf);
+			writeMemoNote("[?] bpcmdd bad whitelist regex", errbuf);
+			free(r->pattern);
+			return -1;
+		}
+	}
+
+	numRules++;
+	return 0;
+}
+
+/*	Loads the whitelist file into the global rule table.  Returns 0,
+ *	or -1 if the file cannot be read or contains a bad rule.	*/
+
+static int loadWhitelist(const char *path)
+{
+	FILE *f;
+	char  line[4096];
+	int   lineno = 0;
+
+	f = fopen(path, "r");
+	if (f == NULL)
+	{
+		putSysErrmsg("bpcmdd can't open whitelist file.", path);
+		return -1;
+	}
+
+	while (fgets(line, sizeof line, f) != NULL)
+	{
+		MatchMode mode;
+		char	 *p;
+		char	 *pattern;
+
+		lineno++;
+		rstrip(line);
+		p = line;
+		while (*p == ' ' || *p == '\t')
+		{
+			p++;
+		}
+
+		if (*p == '\0' || *p == '#')
+		{
+			continue; /*	Blank line or comment.	*/
+		}
+
+		/*	Optional leading mode keyword.	*/
+
+		mode = MatchRegex;
+		pattern = p;
+		if (strncmp(p, "exact", 5) == 0
+				&& isspace((unsigned char) p[5]))
+		{
+			mode = MatchExact;
+			pattern = p + 5;
+		}
+		else if (strncmp(p, "glob", 4) == 0
+				&& isspace((unsigned char) p[4]))
+		{
+			mode = MatchGlob;
+			pattern = p + 4;
+		}
+		else if (strncmp(p, "regex", 5) == 0
+				&& isspace((unsigned char) p[5]))
+		{
+			mode = MatchRegex;
+			pattern = p + 5;
+		}
+
+		while (*pattern == ' ' || *pattern == '\t')
+		{
+			pattern++;
+		}
+
+		if (*pattern == '\0')
+		{
+			char note[32];
+
+			isprintf(note, sizeof note, "line %d", lineno);
+			writeMemoNote("[?] bpcmdd whitelist: empty pattern "
+					"ignored", note);
+			continue;
+		}
+
+		if (addRule(mode, pattern) < 0)
+		{
+			fclose(f);
+			return -1;
+		}
+	}
+
+	fclose(f);
+	if (numRules == 0)
+	{
+		writeMemo("[?] bpcmdd whitelist has no rules; all commands "
+				"will be denied.");
+	}
+
+	return 0;
+}
+
+/*	Returns 1 if the normalised command line is permitted by any rule,
+ *	0 otherwise.							*/
+
+static int commandAllowed(const char *cmdline)
+{
+	int i;
+
+	for (i = 0; i < numRules; i++)
+	{
+		Rule *r = &rules[i];
+
+		switch (r->mode)
+		{
+		case MatchExact:
+			if (strcmp(r->pattern, cmdline) == 0)
+			{
+				return 1;
+			}
+
+			break;
+
+		case MatchGlob:
+			if (fnmatch(r->pattern, cmdline, 0) == 0)
+			{
+				return 1;
+			}
+
+			break;
+
+		case MatchRegex:
+			if (regexec(&r->re, cmdline, 0, NULL, 0) == 0)
+			{
+				return 1;
+			}
+
+			break;
+		}
+	}
+
+	return 0;
 }
 
 /*	Reads the entire payload of a delivered bundle into a freshly
@@ -100,22 +342,96 @@ static char *readPayload(Object adu, int *length)
 	return buffer;
 }
 
-/*	Forks the command, delivers it the payload (on stdin via a
- *	dedicated feeder child to avoid stdin/stdout pipe deadlock, or as
- *	a final command argument when argMode is set), and collects its
- *	stdout into a malloc'd buffer.  Returns the command's exit code
- *	(or -1 if it could not be run); *replyBuf / *replyLen receive the
- *	captured stdout (caller frees *replyBuf when non-NULL).		*/
+/*	Splits a NUL-terminated, mutable command line into a NULL-
+ *	terminated argv whose entries point into 'line'.  Returns the argv
+ *	(caller frees the array, not the strings) and sets *argc, or NULL
+ *	on allocation failure.  *argc may be 0 for a blank command line.*/
 
-static int runCommand(char **cmdArgv, char *payload, int payloadLen,
-		char *srcEid, char *ownEid, int argMode, char **replyBuf,
-		int *replyLen)
+static char **tokenize(char *line, int *argc)
 {
-	int    inPipe[2];
+	static const char ws[] = " \t\n\r\f\v";
+	char		**argv;
+	char		 *tok;
+	int		  cap = 8;
+	int		  n = 0;
+
+	argv = malloc(cap * sizeof(char *));
+	if (argv == NULL)
+	{
+		return NULL;
+	}
+
+	for (tok = strtok(line, ws); tok != NULL; tok = strtok(NULL, ws))
+	{
+		if (n + 1 >= cap) /*	Keep room for the NULL.	*/
+		{
+			char **bigger;
+
+			cap *= 2;
+			bigger = realloc(argv, cap * sizeof(char *));
+			if (bigger == NULL)
+			{
+				free(argv);
+				return NULL;
+			}
+
+			argv = bigger;
+		}
+
+		argv[n++] = tok;
+	}
+
+	argv[n] = NULL;
+	*argc = n;
+	return argv;
+}
+
+/*	Rejoins argv into a single normalised command line (one space
+ *	between tokens) for whitelist matching.  Caller frees.		*/
+
+static char *joinArgv(char **argv, int argc)
+{
+	size_t total = 1; /*	Terminating NUL.	*/
+	char  *s;
+	char  *p;
+	int    i;
+
+	for (i = 0; i < argc; i++)
+	{
+		total += strlen(argv[i]) + 1; /*	Token + space/NUL.*/
+	}
+
+	s = malloc(total);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = s;
+	for (i = 0; i < argc; i++)
+	{
+		if (i > 0)
+		{
+			*p++ = ' ';
+		}
+
+		p = stpcpy(p, argv[i]);
+	}
+
+	*p = '\0';
+	return s;
+}
+
+/*	Forks the (already tokenised) command with an empty stdin and
+ *	collects its stdout into a malloc'd buffer.  Returns the command's
+ *	exit code (or -1 if it could not be run); *replyBuf / *replyLen
+ *	receive the captured stdout (caller frees *replyBuf).		*/
+
+static int runCommand(char **cmdArgv, char *srcEid, char *ownEid,
+		char **replyBuf, int *replyLen)
+{
 	int    outPipe[2];
 	pid_t  cmdPid;
-	pid_t  feederPid;
-	char   lenStr[32];
 	size_t cap = 4096;
 	size_t len = 0;
 	char  *buffer;
@@ -124,27 +440,24 @@ static int runCommand(char **cmdArgv, char *payload, int payloadLen,
 	*replyBuf = NULL;
 	*replyLen = 0;
 
-	if (pipe(inPipe) < 0)
-	{
-		putSysErrmsg("bpcmdd can't create stdin pipe.", NULL);
-		return -1;
-	}
-
 	if (pipe(outPipe) < 0)
 	{
 		putSysErrmsg("bpcmdd can't create stdout pipe.", NULL);
-		close(inPipe[0]);
-		close(inPipe[1]);
 		return -1;
 	}
 
 	cmdPid = fork();
 	if (cmdPid == 0) /*	Command child.	*/
 	{
-		dup2(inPipe[0], STDIN_FILENO);
+		int nullfd = open("/dev/null", O_RDONLY);
+
+		if (nullfd >= 0)
+		{
+			dup2(nullfd, STDIN_FILENO);
+			close(nullfd);
+		}
+
 		dup2(outPipe[1], STDOUT_FILENO);
-		close(inPipe[0]);
-		close(inPipe[1]);
 		close(outPipe[0]);
 		close(outPipe[1]);
 		if (srcEid)
@@ -153,35 +466,6 @@ static int runCommand(char **cmdArgv, char *payload, int payloadLen,
 		}
 
 		setenv("BP_DEST_EID", ownEid, 1);
-		isprintf(lenStr, sizeof lenStr, "%d", payloadLen);
-		setenv("BP_PAYLOAD_LEN", lenStr, 1);
-		if (argMode)
-		{
-			int	 nargs = 0;
-			char	*arg;
-			char   **newArgv;
-
-			while (cmdArgv[nargs])
-			{
-				nargs++;
-			}
-
-			arg = malloc((size_t) payloadLen + 1);
-			newArgv = malloc((nargs + 2) * sizeof(char *));
-			if (arg == NULL || newArgv == NULL)
-			{
-				_exit(127);
-			}
-
-			memcpy(arg, payload, payloadLen);
-			arg[payloadLen] = '\0';
-			memcpy(newArgv, cmdArgv, nargs * sizeof(char *));
-			newArgv[nargs] = arg;
-			newArgv[nargs + 1] = NULL;
-			execvp(newArgv[0], newArgv);
-			_exit(127); /*	exec failed.	*/
-		}
-
 		execvp(cmdArgv[0], cmdArgv);
 		_exit(127); /*	exec failed.	*/
 	}
@@ -189,60 +473,12 @@ static int runCommand(char **cmdArgv, char *payload, int payloadLen,
 	if (cmdPid < 0)
 	{
 		putSysErrmsg("bpcmdd can't fork command.", cmdArgv[0]);
-		close(inPipe[0]);
-		close(inPipe[1]);
 		close(outPipe[0]);
 		close(outPipe[1]);
 		return -1;
 	}
 
-	close(inPipe[0]);
 	close(outPipe[1]);
-
-	feederPid = -1;
-	if (argMode)
-	{
-		/*	Payload goes on the command line; leave stdin
-		 *	empty so the command sees EOF immediately.	*/
-		close(inPipe[1]);
-	}
-	else
-	{
-		feederPid = fork();
-		if (feederPid == 0) /*	Feeder child.	*/
-		{
-			int off = 0;
-			int n;
-
-			close(outPipe[0]);
-			while (off < payloadLen)
-			{
-				n = write(inPipe[1], payload + off,
-						payloadLen - off);
-				if (n < 0)
-				{
-					if (errno == EINTR)
-					{
-						continue;
-					}
-
-					break; /*	e.g. EPIPE.	*/
-				}
-
-				off += n;
-			}
-
-			close(inPipe[1]);
-			_exit(0);
-		}
-
-		close(inPipe[1]);
-		if (feederPid < 0)
-		{
-			putSysErrmsg("bpcmdd can't fork payload feeder.", NULL);
-			/*	Command drains stdin to EOF on close.	*/
-		}
-	}
 
 	buffer = malloc(cap);
 	if (buffer == NULL)
@@ -302,21 +538,12 @@ static int runCommand(char **cmdArgv, char *payload, int payloadLen,
 		continue;
 	}
 
-	if (feederPid > 0)
-	{
-		while (waitpid(feederPid, NULL, 0) < 0 && errno == EINTR)
-		{
-			continue;
-		}
-	}
-
 	*replyBuf = buffer;
 	*replyLen = (int) len;
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/*	Sends the captured stdout back to the bundle source as a reply
- *	bundle.								*/
+/*	Sends 'data' back to the bundle source as a reply bundle.	*/
 
 static void sendReply(char *destEid, char *data, int dataLen, int replyTtl)
 {
@@ -358,24 +585,26 @@ static void sendReply(char *destEid, char *data, int dataLen, int replyTtl)
 	}
 }
 
+/*	True if a reply should be sent to this bundle source.		*/
+
+static int replyable(int reply, char *srcEid)
+{
+	return reply && srcEid && strcmp(srcEid, "dtn:none") != 0;
+}
+
 int main(int argc, char **argv)
 {
 	int	   reply = 1;
-	int	   argMode = 0;
 	int	   replyTtl = 86400;
 	char	  *ownEid;
-	char	 **cmdArgv;
+	char	  *whitelistPath;
 	BpDelivery dlv;
 	int	   c;
 
-	while ((c = getopt(argc, argv, "ant:")) != -1)
+	while ((c = getopt(argc, argv, "nt:")) != -1)
 	{
 		switch (c)
 		{
-		case 'a':
-			argMode = 1;
-			break;
-
 		case 'n':
 			reply = 0;
 			break;
@@ -396,14 +625,14 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (optind + 1 >= argc) /*	Need EID + command.*/
+	if (optind + 2 != argc) /*	Need EID + whitelist file.	*/
 	{
 		PUTS(usage);
 		return 1;
 	}
 
 	ownEid = argv[optind];
-	cmdArgv = &argv[optind + 1];
+	whitelistPath = argv[optind + 1];
 
 	setlinebuf(stdout);
 	isignal(SIGPIPE, SIG_IGN);
@@ -411,6 +640,13 @@ int main(int argc, char **argv)
 	if (bp_attach() < 0)
 	{
 		putErrmsg("bpcmdd can't attach to BP.", NULL);
+		return 1;
+	}
+
+	if (loadWhitelist(whitelistPath) < 0)
+	{
+		putErrmsg("bpcmdd can't load whitelist.", whitelistPath);
+		bp_detach();
 		return 1;
 	}
 
@@ -426,10 +662,14 @@ int main(int argc, char **argv)
 
 	while (running)
 	{
-		char *payload;
-		int   payloadLen = 0;
-		char *replyBuf;
-		int   replyLen;
+		char  *payload;
+		int    payloadLen = 0;
+		char  *cmdline;
+		char **cmdArgv;
+		int    cmdArgc = 0;
+		char  *candidate;
+		char  *replyBuf;
+		int    replyLen;
 
 		if (bp_receive(sap, &dlv, BP_BLOCKING) < 0)
 		{
@@ -463,12 +703,64 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		oK(runCommand(cmdArgv, payload, payloadLen, dlv.bundleSourceEid,
-				ownEid, argMode, &replyBuf, &replyLen));
+		/*	NUL-terminated mutable copy for tokenising.	*/
+
+		cmdline = malloc((size_t) payloadLen + 1);
+		if (cmdline == NULL)
+		{
+			putErrmsg("bpcmdd out of memory.", NULL);
+			MRELEASE(payload);
+			bp_release_delivery(&dlv, 1);
+			continue;
+		}
+
+		memcpy(cmdline, payload, payloadLen);
+		cmdline[payloadLen] = '\0';
 		MRELEASE(payload);
 
-		if (reply && replyBuf && replyLen > 0 && dlv.bundleSourceEid &&
-				strcmp(dlv.bundleSourceEid, "dtn:none") != 0)
+		cmdArgv = tokenize(cmdline, &cmdArgc);
+		if (cmdArgv == NULL || cmdArgc == 0)
+		{
+			free(cmdArgv);
+			free(cmdline);
+			bp_release_delivery(&dlv, 1);
+			continue;
+		}
+
+		candidate = joinArgv(cmdArgv, cmdArgc);
+		if (candidate == NULL)
+		{
+			putErrmsg("bpcmdd out of memory.", NULL);
+			free(cmdArgv);
+			free(cmdline);
+			bp_release_delivery(&dlv, 1);
+			continue;
+		}
+
+		if (!commandAllowed(candidate))
+		{
+			writeMemoNote("[?] bpcmdd denied command", candidate);
+			if (replyable(reply, dlv.bundleSourceEid))
+			{
+				char msg[] =
+					"bpcmdd: command not permitted\n";
+
+				sendReply(dlv.bundleSourceEid, msg,
+						(int) strlen(msg), replyTtl);
+			}
+
+			free(candidate);
+			free(cmdArgv);
+			free(cmdline);
+			bp_release_delivery(&dlv, 1);
+			continue;
+		}
+
+		oK(runCommand(cmdArgv, dlv.bundleSourceEid, ownEid, &replyBuf,
+				&replyLen));
+
+		if (replyable(reply, dlv.bundleSourceEid) && replyBuf
+				&& replyLen > 0)
 		{
 			sendReply(dlv.bundleSourceEid, replyBuf, replyLen,
 					replyTtl);
@@ -479,6 +771,9 @@ int main(int argc, char **argv)
 			free(replyBuf);
 		}
 
+		free(candidate);
+		free(cmdArgv);
+		free(cmdline);
 		bp_release_delivery(&dlv, 1);
 	}
 

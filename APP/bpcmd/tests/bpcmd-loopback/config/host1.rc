@@ -25,12 +25,14 @@ m horizon +0
 a scheme ipn 'ipnfw' 'ipnadminep'
 
 # bpcmdd listen endpoints (1.5 default-reply, 1.7 -n) plus the sender
-# source endpoints the test cases reply to (1.6, 1.8).
+# source endpoints the test cases reply to (1.6, 1.8, 1.10, 1.12).
 a endpoint ipn:1.0 q
 a endpoint ipn:1.5 q
 a endpoint ipn:1.6 q
 a endpoint ipn:1.7 q
 a endpoint ipn:1.8 q
+a endpoint ipn:1.10 q
+a endpoint ipn:1.12 q
 
 a protocol udp 1400 100
 a induct   udp 127.0.0.1:4556 udpcli
