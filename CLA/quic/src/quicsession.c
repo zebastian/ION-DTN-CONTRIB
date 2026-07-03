@@ -1240,8 +1240,20 @@ static int feedConn(QuicConn *qc, const uint8_t *pkt, size_t pktlen)
 			quicNow());
 	if (rc != 0)
 	{
-		writeMemoNote("[?] quic: read_pkt failed",
-				(char *) ngtcp2_strerror(rc));
+		/*	Include the peer's CONNECTION_CLOSE reason: for a TLS
+		 *	handshake failure this is a CRYPTO_ERROR (0x0100 + alert)
+		 *	in ccerr.error_code, which is the key clue when debugging
+		 *	interop against a different QUIC/TLS stack.		*/
+
+		ngtcp2_connection_close_error ccerr;
+		char note[160];
+
+		ngtcp2_conn_get_connection_close_error(qc->conn, &ccerr);
+		isprintf(note, sizeof note,
+				"%s (peer close type %d, code %llu)",
+				(char *) ngtcp2_strerror(rc), (int) ccerr.type,
+				(unsigned long long) ccerr.error_code);
+		writeMemoNote("[?] quic: read_pkt failed", note);
 		qc->failed = 1;
 		return -1;
 	}

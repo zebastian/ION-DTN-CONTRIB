@@ -108,7 +108,18 @@ QuicTlsConn *quicTlsConnNew(const QuicClaConfig *cfg, QuicTlsCreds *creds,
 		return NULL;
 	}
 
-	gnutls_set_default_priority(conn->session);
+	/*	QUIC requires TLS 1.3 with middlebox-compatibility mode off
+	 *	(RFC 9001); the default GnuTLS priority leaves compat mode on,
+	 *	which a strict peer (e.g. picotls) rejects.  Use the QUIC
+	 *	priority string from the ngtcp2 GnuTLS examples.		*/
+
+	gnutls_priority_set_direct(conn->session,
+			"%DISABLE_TLS13_COMPAT_MODE:NORMAL:-VERS-ALL:"
+			"+VERS-TLS1.3:-CIPHER-ALL:+AES-128-GCM:+AES-256-GCM:"
+			"+CHACHA20-POLY1305:+AES-128-CCM:-GROUP-ALL:"
+			"+GROUP-SECP256R1:+GROUP-X25519:+GROUP-SECP384R1:"
+			"+GROUP-SECP521R1",
+			NULL);
 	gnutls_credentials_set(conn->session, GNUTLS_CRD_CERTIFICATE,
 			creds->cred);
 
