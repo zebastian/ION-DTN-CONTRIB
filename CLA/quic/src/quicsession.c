@@ -1326,7 +1326,8 @@ static int clientFeedPacket(void *user, const uint8_t *pkt, size_t len)
 	return feedConn((QuicConn *) user, pkt, len);
 }
 
-QuicSession *quicClientStart(const QuicClaConfig *cfg)
+QuicSession *quicClientStart(const QuicClaConfig *cfg, QuicBundleCb cb,
+		void *user)
 {
 	QuicSession	       *s;
 	QuicConn	       *qc;
@@ -1349,6 +1350,10 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg)
 
 	memset(s, 0, sizeof(*s));
 	s->cfg = *cfg;
+	/*	Deliver reverse-direction bundles (peer-symmetric QUICCL) via
+	 *	cb; set before the I/O thread starts.			*/
+	s->cb = cb;
+	s->cbUser = user;
 	s->fd = -1;
 	s->wakePipe[0] = s->wakePipe[1] = -1;
 	pthread_mutex_init(&s->mutex, NULL);

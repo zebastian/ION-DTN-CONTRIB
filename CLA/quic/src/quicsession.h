@@ -22,8 +22,14 @@ typedef int (*QuicBundleCb)(void *user, unsigned char *bundle, int len);
 
 /*	Connect to cfg->host:cfg->port and complete the QUIC/TLS
  *	handshake.  Spawns an internal I/O thread that keeps the
- *	connection serviced.  Returns NULL on failure.			*/
-QuicSession *quicClientStart(const QuicClaConfig *cfg);
+ *	connection serviced.  Returns NULL on failure.
+ *
+ *	QUICCL sessions are peer-symmetric: the passive peer may push
+ *	bundles back over the same connection.  If cb is non-NULL, each such
+ *	reverse-direction bundle is delivered via cb (as on the server);
+ *	pass NULL for a send-only outduct.				*/
+QuicSession *quicClientStart(const QuicClaConfig *cfg, QuicBundleCb cb,
+		void *user);
 
 /*	Send one bundle on the connection, as QUICCL XFER_SEGMENT(s) on the
  *	data stream selected by ordinal (the bundle's ECOS ordinal, 0-254;

@@ -24,6 +24,36 @@ static void shutDownClo(int signum)
 	sm_SemEnd(quiccloSemaphore(NULL));
 }
 
+/*	Reverse-path receive state (peer-symmetric QUICCL): the passive peer
+ *	may push bundles back over the connection this outduct opened.	*/
+
+typedef struct
+{
+	AcqWorkArea *work;
+	ReqAttendant attendant;
+} ReceiverParms;
+
+/*	Inject one reverse-direction bundle into ION, with attendant-based
+ *	backpressure as in quiccli.  Runs on the session I/O thread.
+ *	Returns 0 on success, -1 to stop the session loop.		*/
+
+static int acquireBundle(void *user, unsigned char *bundle, int len)
+{
+	ReceiverParms *rp = user;
+
+	if (bpBeginAcq(rp->work, 0, NULL) < 0
+			|| bpContinueAcq(rp->work, (char *) bundle, len,
+					   &rp->attendant, 0)
+					< 0
+			|| bpEndAcq(rp->work) < 0)
+	{
+		putErrmsg("quicclo: can't acquire bundle.", NULL);
+		return -1;
+	}
+
+	return 0;
+}
+
 #if defined(ION_LWT)
 int quicclo(saddr a1, saddr a2, saddr a3, saddr a4, saddr a5, saddr a6,
 		saddr a7, saddr a8, saddr a9, saddr a10)
@@ -54,6 +84,11 @@ int main(int argc, char *argv[])
 	int		bytesToSend;
 	QuicSession    *session = NULL;
 	int		pause = 0;
+	VInduct	       *vInduct;
+	PsmAddress	vInductElt;
+	ReceiverParms	rx;
+	QuicBundleCb	recvCb = NULL;
+	int		haveRx = 0;
 
 	if (ductName == NULL)
 	{
@@ -108,6 +143,28 @@ int main(int argc, char *argv[])
 	sdr = getIonsdr();
 	oK(quiccloSemaphore(&(vduct->semaphore)));
 	isignal(SIGTERM, shutDownClo);
+
+	/*	Set up reverse-path acquisition so a peer that pushes bundles
+	 *	back over this connection is served (peer-symmetric QUICCL).
+	 *	Bundles acquire through any configured "quic" induct; if none
+	 *	exists the outduct stays send-only.			*/
+
+	memset((char *) &rx, 0, sizeof(rx));
+	findInduct("quic", NULL, &vInduct, &vInductElt);
+	if (vInductElt != 0)
+	{
+		rx.work = bpGetAcqArea(vInduct);
+		if (rx.work != NULL && ionStartAttendant(&rx.attendant) == 0)
+		{
+			recvCb = acquireBundle;
+			haveRx = 1;
+		}
+		else
+		{
+			writeMemo("[?] quicclo: no reverse-path acquisition; "
+				  "send-only.");
+		}
+	}
 
 	{
 		char memoBuf[1024];
@@ -166,7 +223,7 @@ int main(int argc, char *argv[])
 
 		if (session == NULL)
 		{
-			session = quicClientStart(&cfg);
+			session = quicClientStart(&cfg, recvCb, &rx);
 			if (session == NULL)
 			{
 				writeMemo("[?] quicclo: connect failed; will "
@@ -213,9 +270,20 @@ int main(int argc, char *argv[])
 		sm_TaskYield();
 	}
 
+	if (haveRx)
+	{
+		ionPauseAttendant(&rx.attendant); /* Unblock stalled acquire. */
+	}
+
 	if (session)
 	{
 		quicClientStop(session);
+	}
+
+	if (haveRx)
+	{
+		ionStopAttendant(&rx.attendant);
+		bpReleaseAcqArea(rx.work);
 	}
 
 	writeErrmsgMemos();
