@@ -1,6 +1,5 @@
 #!/bin/bash
-pkill -9 -f "quiccli" 2>/dev/null
-pkill -9 -f "quicclo" 2>/dev/null
+pkill -9 -f "quiccla" 2>/dev/null
 ( cd unibo-run 2>/dev/null && unset UNIBO_BP && unibo-bp-admin stop ) \
 	>/dev/null 2>&1
 pkill -9 -f "unibo-bp" 2>/dev/null

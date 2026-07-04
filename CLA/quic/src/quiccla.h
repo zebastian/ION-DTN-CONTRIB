@@ -2,10 +2,8 @@
 	quiccla.h:	common definitions for the QUIC convergence layer
 			adapter (ngtcp2 + GnuTLS).
 
-	quicclo (outduct) is the QUICCL active entity (QUIC client); quiccli
-	(induct) is the passive entity (QUIC server).  Bundles are carried
-	as XFER_SEGMENT messages on QUIC streams (reliable) or, with -u, as
-	QUIC datagrams (unreliable).
+	Bundles are carried as XFER_SEGMENT messages on QUIC streams
+	(reliable) or, with -u, as QUIC datagrams (unreliable).
 								*/
 
 #ifndef QUICCLA_H
@@ -29,9 +27,9 @@ extern "C" {
 #define QUIC_MAX_ALPN_LEN     64
 
 /*
- * Configuration parsed from command-line arguments.  TLS material is
- * required on the server (quiccli); the client (quicclo) verifies the
- * server certificate against caFile unless noVerify is set.
+ * Configuration parsed from command-line arguments.  A certificate and key
+ * are required (used when accepting connections); when opening a connection
+ * the peer certificate is verified against caFile unless noVerify is set.
  */
 typedef struct
 {
@@ -96,11 +94,11 @@ static int parseQuicDuctName(const char *ductName, char *host, int *port)
 /*
  * Parse optional command-line arguments.
  *
- *   -c <certfile>  server certificate (PEM)        [required: quiccli]
- *   -k <keyfile>   server private key (PEM)        [required: quiccli]
+ *   -c <certfile>  certificate (PEM)               [required]
+ *   -k <keyfile>   private key (PEM)               [required]
  *   -C <cafile>    CA trust anchors (PEM)
  *   -A <alpn>      ALPN protocol id (default "quicclav1")
- *   -n             client: do not verify server certificate
+ *   -n             do not verify the peer certificate
  *   -u             use the unreliable (QUIC datagram) service
  *   -S <bytes>     advertised Segment MRU (default = max bundle size)
  *   -r <bytes>     UDP socket receive buffer (SO_RCVBUF; 0 = OS default)

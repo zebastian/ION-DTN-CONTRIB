@@ -5,7 +5,7 @@ a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
 m payloadcrc 0
 a protocol quic 1400 100
-a induct  quic QUICDUCT 'quiccli -c CERT -k KEY'
-a outduct quic QUICDUCT 'quicclo -n'
+a induct  quic QUICDUCT 'quiccla -c CERT -k KEY -n'
+a outduct quic QUICDUCT ''
 r 'ipnadmin config/bench_runtime.ipnrc'
 s

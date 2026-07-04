@@ -1,0 +1,103 @@
+=head1 NAME
+
+quiccla - DTN QUIC convergence layer task
+
+=head1 SYNOPSIS
+
+B<quiccla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-n>] [B<-u>]
+[B<-A> I<alpn>] [B<-r> I<bytes>] [B<-w> I<bytes>] [B<-t> I<idlesec>]
+I<host>[:I<port>]
+
+=head1 DESCRIPTION
+
+B<quiccla> is a background "daemon" task that implements the QUICCL protocol
+of draft-caini-dtn-quiccl (ngtcp2 with the GnuTLS crypto backend).  QUICCL
+sessions are peer-symmetric: once established, either peer may send bundles
+over the connection regardless of which peer opened it.
+
+B<quiccla> binds a UDP socket to I<host>:I<port> (default port 4560) and
+accepts QUIC connections, injecting the bundles they carry into ION.  It also
+opens connections for the egress plans that cite "quic" outducts (each outduct
+name being the peer's I<host>[:I<port>]) and drains those outducts,
+transmitting each bundle over the session to that node - reusing an
+already-established session to the node, whether B<quiccla> accepted it or
+opened it, rather than opening a second one.  Bundles are carried as
+XFER_SEGMENT messages on the data streams (or, with B<-u>, as QUIC datagrams).
+
+A certificate (B<-c>) and private key (B<-k>) are required, since the node
+accepts connections.  The duct name format is I<host>[:I<port>]; an empty
+I<host> binds all interfaces.
+
+B<quiccla> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the spawning command text is supplied when the "quic"
+convergence layer protocol is added to the BP database.  The task is
+terminated by B<bpadmin> in response to an 'x' (STOP) command.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-c> I<cert>
+
+Certificate (PEM).  Required.
+
+=item B<-k> I<key>
+
+Private key (PEM).  Required.
+
+=item B<-C> I<cafile>
+
+PEM file of trusted CA certificates, used both to verify peers that connect
+to this node and to verify peers this node connects to.
+
+=item B<-n>
+
+Do not verify the certificate of a peer this node connects to; useful with
+self-signed certificates.
+
+=item B<-u>
+
+Use the unreliable service for outbound bundles, carrying them in QUIC
+datagrams (no acknowledgement) rather than on reliable streams.
+
+=item B<-A> I<alpn>
+
+ALPN protocol identifier (default C<quicclav1>); must match the peer.
+
+=item B<-r> I<bytes>
+
+UDP socket receive buffer (B<SO_RCVBUF>), in bytes; 0 (default) leaves the
+operating-system default.
+
+=item B<-w> I<bytes>
+
+UDP socket send buffer (B<SO_SNDBUF>), in bytes; 0 (default) leaves the
+operating-system default.
+
+=item B<-t> I<idlesec>
+
+QUIC idle timeout in seconds (default 30).
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<quiccla> terminated normally.
+
+=item "1"
+
+B<quiccla> terminated abnormally; see the B<ion.log> file.
+
+=back
+
+=head1 EXAMPLES
+
+    a induct quic 0.0.0.0:4560 'quiccla -c /etc/quic/server.pem -k /etc/quic/server.key'
+
+=head1 SEE ALSO
+
+bpadmin(1), bprc(5)

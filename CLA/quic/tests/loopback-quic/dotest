@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Loopback test for the QUIC CLA (quiccli / quicclo), reliable service.
+# Loopback test for the QUIC CLA (quiccla), reliable service.
 #
 # A single ION node sends to itself over QUIC and exercises: a single
 # segment transfer, a multi-segment transfer (Segment MRU forced small
@@ -29,7 +29,7 @@ echo "########################################"
 FAIL=0
 fail() { echo "FAILURE: $1"; FAIL=1; }
 
-for t in quiccli quicclo openssl bpsendfile bprecvfile bpdriver bpcounter \
+for t in quiccla openssl bpsendfile bprecvfile bpdriver bpcounter \
 	bptrace; do
 	if ! command -v "$t" >/dev/null 2>&1; then
 		echo "SKIP: '$t' not found."
@@ -39,8 +39,7 @@ done
 
 echo "Killing old ION..."
 killm >/dev/null 2>&1
-pkill -9 -f "quiccli" 2>/dev/null
-pkill -9 -f "quicclo" 2>/dev/null
+pkill -9 -f "quiccla" 2>/dev/null
 ./cleanup 2>/dev/null
 sleep 1
 rm -f ion.log testfile* sendfile bigfile counter.out "$CERT" "$KEY"
@@ -64,18 +63,18 @@ ionadmin "${CONFIGDIR}/loopback.ionrc"
 sleep 1
 bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
 
-echo "Waiting for QUIC CLAs to start..."
+echo "Waiting for the QUIC CLA daemon to start..."
 for i in 1 2 3 4 5 6 7 8 9 10; do
-	if pgrep -f "quiccli" >/dev/null && pgrep -f "quicclo" >/dev/null; then
-		echo "QUIC CLAs are running."
+	if pgrep -f "quiccla" >/dev/null; then
+		echo "QUIC CLA daemon is running."
 		break
 	fi
 	sleep 1
 done
 sleep 2
 
-if ! pgrep -f "quiccli" >/dev/null || ! pgrep -f "quicclo" >/dev/null; then
-	echo "ERROR: QUIC CLAs did not start."
+if ! pgrep -f "quiccla" >/dev/null; then
+	echo "ERROR: QUIC CLA daemon did not start."
 	tail -30 ion.log 2>/dev/null
 	ionstop; killm
 	exit 1
@@ -137,18 +136,19 @@ else
 fi
 
 # --- Phase 5: graceful SESS_TERM on shutdown ---------------------------
+# One daemon owns both ends of the loopback session, so stopping it flushes a
+# SESS_TERM on each established session as it exits.
 echo "Phase 5: graceful SESS_TERM..."
-pkill -TERM -x quicclo 2>/dev/null
+pkill -TERM -x quiccla 2>/dev/null
 sleep 3
-if grep -q "received SESS_TERM" ion.log; then
-	echo "  PASS: peer received SESS_TERM."
+if grep -q "sending SESS_TERM" ion.log; then
+	echo "  PASS: SESS_TERM sent on shutdown."
 else
 	fail "no SESS_TERM observed on shutdown."
 fi
 
 echo "Cleaning up..."
-pkill -9 -f "quiccli" 2>/dev/null
-pkill -9 -f "quicclo" 2>/dev/null
+pkill -9 -f "quiccla" 2>/dev/null
 sleep 1
 ionstop
 sleep 1

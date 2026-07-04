@@ -1,9 +1,9 @@
 /*
 	quicsession.c:	ngtcp2 QUIC engine for the QUICCL convergence layer.
-			Implements a single-connection client (quicclo) and
-			a multi-connection server (quiccli).  Stream 0 carries
-			QUICCL signalling; bundles are carried as XFER_SEGMENT
-			messages on a separate data stream.
+			Accepts and initiates connections on one bound UDP
+			socket, demultiplexed by connection id.  Stream 0
+			carries QUICCL signalling; bundles are carried as
+			XFER_SEGMENT messages on separate data streams.
 								*/
 
 #include "quicsession.h"
@@ -50,6 +50,9 @@ typedef struct QuicConn
 	int			dataStreamsOpen;
 	int			handshakeDone;
 	int			failed;
+	int			clientRole; /* 1 = we opened it (active).	*/
+	uvast			peerNode;   /* peer node nbr from SESS_INIT.	*/
+	int			sendBusy;   /* a sender holds this conn.	*/
 
 	/*	QUICCL session state (draft-caini-dtn-quiccl).		*/
 	int	      sessState;      /* QSS_*			*/
@@ -130,21 +133,21 @@ typedef struct QuicConn
 struct QuicSession
 {
 	int	      fd;
-	int	      isServer;
 	int	      useGso; /* UDP_SEGMENT available (TX coalescing).	*/
 	int	      useGro; /* UDP_GRO enabled (RX coalescing).		*/
 	QuicClaConfig cfg;
-	QuicTlsCreds *creds;
+	QuicTlsCreds *serverCreds; /* TLS creds for accepted conns.	*/
+	QuicTlsCreds *clientCreds; /* TLS creds for opened conns.	*/
 
-	/*	Client.							*/
-	QuicConn       *client;
+	/*	One I/O thread services every connection (accepted and
+	 *	opened), demultiplexed by connection id on one bound socket.	*/
+
 	pthread_t	ioThread;
 	pthread_mutex_t mutex;
 	pthread_cond_t	cond;
 	int		running;
 	int		wakePipe[2];
 
-	/*	Server.							*/
 	QuicConn    *conns;
 	QuicBundleCb cb;
 	void	    *cbUser;
@@ -307,15 +310,43 @@ static void sessNegotiate(QuicConn *qc, const QuicSessInit *peer)
 	qc->peerTransferMru = peer->transferMru;
 }
 
+/*	Record the peer's node number from its SESS_INIT node id (an
+ *	"ipn:<node>.<service>" EID), so the engine can match a session to the
+ *	egress plan for that node.					*/
+
+static void notePeerNode(QuicConn *qc, const QuicSessInit *peer)
+{
+	char  idbuf[64];
+	int   len;
+	uvast node = 0;
+
+	if (peer->nodeId == NULL || peer->nodeIdLen <= 4)
+	{
+		return;
+	}
+
+	len = peer->nodeIdLen < (int) sizeof(idbuf) - 1 ? peer->nodeIdLen :
+			(int) sizeof(idbuf) - 1;
+	memcpy(idbuf, peer->nodeId, len);
+	idbuf[len] = '\0';
+	if (strncmp(idbuf, "ipn:", 4) == 0
+			&& sscanf(idbuf + 4, UVAST_FIELDSPEC, &node) == 1)
+	{
+		qc->peerNode = node;
+	}
+}
+
 static int handleSessInit(QuicConn *qc, const QuicSessInit *peer)
 {
 	QuicSession *s = qc->owner;
 
 	sessNegotiate(qc, peer);
+	notePeerNode(qc, peer);
 
-	/*	The passive entity (server) replies with its own SESS_INIT.*/
+	/*	The passive entity (the peer that accepted the connection)
+	 *	replies with its own SESS_INIT.				*/
 
-	if (s->isServer && !qc->sessInitSent)
+	if (!qc->clientRole && !qc->sessInitSent)
 	{
 		if (sendSessInit(qc) < 0)
 		{
@@ -935,7 +966,9 @@ static int setupTls(QuicSession *s, QuicConn *qc, int isServer)
 {
 	qc->connRef.get_conn = getConnRef;
 	qc->connRef.user_data = qc;
-	qc->tls = quicTlsConnNew(&s->cfg, s->creds, &qc->connRef, isServer);
+	qc->tls = quicTlsConnNew(&s->cfg,
+			isServer ? s->serverCreds : s->clientCreds,
+			&qc->connRef, isServer);
 	return qc->tls == NULL ? -1 : 0;
 }
 
@@ -983,11 +1016,11 @@ static void prepareAck(QuicConn *qc)
 static int writeConn(QuicConn *qc)
 {
 	QuicSession	   *s = qc->owner;
-	/*	Client socket is connected (no destination); server names the
-	 *	peer per send.						*/
-	struct sockaddr	   *dest = s->isServer
-			? (struct sockaddr *) &qc->remote : NULL;
-	socklen_t	    destLen = s->isServer ? qc->remoteLen : 0;
+	/*	The engine's socket is bound (not connected), so every send
+	 *	names the peer explicitly, whether the connection was accepted
+	 *	or opened locally.					*/
+	struct sockaddr	   *dest = (struct sockaddr *) &qc->remote;
+	socklen_t	    destLen = qc->remoteLen;
 	QuicTxBatch	    batch;
 	ngtcp2_path_storage ps;
 	ngtcp2_pkt_info	    pi;
@@ -1314,33 +1347,76 @@ static void freeConn(QuicConn *qc)
 	MRELEASE(qc);
 }
 
-/*	*	*	Client	*	*	*	*	*	*/
+/*	*	*	Engine	*	*	*	*	*	*/
 
-static void *clientIo(void *parm);
-
-/*	Feed one received packet (from a possibly GRO-coalesced read) into the
- *	client connection.  Stops the read drain if the connection fails.	*/
-
-static int clientFeedPacket(void *user, const uint8_t *pkt, size_t len)
+/*	Per-read context for serverFeedPacket: the peer of the current UDP
+ *	read (its GRO-coalesced packets all share one source).		*/
+typedef struct
 {
-	return feedConn((QuicConn *) user, pkt, len);
+	QuicSession		*s;
+	struct sockaddr_storage *remote;
+	socklen_t		 remoteLen;
+} ServerRxCtx;
+
+static void *engineIo(void *parm);
+static void  wakeIo(QuicSession *s);
+static int   serverFeedPacket(void *user, const uint8_t *pkt, size_t len);
+static void  removeConn(QuicSession *s, QuicConn *dead);
+
+/*	Per-connection bring-up, run each I/O iteration.  The active peer (the
+ *	one that opened the connection) opens the signalling stream (stream 0)
+ *	and sends its SESS_INIT once the QUIC handshake completes.  Both peers
+ *	then open their own four priority data streams for the bundles they
+ *	will send, so bundles flow in both directions on every connection.	*/
+
+static void perConnBringup(QuicConn *qc)
+{
+	QuicSession *s = qc->owner;
+	int	     i;
+
+	if (qc->clientRole && qc->handshakeDone && !qc->sessInitSent)
+	{
+		int64_t sid;
+
+		if (ngtcp2_conn_open_bidi_stream(qc->conn, &sid, qc) != 0
+				|| sendSessInit(qc) < 0)
+		{
+			qc->failed = 1;
+			return;
+		}
+	}
+
+	if (!s->cfg.unreliable && qc->handshakeDone && qc->sessInitSent
+			&& !qc->dataStreamsOpen)
+	{
+		for (i = 0; i < 4; i++)
+		{
+			if (ngtcp2_conn_open_bidi_stream(qc->conn,
+					    &qc->dataStreams[i], qc)
+					!= 0)
+			{
+				qc->failed = 1;
+				return;
+			}
+		}
+
+		qc->dataStreamsOpen = 1;
+	}
 }
 
-QuicSession *quicClientStart(const QuicClaConfig *cfg, QuicBundleCb cb,
+QuicSession *quicEngineStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 		void *user)
 {
-	QuicSession	       *s;
-	QuicConn	       *qc;
-	struct addrinfo		hints;
-	struct addrinfo	       *res = NULL;
-	char			portStr[16];
-	ngtcp2_cid		dcid;
-	ngtcp2_cid		scid;
-	ngtcp2_settings		settings;
-	ngtcp2_transport_params params;
-	ngtcp2_callbacks	callbacks;
-	ngtcp2_path_storage	ps;
-	int			deadline;
+	QuicSession	*s;
+	struct addrinfo	 hints;
+	struct addrinfo *res = NULL;
+	char		 portStr[16];
+
+	if (cfg->certFile[0] == '\0' || cfg->keyFile[0] == '\0')
+	{
+		putErrmsg("quiccla: -c cert and -k key are required.", NULL);
+		return NULL;
+	}
 
 	s = MTAKE(sizeof(QuicSession));
 	if (s == NULL)
@@ -1350,8 +1426,6 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 
 	memset(s, 0, sizeof(*s));
 	s->cfg = *cfg;
-	/*	Deliver reverse-direction bundles (peer-symmetric QUICCL) via
-	 *	cb; set before the I/O thread starts.			*/
 	s->cb = cb;
 	s->cbUser = user;
 	s->fd = -1;
@@ -1359,99 +1433,45 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 	pthread_mutex_init(&s->mutex, NULL);
 	pthread_cond_init(&s->cond, NULL);
 
-	qc = MTAKE(sizeof(QuicConn));
-	if (qc == NULL)
-	{
-		MRELEASE(s);
-		return NULL;
-	}
+	/*	Two credential sets: one for connections this node accepts
+	 *	(TLS server role) and one for connections it opens (TLS client
+	 *	role).							*/
 
-	memset(qc, 0, sizeof(*qc));
-	qc->owner = s;
-	qc->sendStreamId = -1;
-	qc->lastSentStream = -1;
-	qc->ackStreamId = -1;
-	qc->dataStreams[0] = qc->dataStreams[1] = qc->dataStreams[2] =
-			qc->dataStreams[3] = -1;
-	qc->rxCap = QUICCLA_BUFSZ;
-	qc->rxBuf = MTAKE(qc->rxCap);
-	if (qc->rxBuf == NULL)
+	s->serverCreds = quicTlsCredsNew(cfg, 1);
+	s->clientCreds = quicTlsCredsNew(cfg, 0);
+	if (s->serverCreds == NULL || s->clientCreds == NULL)
 	{
-		MRELEASE(qc);
-		MRELEASE(s);
-		return NULL;
+		goto fail;
 	}
-
-	s->client = qc;
 
 	isprintf(portStr, sizeof(portStr), "%d", cfg->port);
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
-	if (getaddrinfo(cfg->host, portStr, &hints, &res) != 0 || res == NULL)
+	hints.ai_flags = AI_PASSIVE;
+	if (getaddrinfo(cfg->host[0] ? cfg->host : NULL, portStr, &hints, &res)
+			!= 0
+			|| res == NULL)
 	{
-		putErrmsg("quicclo: can't resolve host.", cfg->host);
+		putErrmsg("quiccla: can't resolve bind address.", cfg->host);
 		goto fail;
 	}
 
 	s->fd = socket(res->ai_family, SOCK_DGRAM, 0);
-	if (s->fd < 0 || connect(s->fd, res->ai_addr, res->ai_addrlen) < 0)
+	if (s->fd < 0 || bind(s->fd, res->ai_addr, res->ai_addrlen) < 0)
 	{
-		putSysErrmsg("quicclo: can't create/connect UDP socket", NULL);
-		goto fail;
-	}
-
-	memcpy(&qc->remote, res->ai_addr, res->ai_addrlen);
-	qc->remoteLen = res->ai_addrlen;
-	qc->localLen = sizeof(qc->local);
-	if (getsockname(s->fd, (struct sockaddr *) &qc->local, &qc->localLen) < 0)
-	{
-		putSysErrmsg("quicclo: getsockname failed", NULL);
+		putSysErrmsg("quiccla: can't bind UDP socket", NULL);
 		goto fail;
 	}
 
 	quicUdpApplyOpts(s->fd, cfg->rcvBufSize, cfg->sndBufSize,
 			&s->useGso, &s->useGro);
-
 	freeaddrinfo(res);
 	res = NULL;
 
-	s->creds = quicTlsCredsNew(cfg, 0);
-	if (s->creds == NULL || setupTls(s, qc, 0) < 0)
-	{
-		putErrmsg("quicclo: TLS setup failed.", NULL);
-		goto fail;
-	}
-
-	dcid.datalen = NGTCP2_MAX_CIDLEN;
-	scid.datalen = NGTCP2_MAX_CIDLEN;
-	oK(quicTlsRand(dcid.data, dcid.datalen));
-	oK(quicTlsRand(scid.data, scid.datalen));
-	memcpy(&qc->scid, &scid, sizeof(ngtcp2_cid));
-
-	ngtcp2_settings_default(&settings);
-	settings.initial_ts = quicNow();
-	defaultTransportParams(cfg, &params);
-	setCallbacks(&callbacks, 0);
-
-	ngtcp2_path_storage_init(&ps, (struct sockaddr *) &qc->local,
-			qc->localLen, (struct sockaddr *) &qc->remote,
-			qc->remoteLen, NULL);
-
-	if (ngtcp2_conn_client_new(&qc->conn, &dcid, &scid, &ps.path,
-			    NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params,
-			    NULL, qc)
-			!= 0)
-	{
-		putErrmsg("quicclo: ngtcp2_conn_client_new failed.", NULL);
-		goto fail;
-	}
-
-	ngtcp2_conn_set_tls_native_handle(qc->conn, quicTlsNativeHandle(qc->tls));
-
 	if (pipe(s->wakePipe) < 0)
 	{
-		putSysErrmsg("quicclo: pipe failed", NULL);
+		putSysErrmsg("quiccla: pipe failed", NULL);
 		goto fail;
 	}
 
@@ -1460,43 +1480,12 @@ QuicSession *quicClientStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 	oK(fcntl(s->wakePipe[1], F_SETFL, O_NONBLOCK));
 	s->running = 1;
 
-	if (pthread_begin(&s->ioThread, NULL, clientIo, s))
+	if (pthread_begin(&s->ioThread, NULL, engineIo, s))
 	{
-		putSysErrmsg("quicclo: can't start I/O thread", NULL);
+		putSysErrmsg("quiccla: can't start I/O thread", NULL);
 		goto fail;
 	}
 
-	/*	Wait for the QUIC handshake and the QUICCL SESS_INIT
-	 *	exchange to complete (up to idle timeout).		*/
-
-	deadline = cfg->idleSec * 1000;
-	pthread_mutex_lock(&s->mutex);
-	while (qc->sessState != QSS_ESTABLISHED && !qc->failed && deadline > 0)
-	{
-		struct timespec tw;
-
-		clock_gettime(CLOCK_REALTIME, &tw);
-		tw.tv_nsec += 100 * 1000000L;
-		if (tw.tv_nsec >= 1000000000L)
-		{
-			tw.tv_sec += 1;
-			tw.tv_nsec -= 1000000000L;
-		}
-
-		pthread_cond_timedwait(&s->cond, &s->mutex, &tw);
-		deadline -= 100;
-	}
-
-	pthread_mutex_unlock(&s->mutex);
-
-	if (qc->sessState != QSS_ESTABLISHED || qc->failed)
-	{
-		putErrmsg("quicclo: QUICCL session did not establish.", NULL);
-		quicClientStop(s);
-		return NULL;
-	}
-
-	writeMemo("[i] quic: QUICCL session established.");
 	return s;
 
 fail:
@@ -1516,77 +1505,213 @@ fail:
 		close(s->wakePipe[1]);
 	}
 
-	freeConn(qc);
+	quicTlsCredsFree(s->serverCreds);
+	quicTlsCredsFree(s->clientCreds);
 	pthread_mutex_destroy(&s->mutex);
 	pthread_cond_destroy(&s->cond);
 	MRELEASE(s);
 	return NULL;
 }
 
-static void *clientIo(void *parm)
+/*	Open a connection to host:port and wait until its QUICCL session is
+ *	established and ready to carry bundles.  The connection is added to
+ *	the engine's list and driven by the I/O thread; while this function
+ *	waits, the connection is pinned (sendBusy) so the I/O thread will not
+ *	reap it.  Returns 0 on success, -1 on failure.			*/
+
+static int quicEngineConnect(QuicSession *s, const char *host, int port)
 {
-	QuicSession *s = parm;
-	QuicConn    *qc = s->client;
+	QuicConn	       *qc;
+	struct addrinfo		hints;
+	struct addrinfo	       *res = NULL;
+	char			portStr[16];
+	ngtcp2_cid		dcid;
+	ngtcp2_cid		scid;
+	ngtcp2_settings		settings;
+	ngtcp2_transport_params params;
+	ngtcp2_callbacks	callbacks;
+	ngtcp2_path_storage	ps;
+	int			deadline;
+	int			ready;
 
-	while (s->running && !qc->failed)
+	qc = MTAKE(sizeof(QuicConn));
+	if (qc == NULL)
 	{
-		struct pollfd pfds[2];
-		ngtcp2_tstamp expiry;
-		int	      timeoutMs = 1000;
-		uint8_t	      buf[QUIC_RX_BUFSZ];
-		ssize_t	      n;
-		int	      seg;
+		return -1;
+	}
 
-		/*	Once the QUIC handshake completes, open stream 0
-		 *	(the first client bidi stream, == QUICCL_SIG_STREAM)
-		 *	and send our SESS_INIT to begin the QUICCL session.	*/
+	memset(qc, 0, sizeof(*qc));
+	qc->owner = s;
+	qc->clientRole = 1;
+	qc->sendStreamId = -1;
+	qc->lastSentStream = -1;
+	qc->ackStreamId = -1;
+	qc->dataStreams[0] = qc->dataStreams[1] = qc->dataStreams[2] =
+			qc->dataStreams[3] = -1;
+	qc->rxCap = QUICCLA_BUFSZ;
+	qc->rxBuf = MTAKE(qc->rxCap);
+	if (qc->rxBuf == NULL)
+	{
+		MRELEASE(qc);
+		return -1;
+	}
 
-		if (qc->handshakeDone && !qc->sessInitSent)
+	isprintf(portStr, sizeof(portStr), "%d", port);
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	if (getaddrinfo(host, portStr, &hints, &res) != 0 || res == NULL)
+	{
+		putErrmsg("quiccla: can't resolve peer host.", host);
+		freeConn(qc);
+		return -1;
+	}
+
+	memcpy(&qc->remote, res->ai_addr, res->ai_addrlen);
+	qc->remoteLen = res->ai_addrlen;
+	freeaddrinfo(res);
+	qc->localLen = sizeof(qc->local);
+	oK(getsockname(s->fd, (struct sockaddr *) &qc->local, &qc->localLen));
+
+	if (setupTls(s, qc, 0) < 0)
+	{
+		putErrmsg("quiccla: TLS setup failed.", NULL);
+		freeConn(qc);
+		return -1;
+	}
+
+	dcid.datalen = NGTCP2_MAX_CIDLEN;
+	scid.datalen = NGTCP2_MAX_CIDLEN;
+	oK(quicTlsRand(dcid.data, dcid.datalen));
+	oK(quicTlsRand(scid.data, scid.datalen));
+	memcpy(&qc->scid, &scid, sizeof(ngtcp2_cid));
+
+	ngtcp2_settings_default(&settings);
+	settings.initial_ts = quicNow();
+	defaultTransportParams(&s->cfg, &params);
+	setCallbacks(&callbacks, 0);
+	ngtcp2_path_storage_init(&ps, (struct sockaddr *) &qc->local,
+			qc->localLen, (struct sockaddr *) &qc->remote,
+			qc->remoteLen, NULL);
+
+	if (ngtcp2_conn_client_new(&qc->conn, &dcid, &scid, &ps.path,
+			    NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params,
+			    NULL, qc)
+			!= 0)
+	{
+		putErrmsg("quiccla: ngtcp2_conn_client_new failed.", NULL);
+		freeConn(qc);
+		return -1;
+	}
+
+	ngtcp2_conn_set_tls_native_handle(qc->conn, quicTlsNativeHandle(qc->tls));
+
+	/*	Publish the connection (pinned) and let the I/O thread drive
+	 *	its handshake.						*/
+
+	pthread_mutex_lock(&s->mutex);
+	qc->sendBusy = 1;
+	qc->next = s->conns;
+	s->conns = qc;
+	pthread_mutex_unlock(&s->mutex);
+	wakeIo(s);
+
+	deadline = s->cfg.idleSec * 1000;
+	pthread_mutex_lock(&s->mutex);
+	while (!qc->failed && deadline > 0
+			&& !(qc->sessState == QSS_ESTABLISHED
+					&& (s->cfg.unreliable
+							|| qc->dataStreamsOpen)))
+	{
+		struct timespec tw;
+
+		clock_gettime(CLOCK_REALTIME, &tw);
+		tw.tv_nsec += 100 * 1000000L;
+		if (tw.tv_nsec >= 1000000000L)
 		{
-			int64_t sid;
-
-			if (ngtcp2_conn_open_bidi_stream(qc->conn, &sid, qc) != 0
-					|| sendSessInit(qc) < 0)
-			{
-				qc->failed = 1;
-				break;
-			}
+			tw.tv_sec += 1;
+			tw.tv_nsec -= 1000000000L;
 		}
 
-		/*	Open the four priority data streams (4, 8, 12, 16) once
-		 *	the signalling stream exists, so each bundle can be
-		 *	mapped to a stream by class of service.			*/
+		pthread_cond_timedwait(&s->cond, &s->mutex, &tw);
+		deadline -= 100;
+	}
 
-		if (!s->cfg.unreliable && qc->sessInitSent && !qc->dataStreamsOpen)
-		{
-			int i;
+	ready = (qc->sessState == QSS_ESTABLISHED && !qc->failed
+			&& (s->cfg.unreliable || qc->dataStreamsOpen));
+	qc->sendBusy = 0;
+	pthread_mutex_unlock(&s->mutex);
 
-			for (i = 0; i < 4; i++)
-			{
-				if (ngtcp2_conn_open_bidi_stream(qc->conn,
-						    &qc->dataStreams[i], qc)
-						!= 0)
-				{
-					qc->failed = 1;
-					break;
-				}
-			}
+	if (!ready)
+	{
+		putErrmsg("quiccla: QUICCL session did not establish.", host);
+		wakeIo(s); /* Let the I/O thread reap the failed conn.	*/
+		return -1;
+	}
 
-			qc->dataStreamsOpen = 1;
-		}
+	writeMemo("[i] quic: QUICCL session established.");
+	return 0;
+}
 
-		sessionTick(qc);
-		oK(writeConn(qc));
-		oK(writeDatagrams(qc));
+/*	Mark send slots done and wake any waiting sender/connect threads.	*/
 
-		pthread_mutex_lock(&s->mutex);
+static void engineWakeWaiters(QuicSession *s)
+{
+	QuicConn *qc;
+
+	pthread_mutex_lock(&s->mutex);
+	for (qc = s->conns; qc != NULL; qc = qc->next)
+	{
 		if (qc->sendData && qc->sendOff >= qc->sendLen)
 		{
 			qc->sendDone = 1;
 		}
+	}
 
-		pthread_cond_broadcast(&s->cond);
-		pthread_mutex_unlock(&s->mutex);
+	pthread_cond_broadcast(&s->cond);
+	pthread_mutex_unlock(&s->mutex);
+}
+
+/*	Service every connection once: bring-up, keepalive, and flush.	*/
+
+static void engineServiceConns(QuicSession *s)
+{
+	QuicConn *qc;
+
+	for (qc = s->conns; qc != NULL; qc = qc->next)
+	{
+		if (qc->failed)
+		{
+			continue;
+		}
+
+		perConnBringup(qc);
+		sessionTick(qc);
+		oK(writeConn(qc));
+		oK(writeDatagrams(qc));
+	}
+}
+
+static void *engineIo(void *parm)
+{
+	QuicSession *s = parm;
+	QuicConn    *qc;
+	QuicConn    *next;
+
+	while (s->running)
+	{
+		struct pollfd		pfds[2];
+		uint8_t			buf[QUIC_RX_BUFSZ];
+		ssize_t			n;
+		struct sockaddr_storage remote;
+		socklen_t		remoteLen;
+		ServerRxCtx		ctx;
+		int			timeoutMs = 1000;
+		int			seg;
+		ngtcp2_tstamp		now;
+
+		engineServiceConns(s);
+		engineWakeWaiters(s);
 
 		pfds[0].fd = s->fd;
 		pfds[0].events = POLLIN;
@@ -1595,10 +1720,23 @@ static void *clientIo(void *parm)
 		pfds[1].events = POLLIN;
 		pfds[1].revents = 0;
 
-		expiry = ngtcp2_conn_get_expiry(qc->conn);
-		if (expiry != UINT64_MAX)
+		/*	Wake at the soonest connection expiry (capped at 1s).	*/
+
+		now = quicNow();
+		for (qc = s->conns; qc != NULL; qc = qc->next)
 		{
-			ngtcp2_tstamp now = quicNow();
+			ngtcp2_tstamp expiry;
+
+			if (qc->failed)
+			{
+				continue;
+			}
+
+			expiry = ngtcp2_conn_get_expiry(qc->conn);
+			if (expiry == UINT64_MAX)
+			{
+				continue;
+			}
 
 			if (expiry <= now)
 			{
@@ -1609,7 +1747,10 @@ static void *clientIo(void *parm)
 				ngtcp2_tstamp d = (expiry - now)
 						/ NGTCP2_MILLISECONDS;
 
-				timeoutMs = d > 1000 ? 1000 : (int) d;
+				if ((int) d < timeoutMs)
+				{
+					timeoutMs = (int) d;
+				}
 			}
 		}
 
@@ -1629,40 +1770,73 @@ static void *clientIo(void *parm)
 		}
 
 		/*	Each read may be a GRO-coalesced train of seg-byte
-		 *	datagrams; split it back into individual QUIC packets.	*/
+		 *	datagrams; split it back into individual QUIC packets and
+		 *	demultiplex each to its connection (accepting a new one
+		 *	when needed).					*/
 
 		while ((n = quicUdpRecv(s->fd, s->useGro, buf, sizeof(buf),
-				NULL, NULL, &seg))
+				&remote, &remoteLen, &seg))
 				> 0)
 		{
-			if (quicUdpForEachPacket(buf, (size_t) n, seg,
-					clientFeedPacket, qc)
-					< 0)
+			ctx.s = s;
+			ctx.remote = &remote;
+			ctx.remoteLen = remoteLen;
+			oK(quicUdpForEachPacket(buf, (size_t) n, seg,
+					serverFeedPacket, &ctx));
+		}
+
+		now = quicNow();
+		for (qc = s->conns; qc != NULL; qc = next)
+		{
+			next = qc->next;
+			if (!qc->failed)
 			{
-				break;
+				if (ngtcp2_conn_handle_expiry(qc->conn, now) != 0)
+				{
+					qc->failed = 1;
+				}
+				else
+				{
+					perConnBringup(qc);
+					sessionTick(qc);
+					oK(writeConn(qc));
+					oK(writeDatagrams(qc));
+				}
+			}
+
+			/*	Reap failed connections, but never one a sender
+			 *	or connect thread still holds (sendBusy).	*/
+
+			if (qc->failed && !qc->sendBusy)
+			{
+				engineWakeWaiters(s);
+				removeConn(s, qc);
 			}
 		}
 
-		if (ngtcp2_conn_handle_expiry(qc->conn, quicNow()) != 0)
+		engineWakeWaiters(s);
+	}
+
+	/*	Stopping: cleanly terminate each established session with a
+	 *	SESS_TERM, flushed inline, then wake any waiters.		*/
+
+	for (qc = s->conns; qc != NULL; qc = qc->next)
+	{
+		if (!qc->failed && qc->sessState == QSS_ESTABLISHED
+				&& !qc->termSent)
 		{
-			qc->failed = 1;
+			oK(sendSessTerm(qc, QMSG_TERM_UNKNOWN, 0));
+			oK(writeConn(qc));
+			writeMemo("[i] quic: sending SESS_TERM.");
 		}
-
-		oK(writeConn(qc));
-		oK(writeDatagrams(qc));
-
-		pthread_mutex_lock(&s->mutex);
-		if (qc->sendData && qc->sendOff >= qc->sendLen)
-		{
-			qc->sendDone = 1;
-		}
-
-		pthread_cond_broadcast(&s->cond);
-		pthread_mutex_unlock(&s->mutex);
 	}
 
 	pthread_mutex_lock(&s->mutex);
-	qc->failed = 1;
+	for (qc = s->conns; qc != NULL; qc = qc->next)
+	{
+		qc->failed = 1;
+	}
+
 	pthread_cond_broadcast(&s->cond);
 	pthread_mutex_unlock(&s->mutex);
 	return NULL;
@@ -1880,32 +2054,73 @@ static int quicClientSendDatagram(QuicSession *s, QuicConn *qc,
 	return qc->failed ? -1 : 0;
 }
 
-int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
-		int ordinal)
+/*	Claim a connection ready to carry a bundle to nodeNbr, pinning it
+ *	(sendBusy) so the I/O thread will not reap it while the sender uses
+ *	it.  Sets *exists when any live connection to nodeNbr is present
+ *	(ready or still coming up), so the caller can tell "not yet ready"
+ *	from "no connection at all".  Must be called with s->mutex held.	*/
+
+static QuicConn *claimReadyConn(QuicSession *s, uvast nodeNbr, int *exists)
 {
-	QuicConn      *qc = s->client;
+	QuicConn *qc;
+	QuicConn *ready = NULL;
+
+	*exists = 0;
+	for (qc = s->conns; qc != NULL; qc = qc->next)
+	{
+		if (qc->failed || qc->peerNode != nodeNbr)
+		{
+			continue;
+		}
+
+		*exists = 1;
+		if (qc->sessState != QSS_ESTABLISHED || qc->sendBusy
+				|| !(s->cfg.unreliable || qc->dataStreamsOpen))
+		{
+			continue;
+		}
+
+		/*	Prefer a connection this node opened: its data streams
+		 *	use the draft's 4/8/12/16 priority numbering.  Fall back
+		 *	to an accepted connection so a peer-opened session is
+		 *	reused rather than opening a second one.		*/
+
+		if (qc->clientRole)
+		{
+			qc->sendBusy = 1;
+			return qc;
+		}
+
+		if (ready == NULL)
+		{
+			ready = qc;
+		}
+	}
+
+	if (ready != NULL)
+	{
+		ready->sendBusy = 1;
+	}
+
+	return ready;
+}
+
+/*	Send one bundle on a claimed connection as reliable XFER_SEGMENT(s),
+ *	handing it to the I/O thread (the only thread that may touch the
+ *	non-thread-safe ngtcp2_conn) on the priority-appropriate data stream
+ *	and blocking until it is sent or the connection fails.		*/
+
+static int doSend(QuicSession *s, QuicConn *qc, const unsigned char *bundle,
+		int len, int ordinal)
+{
 	unsigned char *framed;
 	int	       flen;
-
-	if (qc->failed || qc->sessState != QSS_ESTABLISHED)
-	{
-		return -1;
-	}
-
-	if (s->cfg.unreliable)
-	{
-		return quicClientSendDatagram(s, qc, bundle, len);
-	}
 
 	framed = frameBundle(qc, bundle, len, &flen);
 	if (framed == NULL)
 	{
 		return -1;
 	}
-
-	/*	Hand the bundle to the I/O thread; only that thread may
-	 *	touch the (non-thread-safe) ngtcp2_conn.  Route it to the
-	 *	priority-appropriate data stream.			*/
 
 	pthread_mutex_lock(&s->mutex);
 	qc->sendData = framed;
@@ -1941,29 +2156,84 @@ int quicClientSend(QuicSession *s, const unsigned char *bundle, int len,
 	return qc->failed ? -1 : 0;
 }
 
-void quicClientStop(QuicSession *s)
+int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
+		const unsigned char *bundle, int len, int ordinal)
 {
+	QuicConn *qc;
+	int	  exists;
+	int	  dialed = 0;
+	int	  waited = 0;
+	int	  rc;
+
+	for (;;)
+	{
+		pthread_mutex_lock(&s->mutex);
+		qc = claimReadyConn(s, nodeNbr, &exists);
+		pthread_mutex_unlock(&s->mutex);
+		if (qc != NULL)
+		{
+			break;
+		}
+
+		if (exists)
+		{
+			/*	A session to this node exists but is not yet
+			 *	ready (or is busy); wait briefly and retry.	*/
+
+			if (waited >= 50)
+			{
+				return -1;
+			}
+
+			microsnooze(100000);
+			waited++;
+			continue;
+		}
+
+		/*	No session to this node: open one (once).		*/
+
+		if (dialed || quicEngineConnect(s, host, port) < 0)
+		{
+			return -1;
+		}
+
+		dialed = 1;
+	}
+
+	rc = s->cfg.unreliable ? quicClientSendDatagram(s, qc, bundle, len) :
+				 doSend(s, qc, bundle, len, ordinal);
+
+	pthread_mutex_lock(&s->mutex);
+	qc->sendBusy = 0;
+	pthread_mutex_unlock(&s->mutex);
+	return rc;
+}
+
+void quicEngineStop(QuicSession *s)
+{
+	QuicConn *qc;
+	QuicConn *next;
+
 	if (s == NULL)
 	{
 		return;
 	}
 
+	/*	The I/O thread flushes a SESS_TERM on each established session
+	 *	as it exits (it alone owns the ngtcp2 connections), so callers
+	 *	must stop their sender threads before calling this.		*/
+
 	if (s->running)
 	{
-		/*	Cleanly terminate the QUICCL session: queue SESS_TERM
-		 *	and let the I/O thread flush it before shutting down.	*/
-
-		if (s->client && s->client->sessState == QSS_ESTABLISHED
-				&& !s->client->termSent)
-		{
-			oK(sendSessTerm(s->client, QMSG_TERM_UNKNOWN, 0));
-			wakeIo(s);
-			microsnooze(200000);
-		}
-
 		s->running = 0;
 		wakeIo(s);
 		pthread_join(s->ioThread, NULL);
+	}
+
+	for (qc = s->conns; qc != NULL; qc = next)
+	{
+		next = qc->next;
+		freeConn(qc);
 	}
 
 	if (s->fd >= 0)
@@ -1977,88 +2247,14 @@ void quicClientStop(QuicSession *s)
 		close(s->wakePipe[1]);
 	}
 
-	freeConn(s->client);
-	quicTlsCredsFree(s->creds);
+	quicTlsCredsFree(s->serverCreds);
+	quicTlsCredsFree(s->clientCreds);
 	pthread_mutex_destroy(&s->mutex);
 	pthread_cond_destroy(&s->cond);
 	MRELEASE(s);
 }
 
-/*	*	*	Server	*	*	*	*	*	*/
-
-QuicSession *quicServerStart(const QuicClaConfig *cfg)
-{
-	QuicSession	*s;
-	struct addrinfo	 hints;
-	struct addrinfo *res = NULL;
-	char		 portStr[16];
-
-	if (cfg->certFile[0] == '\0' || cfg->keyFile[0] == '\0')
-	{
-		putErrmsg("quiccli: -c cert and -k key are required.", NULL);
-		return NULL;
-	}
-
-	s = MTAKE(sizeof(QuicSession));
-	if (s == NULL)
-	{
-		return NULL;
-	}
-
-	memset(s, 0, sizeof(*s));
-	s->isServer = 1;
-	s->cfg = *cfg;
-	s->fd = -1;
-	pthread_mutex_init(&s->mutex, NULL);
-	pthread_cond_init(&s->cond, NULL);
-
-	s->creds = quicTlsCredsNew(cfg, 1);
-	if (s->creds == NULL)
-	{
-		goto fail;
-	}
-
-	isprintf(portStr, sizeof(portStr), "%d", cfg->port);
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_flags = AI_PASSIVE;
-	if (getaddrinfo(cfg->host[0] ? cfg->host : NULL, portStr, &hints, &res) != 0
-			|| res == NULL)
-	{
-		putErrmsg("quiccli: can't resolve bind address.", cfg->host);
-		goto fail;
-	}
-
-	s->fd = socket(res->ai_family, SOCK_DGRAM, 0);
-	if (s->fd < 0 || bind(s->fd, res->ai_addr, res->ai_addrlen) < 0)
-	{
-		putSysErrmsg("quiccli: can't bind UDP socket", NULL);
-		goto fail;
-	}
-
-	quicUdpApplyOpts(s->fd, cfg->rcvBufSize, cfg->sndBufSize,
-			&s->useGso, &s->useGro);
-	freeaddrinfo(res);
-	oK(fcntl(s->fd, F_SETFL, O_NONBLOCK));
-	return s;
-
-fail:
-	if (res)
-	{
-		freeaddrinfo(res);
-	}
-
-	if (s->fd >= 0)
-	{
-		close(s->fd);
-	}
-
-	quicTlsCredsFree(s->creds);
-
-	MRELEASE(s);
-	return NULL;
-}
+/*	*	*	Connection demux	*	*	*	*	*/
 
 static QuicConn *findConn(QuicSession *s, const uint8_t *dcid, size_t dcidlen)
 {
@@ -2169,15 +2365,6 @@ static void removeConn(QuicSession *s, QuicConn *dead)
 	freeConn(dead);
 }
 
-/*	Per-read context for serverFeedPacket: the peer of the current UDP
- *	read (its GRO-coalesced packets all share one source).		*/
-typedef struct
-{
-	QuicSession		*s;
-	struct sockaddr_storage *remote;
-	socklen_t		 remoteLen;
-} ServerRxCtx;
-
 /*	Dispatch one received packet (from a possibly GRO-coalesced read) to
  *	its connection, accepting a new connection when needed.  Malformed or
  *	unacceptable packets are dropped; the drain never stops early.	*/
@@ -2208,112 +2395,4 @@ static int serverFeedPacket(void *user, const uint8_t *pkt, size_t len)
 
 	oK(feedConn(qc, pkt, len));
 	return 0;
-}
-
-int quicServerRun(QuicSession *s, QuicBundleCb cb, void *user,
-		volatile int *running)
-{
-	s->cb = cb;
-	s->cbUser = user;
-
-	while (*running)
-	{
-		struct pollfd		pfd;
-		uint8_t			buf[QUIC_RX_BUFSZ];
-		ssize_t			n;
-		struct sockaddr_storage remote;
-		socklen_t		remoteLen;
-		QuicConn	       *qc;
-		QuicConn	       *next;
-		ServerRxCtx		ctx;
-		int			timeoutMs = 1000;
-		int			seg;
-
-		pfd.fd = s->fd;
-		pfd.events = POLLIN;
-		pfd.revents = 0;
-
-		if (poll(&pfd, 1, timeoutMs) < 0 && errno != EINTR)
-		{
-			return -1;
-		}
-
-		/*	Each read may be a GRO-coalesced train of seg-byte
-		 *	datagrams; split it back into individual QUIC packets.	*/
-
-		while ((n = quicUdpRecv(s->fd, s->useGro, buf, sizeof(buf),
-				&remote, &remoteLen, &seg))
-				> 0)
-		{
-			ctx.s = s;
-			ctx.remote = &remote;
-			ctx.remoteLen = remoteLen;
-			oK(quicUdpForEachPacket(buf, (size_t) n, seg,
-					serverFeedPacket, &ctx));
-		}
-
-		for (qc = s->conns; qc != NULL; qc = next)
-		{
-			next = qc->next;
-			if (!qc->failed)
-			{
-				if (ngtcp2_conn_handle_expiry(qc->conn, quicNow())
-						!= 0)
-				{
-					qc->failed = 1;
-				}
-				else
-				{
-					sessionTick(qc);
-					oK(writeConn(qc));
-				}
-			}
-
-			if (qc->failed)
-			{
-				removeConn(s, qc);
-			}
-		}
-	}
-
-	return 0;
-}
-
-void quicServerStop(QuicSession *s)
-{
-	QuicConn *qc;
-	QuicConn *next;
-
-	if (s == NULL)
-	{
-		return;
-	}
-
-	/*	Cleanly terminate each established session with a SESS_TERM,
-	 *	flushed inline since the server loop has already stopped.	*/
-
-	for (qc = s->conns; qc != NULL; qc = qc->next)
-	{
-		if (!qc->failed && qc->sessState == QSS_ESTABLISHED
-				&& !qc->termSent)
-		{
-			oK(sendSessTerm(qc, QMSG_TERM_UNKNOWN, 0));
-			oK(writeConn(qc));
-		}
-	}
-
-	for (qc = s->conns; qc != NULL; qc = next)
-	{
-		next = qc->next;
-		freeConn(qc);
-	}
-
-	if (s->fd >= 0)
-	{
-		close(s->fd);
-	}
-
-	quicTlsCredsFree(s->creds);
-
-	MRELEASE(s);
 }

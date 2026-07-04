@@ -56,7 +56,7 @@ QuicTlsCreds *quicTlsCredsNew(const QuicClaConfig *cfg, int isServer)
 				!= 0
 				&& isServer)
 		{
-			putErrmsg("quiccli: can't load cert/key.", NULL);
+			putErrmsg("quiccla: can't load cert/key.", NULL);
 			gnutls_certificate_free_credentials(creds->cred);
 			MRELEASE(creds);
 			return NULL;

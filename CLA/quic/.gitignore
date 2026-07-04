@@ -20,9 +20,8 @@ bench/bpdriverAduFile
 # Generated man pages
 doc/*.1
 
-# Built daemons
-quiccli
-quicclo
+# Built daemon
+quiccla
 
 # make check artifacts
 quicmsg_test

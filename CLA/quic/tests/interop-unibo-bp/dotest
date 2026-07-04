@@ -2,26 +2,30 @@
 #
 # Inter-project QUIC CLA interop test: ION-DTN <-> Unibo-BP.
 #
-# Both stacks implement the QUICCL protocol of draft-caini-dtn-quiccl,
-# but from independent codebases and QUIC libraries (ION: ngtcp2 + GnuTLS;
-# Unibo-BP: picoquic + OpenSSL).  This test stands up one ION node
-# (ipn:1) and one Unibo-BP node (ipn:2) on the loopback interface and
-# carries a bundle each way over a live QUIC connection, proving the two
-# implementations interoperate on the wire (QUIC handshake + SESS_INIT
-# negotiation + XFER_SEGMENT/XFER_ACK).
+# Both stacks implement the QUICCL protocol of draft-caini-dtn-quiccl, from
+# independent codebases and QUIC libraries (ION: ngtcp2 + GnuTLS; Unibo-BP:
+# picoquic + OpenSSL).  QUICCL sessions are peer-symmetric: once established,
+# either peer may send over the connection regardless of which peer opened it.
+# This test proves that both ways, using a SINGLE connection per phase:
 #
-#   Phase 1  unibo -> ION   : unibo-bp-send  -> bprecvfile ipn:1.2
-#   Phase 2  ION -> unibo -> ION : bpsendfile to the unibo echo service
-#                                  (ipn:2.7); the echo returns to ipn:1.4.
+#   Phase 1  ION is the active peer.  ION opens the connection to Unibo-BP's
+#            induct, sends a bundle ION -> Unibo (to a sink, no size limit),
+#            then Unibo sends a bundle back Unibo -> ION over that same
+#            connection (Unibo has no outduct to ION, so it must reuse it).
 #
-# ION supplies the quic CLAs (quiccli/quicclo) and the standard bp tools.
-# The Unibo-BP tools are found on PATH; set UNIBO_BP_BIN_DIR to point at
-# an install prefix's bin directory if they live elsewhere.  The test
+#   Phase 2  Unibo-BP is the active peer (dual of phase 1).  Unibo opens the
+#            connection to ION's induct, sends Unibo -> ION, then ION sends
+#            ION -> Unibo over that same accepted connection.
+#
+# Each phase uses one QUIC connection and no concurrent TCPCL session (per
+# Unibo-BP's round-robin outduct policy).  ION supplies the quiccla daemon and
+# the standard bp tools; the Unibo-BP tools are found on PATH (set
+# UNIBO_BP_BIN_DIR to an install bin dir if they live elsewhere).  The test
 # SKIPs (exit 2) when either stack, or openssl, is unavailable.
 #
 
-ION_PORT="${ION_PORT:-4570}"      # ION quiccli induct (unibo outduct target)
-UNIBO_PORT="${UNIBO_PORT:-4571}"  # Unibo-BP quiccl induct (ION quicclo target)
+ION_PORT="${ION_PORT:-4570}"      # ION quiccla induct (unibo outduct target)
+UNIBO_PORT="${UNIBO_PORT:-4571}"  # Unibo-BP quiccl induct (ION outduct target)
 
 ION_INDUCT="127.0.0.1:${ION_PORT}"
 UNIBO_OUTDUCT="127.0.0.1:${UNIBO_PORT}"
@@ -38,8 +42,8 @@ echo "########################################"
 echo
 pwd | sed "s/\/.*\///" | xargs echo "NAME: "
 echo
-echo "PURPOSE: ION-DTN <-> Unibo-BP QUIC CLA interoperability"
-echo "         (draft-caini-dtn-quiccl, live cross-project connection)."
+echo "PURPOSE: ION-DTN <-> Unibo-BP QUIC CLA interoperability, proving a"
+echo "         QUICCL session is bidirectional (draft-caini-dtn-quiccl)."
 echo
 echo "########################################"
 
@@ -47,22 +51,22 @@ FAIL=0
 fail() { echo "FAILURE: $1"; FAIL=1; }
 
 # Run a Unibo-BP command against the node whose state lives in $UNIBODIR.
-# Unibo-BP tools bind to the agent in the current directory by default,
-# so we cd there (and clear UNIBO_BP to honour that default).
+# Unibo-BP tools bind to the agent in the current directory by default, so we
+# cd there (and clear UNIBO_BP to honour that default).
 ubp() { ( cd "$UNIBODIR" && unset UNIBO_BP && "$@" ); }
 
 if [ -n "$UNIBO_BP_BIN_DIR" ]; then
 	PATH="$UNIBO_BP_BIN_DIR:$PATH"
 fi
 
-for t in quiccli quicclo ionadmin bpadmin bpsendfile bprecvfile openssl; do
+for t in quiccla ionadmin bpadmin bpsendfile bprecvfile openssl; do
 	if ! command -v "$t" >/dev/null 2>&1; then
 		echo "SKIP: ION tool '$t' not found."
 		exit 2
 	fi
 done
 
-for t in unibo-bp unibo-bp-admin unibo-bp-quiccl unibo-bp-echo \
+for t in unibo-bp unibo-bp-admin unibo-bp-quiccl unibo-bp-sink \
 	unibo-bp-send unibo-bp-utility; do
 	if ! command -v "$t" >/dev/null 2>&1; then
 		echo "SKIP: Unibo-BP tool '$t' not found"
@@ -71,23 +75,127 @@ for t in unibo-bp unibo-bp-admin unibo-bp-quiccl unibo-bp-echo \
 	fi
 done
 
+kill_everything() {
+	pkill -9 -f "quiccla" 2>/dev/null
+	( cd "$UNIBODIR" 2>/dev/null && unset UNIBO_BP && unibo-bp-admin stop ) \
+		>/dev/null 2>&1
+	pkill -9 -f "unibo-bp start" 2>/dev/null
+	pkill -9 -f "unibo-bp-quiccl" 2>/dev/null
+	pkill -9 -f "unibo-bp-sink" 2>/dev/null
+	ionstop >/dev/null 2>&1
+	killm >/dev/null 2>&1
+}
+
+# --- ION node lifecycle -------------------------------------------------
+ion_start() {
+	echo "  Starting ION node (ipn:1)..."
+	ionadmin "${CONFIGDIR}/interop.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/interop_runtime.bprc" >/dev/null 2>&1
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -f "quiccla" >/dev/null && break
+		sleep 1
+	done
+	sleep 1
+	if ! pgrep -f "quiccla" >/dev/null; then
+		echo "  ERROR: ION QUIC CLA daemon did not start."
+		tail -20 ion.log 2>/dev/null
+		return 1
+	fi
+	return 0
+}
+
+ion_stop() {
+	pkill -9 -f "quiccla" 2>/dev/null
+	ionstop >/dev/null 2>&1
+	sleep 1
+	killm >/dev/null 2>&1
+}
+
+# --- Unibo-BP node lifecycle --------------------------------------------
+# $1 = 1 to also add a Unibo outduct toward ION (phase 2), 0 for none.
+unibo_start() {
+	local add_outduct="$1"
+	local reftime
+
+	rm -rf "$UNIBODIR"
+	mkdir -p "$UNIBODIR"
+	cp "$CERT" "$UNIBODIR/cert.pem"
+	cp "$KEY" "$UNIBODIR/key.pem"
+
+	echo "  Starting Unibo-BP node (ipn:2)..."
+	ubp unibo-bp start --set-storage-size 50000000 \
+		--dtn-admin dtn://node2.dtn/ --ipn-admin ipn:2.0 --daemon \
+		>/dev/null 2>&1
+	sleep 3
+	if ! pgrep -f "unibo-bp start" >/dev/null; then
+		echo "  SKIP: Unibo-BP node failed to start."
+		return 2
+	fi
+
+	# Debug logging surfaces Unibo's per-bundle QUICCLA receive events.
+	ubp unibo-bp-admin logger --set-log-level debug >/dev/null 2>&1
+	reftime=$(unibo-bp-utility --get-utc-time +0 2>/dev/null)
+	ubp unibo-bp-admin region home --register-node ipn:1.0 >/dev/null 2>&1
+	ubp unibo-bp-admin region home --register-node ipn:2.0 >/dev/null 2>&1
+	ubp unibo-bp-admin routing cgr --set-reference-time "$reftime" \
+		>/dev/null 2>&1
+	ubp unibo-bp-admin range add --start-time +0 --end-time +86400 \
+		--sender ipn:1.0 --receiver ipn:2.0 --owlt 0 \
+		--reference-time "$reftime" >/dev/null 2>&1
+	ubp unibo-bp-admin range add --start-time +0 --end-time +86400 \
+		--sender ipn:2.0 --receiver ipn:1.0 --owlt 0 \
+		--reference-time "$reftime" >/dev/null 2>&1
+	ubp unibo-bp-admin contact add --start-time +0 --end-time +86400 \
+		--sender ipn:1.0 --receiver ipn:2.0 --xmit-rate 1000000 \
+		--reference-time "$reftime" >/dev/null 2>&1
+	ubp unibo-bp-admin contact add --start-time +0 --end-time +86400 \
+		--sender ipn:2.0 --receiver ipn:1.0 --xmit-rate 1000000 \
+		--reference-time "$reftime" >/dev/null 2>&1
+
+	ubp unibo-bp-quiccl --daemon >/dev/null 2>&1
+	sleep 2
+	ubp unibo-bp-admin quiccl induct add --port "$UNIBO_PORT" >/dev/null 2>&1
+	if [ "$add_outduct" = "1" ]; then
+		ubp unibo-bp-admin quiccl outduct add --peer ipn:1.0 \
+			--hostname 127.0.0.1 --port "$ION_PORT" >/dev/null 2>&1
+	fi
+
+	# Data sink at ipn:2.7 (no bundle-size limit, unlike the echo service).
+	ubp unibo-bp-sink ipn:2.7 > "$UNIBODIR/sink.out" 2>&1 &
+	sleep 3
+
+	if ! pgrep -f "unibo-bp-quiccl" >/dev/null; then
+		echo "  ERROR: Unibo-BP QUIC CLA daemon is not running."
+		grep QUICCLA "$UNIBODIR"/unibo-bp.log 2>/dev/null | tail -8
+		return 1
+	fi
+	return 0
+}
+
+unibo_stop() {
+	( cd "$UNIBODIR" 2>/dev/null && unset UNIBO_BP && \
+		unibo-bp-admin quiccl stop ) >/dev/null 2>&1
+	( cd "$UNIBODIR" 2>/dev/null && unset UNIBO_BP && \
+		unibo-bp-admin stop ) >/dev/null 2>&1
+	sleep 1
+	pkill -9 -f "unibo-bp-sink" 2>/dev/null
+	pkill -9 -f "unibo-bp-quiccl" 2>/dev/null
+	pkill -9 -f "unibo-bp start" 2>/dev/null
+}
+
+# Did Unibo-BP receive a bundle over QUICCL since its log was (re)created?
+unibo_received() {
+	grep -q "received successfully" "$UNIBODIR"/unibo-bp.log 2>/dev/null
+}
+
 echo "Killing old ION / Unibo-BP..."
 killm >/dev/null 2>&1
-# The unibo daemons run under comm "main", so match their argv with -f; but
-# use "unibo-bp start" (not bare "unibo-bp") so we don't also kill a shell
-# whose command line contains this test's "interop-unibo-bp" path.
-pkill -9 -f "quiccli" 2>/dev/null
-pkill -9 -f "quicclo" 2>/dev/null
-( cd "$UNIBODIR" 2>/dev/null && unset UNIBO_BP && unibo-bp-admin stop ) \
-	>/dev/null 2>&1
-pkill -9 -f "unibo-bp start" 2>/dev/null
-pkill -9 -f "unibo-bp-quiccl" 2>/dev/null
-pkill -9 -f "unibo-bp-echo" 2>/dev/null
+kill_everything
 ./cleanup 2>/dev/null
 sleep 1
-rm -f ion.log payload_u2i payload_i2u testfile* "$CERT" "$KEY"
+rm -f ion.log payload_* testfile* "$CERT" "$KEY"
 rm -rf "$UNIBODIR"
-mkdir -p "$UNIBODIR"
 
 echo "Generating self-signed certificate..."
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -97,9 +205,6 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
 	echo "SKIP: could not generate a certificate."
 	exit 2
 fi
-# The Unibo-BP quiccl server reads cert.pem/key.pem from its work dir.
-cp "$CERT" "$UNIBODIR/cert.pem"
-cp "$KEY" "$UNIBODIR/key.pem"
 
 sed -e "s|ION_INDUCT|${ION_INDUCT}|g" -e "s|UNIBO_OUTDUCT|${UNIBO_OUTDUCT}|g" \
 	-e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
@@ -107,159 +212,108 @@ sed -e "s|ION_INDUCT|${ION_INDUCT}|g" -e "s|UNIBO_OUTDUCT|${UNIBO_OUTDUCT}|g" \
 sed -e "s|UNIBO_OUTDUCT|${UNIBO_OUTDUCT}|g" \
 	"${CONFIGDIR}/interop.ipnrc" > "${CONFIGDIR}/interop_runtime.ipnrc"
 
-# --- Start the ION node (ipn:1) -----------------------------------------
-echo "Starting ION node (ipn:1)..."
-ionadmin "${CONFIGDIR}/interop.ionrc"
-sleep 1
-bpadmin "${CONFIGDIR}/interop_runtime.bprc"
+# ======================================================================
+# Phase 1: ION is the active peer (ION opens the one connection).
+# ======================================================================
+echo
+echo "=== Phase 1: ION active peer (one ION-opened connection) ==="
+ion_start || { fail "ION did not start (phase 1)."; kill_everything; exit 1; }
+unibo_start 0
+rc=$?
+if [ "$rc" = "2" ]; then
+	echo "SKIP: Unibo-BP unavailable."
+	kill_everything; rm -rf "$UNIBODIR"; exit 2
+fi
+[ "$rc" = "0" ] || fail "Unibo-BP did not start (phase 1)."
 
-echo "Waiting for ION QUIC CLAs..."
-for i in 1 2 3 4 5 6 7 8 9 10; do
-	if pgrep -f "quiccli" >/dev/null && pgrep -f "quicclo" >/dev/null; then
-		echo "ION QUIC CLAs are running."
-		break
-	fi
-	sleep 1
-done
-sleep 2
-if ! pgrep -f "quiccli" >/dev/null || ! pgrep -f "quicclo" >/dev/null; then
-	echo "ERROR: ION QUIC CLAs did not start."
-	tail -30 ion.log 2>/dev/null
-	ionstop; killm
-	rm -rf "$UNIBODIR"
-	exit 1
+# ION -> Unibo: ION's outduct opens the connection and sends to the sink.
+echo "Phase 1a: ION (ipn:1.4) -> Unibo-BP sink (ipn:2.7)..."
+head -c 4000 /dev/urandom | base64 | head -c 4000 > payload_i2u
+bpsendfile ipn:1.4 ipn:2.7 payload_i2u >/dev/null 2>&1
+for w in 1 2 3 4 5 6 7 8; do unibo_received && break; sleep 1; done
+if unibo_received; then
+	echo "  PASS: ION bundle delivered to Unibo-BP over QUIC."
+else
+	fail "ION -> Unibo-BP delivery failed."
+	grep QUICCLA "$UNIBODIR"/unibo-bp.log 2>/dev/null | tail -8 | sed 's/^/    /'
 fi
 
-# --- Start the Unibo-BP node (ipn:2) ------------------------------------
-echo "Starting Unibo-BP node (ipn:2)..."
-ubp unibo-bp start --set-storage-size 50000000 \
-	--dtn-admin dtn://node2.dtn/ --ipn-admin ipn:2.0 --daemon
-sleep 3
-if ! pgrep -f "unibo-bp start" >/dev/null; then
-	echo "SKIP: Unibo-BP node failed to start (cannot exercise interop)."
-	ionstop; killm
-	rm -rf "$UNIBODIR"
-	exit 2
-fi
-
-# Debug logging surfaces Unibo's per-bundle QUICCLA receive/send events,
-# which the checks and diagnostics below rely on.
-ubp unibo-bp-admin logger --set-log-level debug >/dev/null 2>&1
-REFTIME=$(unibo-bp-utility --get-utc-time +0 2>/dev/null)
-
-ubp unibo-bp-admin region home --register-node ipn:1.0 >/dev/null 2>&1
-ubp unibo-bp-admin region home --register-node ipn:2.0 >/dev/null 2>&1
-ubp unibo-bp-admin routing cgr --set-reference-time "$REFTIME" >/dev/null 2>&1
-ubp unibo-bp-admin range add --start-time +0 --end-time +86400 \
-	--sender ipn:1.0 --receiver ipn:2.0 --owlt 0 \
-	--reference-time "$REFTIME" >/dev/null 2>&1
-ubp unibo-bp-admin range add --start-time +0 --end-time +86400 \
-	--sender ipn:2.0 --receiver ipn:1.0 --owlt 0 \
-	--reference-time "$REFTIME" >/dev/null 2>&1
-ubp unibo-bp-admin contact add --start-time +0 --end-time +86400 \
-	--sender ipn:1.0 --receiver ipn:2.0 --xmit-rate 1000000 \
-	--reference-time "$REFTIME" >/dev/null 2>&1
-ubp unibo-bp-admin contact add --start-time +0 --end-time +86400 \
-	--sender ipn:2.0 --receiver ipn:1.0 --xmit-rate 1000000 \
-	--reference-time "$REFTIME" >/dev/null 2>&1
-
-echo "Starting Unibo-BP QUIC CLA daemon and ducts..."
-ubp unibo-bp-quiccl --daemon >/dev/null 2>&1
-sleep 2
-ubp unibo-bp-admin quiccl induct add --port "$UNIBO_PORT" >/dev/null 2>&1
-ubp unibo-bp-admin quiccl outduct add --peer ipn:1.0 \
-	--hostname 127.0.0.1 --port "$ION_PORT" >/dev/null 2>&1
-# Echo service binds ipn:2.7 (mirrors the IP echo port).
-ubp unibo-bp-echo --scheme ipn --daemon >/dev/null 2>&1
-sleep 3
-
-if ! pgrep -f "unibo-bp-quiccl" >/dev/null; then
-	echo "ERROR: Unibo-BP QUIC CLA daemon is not running."
-	grep QUICCLA "$UNIBODIR"/unibo-bp.log 2>/dev/null | tail -8
-	tail -20 ion.log 2>/dev/null
-	ubp unibo-bp-admin stop >/dev/null 2>&1
-	pkill -9 -f "unibo-bp start" 2>/dev/null
-	pkill -9 -f "unibo-bp-quiccl" 2>/dev/null
-	ionstop; killm
-	rm -rf "$UNIBODIR"
-	exit 1
-fi
-
-# --- Phase 1: Unibo-BP -> ION -------------------------------------------
-echo "Phase 1: Unibo-BP (ipn:2) -> ION (ipn:1.2) over QUIC..."
+# Unibo -> ION over the SAME connection (Unibo has no outduct to ION, so it
+# must reply over the connection ION opened).
+echo "Phase 1b: Unibo-BP (ipn:2) -> ION (ipn:1.2) over the same connection..."
 head -c 4000 /dev/urandom | base64 | head -c 4000 > payload_u2i
 rm -f testfile*
 bprecvfile ipn:1.2 & RP=$!
 sleep 1
 ubp unibo-bp-send --source ipn:2.9 --destination ipn:1.2 \
 	--payload-file "$(pwd)/payload_u2i" --lifetime 300 >/dev/null 2>&1
-sleep 6
-if [ -f testfile1 ] && cmp -s payload_u2i testfile1; then
-	echo "  PASS: bundle from Unibo-BP delivered at ION."
-else
-	fail "bundle from Unibo-BP not delivered at ION."
-fi
-kill $RP 2>/dev/null; wait $RP 2>/dev/null
-
-# --- Phase 2: ION -> Unibo-BP (forward delivery over QUIC) ---------------
-# Exercises the ION->Unibo direction (ION quicclo -> Unibo induct), which
-# depends on the TLS handshake working against picotls.  The bundle goes to
-# the Unibo echo service (ipn:2.7).  Payload is kept < 1 KiB because the
-# Unibo echo service silently drops larger bundles.
-#
-# The echo REPLY (Unibo -> ION) is a KNOWN Unibo-side limitation: having
-# received on the connection ION's quicclo opened, Unibo routes the reply to
-# that opportunistic neighbour and does not transmit it, instead of using
-# its own outduct to ION's induct.  ION's quicclo does accept reverse
-# traffic, so the round-trip is checked but is not fatal.
-echo "Phase 2: ION (ipn:1.4) -> Unibo-BP echo (ipn:2.7) over QUIC..."
-head -c 512 /dev/urandom | base64 | head -c 512 > payload_i2u
-rm -f testfile*
-bpsendfile ipn:1.4 ipn:2.7 payload_i2u
-sleep 6
-
-# Forward check: the Unibo debug log records each QUICCLA bundle receipt.
-if grep -q "received successfully" "$UNIBODIR"/unibo-bp.log 2>/dev/null; then
-	echo "  PASS: ION bundle delivered to Unibo-BP over QUIC."
-else
-	fail "ION -> Unibo-BP forward delivery failed."
-	echo "  --- Unibo QUICCLA log ---"
-	grep QUICCLA "$UNIBODIR"/unibo-bp.log 2>/dev/null | tail -8 | sed 's/^/    /'
-fi
-
-# Round-trip check (informational; non-fatal known Unibo limitation).
-sleep 2	# let bpsendfile release ipn:1.4 before bprecvfile opens it
-bprecvfile ipn:1.4 & RP=$!
 for w in 1 2 3 4 5 6 7 8; do
-	sleep 2
-	[ -f testfile1 ] && cmp -s payload_i2u testfile1 && break
+	[ -f testfile1 ] && cmp -s payload_u2i testfile1 && break
+	sleep 1
 done
-if [ -f testfile1 ] && cmp -s payload_i2u testfile1; then
-	echo "  PASS: bundle echoed back through Unibo-BP."
+if [ -f testfile1 ] && cmp -s payload_u2i testfile1; then
+	echo "  PASS: Unibo-BP replied to ION over the ION-opened session."
 else
-	echo "  KNOWN LIMITATION: Unibo did not return the echo reply."
-	echo "    ION bundles pending: $(bplist 2>/dev/null | grep -c 'Bundle$')"
-	echo "    Unibo QUICCLA tail:"
-	grep QUICCLA "$UNIBODIR"/unibo-bp.log 2>/dev/null | tail -5 | sed 's/^/      /'
+	fail "Unibo-BP -> ION reverse delivery failed."
 fi
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+unibo_stop
+ion_stop
+
+# ======================================================================
+# Phase 2: Unibo-BP is the active peer (Unibo opens the one connection).
+# ======================================================================
+echo
+echo "=== Phase 2: Unibo-BP active peer (one Unibo-opened connection) ==="
+ion_start || { fail "ION did not start (phase 2)."; kill_everything; exit 1; }
+unibo_start 1
+rc=$?
+if [ "$rc" = "0" ]; then
+	# Unibo -> ION: Unibo's outduct opens the connection and sends.
+	echo "Phase 2a: Unibo-BP (ipn:2) -> ION (ipn:1.2)..."
+	head -c 4000 /dev/urandom | base64 | head -c 4000 > payload_u2i
+	rm -f testfile*
+	bprecvfile ipn:1.2 & RP=$!
+	sleep 1
+	ubp unibo-bp-send --source ipn:2.9 --destination ipn:1.2 \
+		--payload-file "$(pwd)/payload_u2i" --lifetime 300 \
+		>/dev/null 2>&1
+	for w in 1 2 3 4 5 6 7 8; do
+		[ -f testfile1 ] && cmp -s payload_u2i testfile1 && break
+		sleep 1
+	done
+	if [ -f testfile1 ] && cmp -s payload_u2i testfile1; then
+		echo "  PASS: Unibo-BP bundle delivered to ION over QUIC."
+	else
+		fail "Unibo-BP -> ION delivery failed (phase 2)."
+	fi
+	kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+	# ION -> Unibo over the SAME connection Unibo opened (ION reuses the
+	# accepted session rather than opening its own).
+	echo "Phase 2b: ION (ipn:1.4) -> Unibo-BP sink over the same connection..."
+	head -c 4000 /dev/urandom | base64 | head -c 4000 > payload_i2u
+	bpsendfile ipn:1.4 ipn:2.7 payload_i2u >/dev/null 2>&1
+	for w in 1 2 3 4 5 6 7 8; do unibo_received && break; sleep 1; done
+	if unibo_received; then
+		echo "  PASS: ION replied to Unibo-BP over the Unibo-opened session."
+	else
+		fail "ION -> Unibo-BP reverse delivery failed (phase 2)."
+		grep QUICCLA "$UNIBODIR"/unibo-bp.log 2>/dev/null | tail -8 \
+			| sed 's/^/    /'
+	fi
+else
+	echo "SKIP: Unibo-BP unavailable for phase 2."
+fi
 
 # --- Cleanup ------------------------------------------------------------
+echo
 echo "Cleaning up..."
-ubp unibo-bp-admin quiccl stop >/dev/null 2>&1
-ubp unibo-bp-admin stop >/dev/null 2>&1
-sleep 2
-pkill -9 -f "unibo-bp-echo" 2>/dev/null
-pkill -9 -f "unibo-bp-quiccl" 2>/dev/null
-pkill -9 -f "unibo-bp start" 2>/dev/null
-pkill -9 -f "quiccli" 2>/dev/null
-pkill -9 -f "quicclo" 2>/dev/null
-sleep 1
-ionstop
-sleep 1
-killm
-
-rm -f testfile* payload_u2i payload_i2u bpacq.* "$CERT" "$KEY"
+unibo_stop
+ion_stop
+kill_everything
+rm -f testfile* payload_* bpacq.* "$CERT" "$KEY"
 rm -f "${CONFIGDIR}/interop_runtime.bprc" "${CONFIGDIR}/interop_runtime.ipnrc"
 rm -rf "$UNIBODIR"
 
