@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 killm f >/dev/null 2>&1
 pkill -f "bpshd ipn:1.22" >/dev/null 2>&1
+pkill -f "bpshd -k .* ipn:1.23" >/dev/null 2>&1
 rm -f ion.log bpshd.log bpshd.pid \
+	bpshd-auth.log bpshd-auth.pid bpshd.secret bpshd.secret.wrong \
 	out.case1 err.case1 \
 	out.case2 err.case2 \
 	out.case3 err.case3 \
 	out.case4 err.case4 \
-	out.case5 err.case5
+	out.case5 err.case5 \
+	out.case8a err.case8a \
+	out.case8b err.case8b \
+	out.case8c err.case8c

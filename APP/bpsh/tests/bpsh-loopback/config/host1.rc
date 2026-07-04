@@ -27,6 +27,7 @@ a scheme ipn 'ipnfw' 'ipnadminep'
 # bpshd listen endpoint, plus client endpoints used by the test cases.
 a endpoint ipn:1.0   q
 a endpoint ipn:1.22  q
+a endpoint ipn:1.23  q
 a endpoint ipn:1.500 q
 a endpoint ipn:1.501 q
 a endpoint ipn:1.502 q
@@ -36,6 +37,9 @@ a endpoint ipn:1.505 q
 a endpoint ipn:1.513 q
 a endpoint ipn:1.514 q
 a endpoint ipn:1.515 q
+a endpoint ipn:1.520 q
+a endpoint ipn:1.521 q
+a endpoint ipn:1.522 q
 
 a protocol udp 1400 100
 a induct   udp 127.0.0.1:4556 udpcli

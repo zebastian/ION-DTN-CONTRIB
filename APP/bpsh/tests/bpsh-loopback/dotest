@@ -48,6 +48,22 @@ if ! kill -0 "$BPSHD_PID" 2>/dev/null; then
 	exit 1
 fi
 
+# Second daemon, secret-gated, for the authentication cases (Case 8).
+SECRETFILE=./bpshd.secret
+echo "s3cr3t-pw" > "$SECRETFILE"
+echo "Starting secret-gated bpshd on ipn:1.23..."
+bpshd -k "$SECRETFILE" ipn:1.23 > bpshd-auth.log 2>&1 &
+BPSHD_AUTH_PID=$!
+echo "$BPSHD_AUTH_PID" > bpshd-auth.pid
+sleep 2
+if ! kill -0 "$BPSHD_AUTH_PID" 2>/dev/null; then
+	echo "ERROR: secret-gated bpshd died at startup"
+	cat bpshd-auth.log
+	kill "$BPSHD_PID" 2>/dev/null
+	ionstop
+	exit 1
+fi
+
 # use the below to run your own bpsh client against the local running bpshd
 # sleep 10000
 
@@ -417,12 +433,68 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# Case 8: shared-secret authentication gate (against the ipn:1.23 daemon
+# started with -k).  Asserts:
+#   (a) a client presenting the correct secret runs its command,
+#   (b) a wrong secret is rejected with "authentication failed",
+#   (c) no secret at all is likewise rejected.
+# ----------------------------------------------------------------------
+echo
+echo "Case 8: shared-secret authentication gate"
+CASE8_FAIL=0
+WRONGFILE=./bpshd.secret.wrong
+echo "not-the-secret" > "$WRONGFILE"
+
+# (a) correct secret -> command runs.
+echo AUTH_INPUT | bpsh -h ipn:1.23 -l ipn:1.520 -k "$SECRETFILE" -c "cat" \
+	> out.case8a 2> err.case8a
+RC8a=$?
+if [ "$RC8a" != "0" ] || ! grep -qx "AUTH_INPUT" out.case8a; then
+	echo "  correct secret was not accepted (rc=$RC8a)"
+	echo "  --- out.case8a ---"; cat out.case8a
+	echo "  --- err.case8a ---"; cat err.case8a
+	CASE8_FAIL=1
+fi
+
+# (b) wrong secret -> rejected, command must not run.
+echo x | bpsh -h ipn:1.23 -l ipn:1.521 -k "$WRONGFILE" -c "echo SHOULD_NOT_RUN" \
+	> out.case8b 2> err.case8b
+RC8b=$?
+if [ "$RC8b" = "0" ]; then
+	echo "  wrong secret was accepted (rc=$RC8b)"
+	CASE8_FAIL=1
+fi
+grep -q "authentication failed" err.case8b || { echo "  no auth-failure message on wrong secret"; CASE8_FAIL=1; }
+grep -q "SHOULD_NOT_RUN" out.case8b && { echo "  command ran despite wrong secret"; CASE8_FAIL=1; }
+
+# (c) no secret -> rejected, command must not run.
+echo x | bpsh -h ipn:1.23 -l ipn:1.522 -c "echo SHOULD_NOT_RUN" \
+	> out.case8c 2> err.case8c
+RC8c=$?
+if [ "$RC8c" = "0" ]; then
+	echo "  missing secret was accepted (rc=$RC8c)"
+	CASE8_FAIL=1
+fi
+grep -q "authentication failed" err.case8c || { echo "  no auth-failure message on missing secret"; CASE8_FAIL=1; }
+grep -q "SHOULD_NOT_RUN" out.case8c && { echo "  command ran despite missing secret"; CASE8_FAIL=1; }
+
+rm -f "$WRONGFILE"
+
+if [ $CASE8_FAIL -eq 0 ]; then
+	echo "  Case 8 PASS"
+else
+	echo "  Case 8 FAIL"
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
 # Teardown
 # ----------------------------------------------------------------------
 echo
 echo "Stopping bpshd..."
-kill "$BPSHD_PID" 2>/dev/null
-wait "$BPSHD_PID" 2>/dev/null
+kill "$BPSHD_PID" "$BPSHD_AUTH_PID" 2>/dev/null
+wait "$BPSHD_PID" "$BPSHD_AUTH_PID" 2>/dev/null
+rm -f "$SECRETFILE"
 
 echo "Stopping ION..."
 ionstop
