@@ -4,7 +4,7 @@ bpsh - Bundle Protocol remote shell client
 
 =head1 SYNOPSIS
 
-B<bpsh> B<-h> I<remoteEID> B<-l> I<localEID> [B<-c> I<command>]
+B<bpsh> B<-h> I<remoteEID> B<-l> I<localEID> [B<-c> I<command>] [B<-k> I<secretfile>]
 
 B<bpsh> I<localEID> I<remoteEID>
 
@@ -76,6 +76,13 @@ Run I<command> as a single one-shot request, then exit with the remote
 command's exit code.  Standard input is forwarded if it is not a terminal.
 Without B<-c>, B<bpsh> runs an interactive REPL.
 
+=item B<-k> I<secretfile>
+
+Authenticate to a B<bpshd> that was started with a shared secret, sending the
+secret contained in I<secretfile> (a single line; a trailing newline is
+ignored) in the INIT.  The secret may also be supplied in the environment
+variable B<BPSH_SECRET>; B<-k> takes precedence.  Optional.
+
 =back
 
 =head1 FILES
@@ -90,6 +97,10 @@ No configuration files are needed.
 
 If NO_COLOR is set, or TERM indicates a non-capable terminal, B<bpsh>
 suppresses colored output.
+
+=item BPSH_SECRET
+
+Shared secret to authenticate with, used when B<-k> is not given.
 
 =back
 

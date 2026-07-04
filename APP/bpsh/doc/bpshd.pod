@@ -4,7 +4,7 @@ bpshd - Bundle Protocol remote shell daemon
 
 =head1 SYNOPSIS
 
-B<bpshd> [B<-u> I<user>] I<listenEID>
+B<bpshd> [B<-u> I<user>] [B<-k> I<secretfile>] I<listenEID>
 
 =head1 DESCRIPTION
 
@@ -63,6 +63,16 @@ started as.  I<user> may be a login name or a numeric UID; its primary and
 supplementary groups are set as well.  B<bpshd> must be started with
 sufficient privilege (typically as root) to change identity.  Optional; when
 omitted, shells run as the daemon's own user.
+
+=item B<-k> I<secretfile>
+
+Require every client to present the shared secret contained in I<secretfile>
+(a single line; a trailing newline is ignored) in its INIT, rejecting any
+client that does not.  The secret may also be supplied in the environment
+variable B<BPSHD_SECRET>; B<-k> takes precedence.  Optional; when omitted, no
+authentication is performed.  Note that the secret travels in the clear
+unless the underlying bundles are protected by BPSec, so this gate is access
+control, not confidentiality.
 
 =item I<listenEID>
 

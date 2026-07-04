@@ -256,6 +256,41 @@ char *bpsh_cause_name(BpshExitCause c)
 	}
 }
 
+char *bpsh_load_secret(const char *path)
+{
+	FILE  *f;
+	char  *buf;
+	size_t n;
+
+	if (path == NULL || (f = fopen(path, "r")) == NULL)
+	{
+		return NULL;
+	}
+
+	buf = malloc(BPSH_MAX_SECRET + 1);
+	if (buf == NULL)
+	{
+		fclose(f);
+		return NULL;
+	}
+
+	n = fread(buf, 1, BPSH_MAX_SECRET, f);
+	fclose(f);
+	buf[n] = '\0';
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+	{
+		buf[--n] = '\0';
+	}
+
+	if (n == 0)
+	{
+		free(buf);
+		return NULL;
+	}
+
+	return buf;
+}
+
 static ReqAttendant *sendAttendant = NULL;
 
 void bpsh_set_send_attendant(ReqAttendant *attendant)

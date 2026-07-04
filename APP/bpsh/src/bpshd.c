@@ -35,6 +35,27 @@ static DeferredBundle *deferredHead = NULL;
 static DeferredBundle *deferredTail = NULL;
 static ReqAttendant   attendant;	/* blocking transmission of output */
 static int	      attendantStarted = 0;
+static char	     *authSecret = NULL;	/* NULL = no password gate */
+
+/*	Constant-time compare of an INIT's password against authSecret.	*/
+static int authOk(const unsigned char *pw, size_t pwLen)
+{
+	size_t	      secretLen = strlen(authSecret);
+	size_t	      i;
+	unsigned char diff = 0;
+
+	if (pw == NULL || pwLen != secretLen)
+	{
+		return 0;
+	}
+
+	for (i = 0; i < secretLen; i++)
+	{
+		diff |= pw[i] ^ (unsigned char) authSecret[i];
+	}
+
+	return diff == 0;
+}
 
 static void handleQuit(int signum)
 {
@@ -241,10 +262,26 @@ static int handleFrame(BpshFrame *frame, char *sourceEid)
 	{
 	case BpshMsgInit:
 	{
-		int wantStdin = 0;
-		if (frame->payloadLen >= 1 && frame->payload[0] == 0x01)
+		int		     wantStdin = 0;
+		const unsigned char *pw = NULL;
+		size_t		     pwLen = 0;
+
+		/*	INIT payload: flags byte (bit0 = wantStdin) then the
+		 *	optional password.				*/
+		if (frame->payloadLen >= 1)
 		{
-			wantStdin = 1;
+			wantStdin = (frame->payload[0] & 0x01) ? 1 : 0;
+			pw = frame->payload + 1;
+			pwLen = frame->payloadLen - 1;
+		}
+
+		if (authSecret != NULL && !authOk(pw, pwLen))
+		{
+			writeMemoNote("[!] bpshd INIT auth failure from",
+					sourceEid);
+			return bpsh_send_error(sap, sourceEid,
+					frame->sessionId, 0,
+					"authentication failed");
 		}
 
 		s = findSession(sourceEid);
@@ -430,15 +467,17 @@ static int receiveLoop(void)
 static void usage(void)
 {
 	fprintf(stderr,
-			"Usage: bpshd [-u user] <listen EID>\n"
+			"Usage: bpshd [-u user] [-k secretfile] <listen EID>\n"
 			"\n"
 			"Listens on <listen EID> for bpsh client requests.  Each\n"
 			"client session gets a persistent /bin/sh; commands are\n"
 			"run inside it (so cd, env-vars persist), and stdout /\n"
 			"stderr / exit-code are returned in separate bundles.\n"
 			"\n"
-			"  -u user  Run every session's shell as this user (the\n"
-			"           daemon must start with privilege to do so).\n");
+			"  -u user        Run every session's shell as this user\n"
+			"                 (the daemon must start with privilege).\n"
+			"  -k secretfile  Require clients to present the shared\n"
+			"                 secret in this file (also BPSHD_SECRET).\n");
 }
 
 /*	Resolve runAsUser (a login name or numeric uid) and configure every
@@ -474,6 +513,7 @@ int main(int argc, char **argv)
 {
 	char *listenEid;
 	char *runAsUser = NULL;
+	char *secretFile = NULL;
 	int   i = 1;
 
 	while (i < argc && argv[i][0] == '-')
@@ -481,6 +521,13 @@ int main(int argc, char **argv)
 		if (strcmp(argv[i], "-u") == 0 && i + 1 < argc)
 		{
 			runAsUser = argv[++i];
+			i++;
+			continue;
+		}
+
+		if (strcmp(argv[i], "-k") == 0 && i + 1 < argc)
+		{
+			secretFile = argv[++i];
 			i++;
 			continue;
 		}
@@ -500,6 +547,21 @@ int main(int argc, char **argv)
 	if (runAsUser != NULL && configureRunAs(runAsUser) < 0)
 	{
 		return 1;
+	}
+
+	if (secretFile != NULL)
+	{
+		authSecret = bpsh_load_secret(secretFile);
+		if (authSecret == NULL)
+		{
+			fprintf(stderr, "bpshd: can't read secret file '%s'.\n",
+					secretFile);
+			return 1;
+		}
+	}
+	else if (getenv("BPSHD_SECRET") != NULL)
+	{
+		authSecret = getenv("BPSHD_SECRET");
 	}
 
 	if (bp_attach() < 0)

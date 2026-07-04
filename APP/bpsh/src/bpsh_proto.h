@@ -25,6 +25,9 @@ extern "C" {
 /*	Max bundle source EID length bpsh_recv_frame will copy out.	*/
 #define BPSH_MAX_EID	     256
 
+/*	Max length of a shared secret read from a file.			*/
+#define BPSH_MAX_SECRET	     1024
+
 typedef enum
 {
 	BpshMsgInit = 1,	/* C->S, no payload	*/
@@ -87,6 +90,10 @@ extern int bpsh_decode(unsigned char *buf, size_t buflen, BpshFrame *frame);
 /*	The name lookup helpers for debug memo.				*/
 extern char *bpsh_msgtype_name(BpshMsgType t);
 extern char *bpsh_cause_name(BpshExitCause c);
+
+/*	Read a shared secret from `path` (trailing CR/LF stripped) into a
+ *	malloc'd string; NULL if unreadable/empty.  Caller frees.	*/
+extern char *bpsh_load_secret(const char *path);
 
 /*	bpsh_send_frame: encode frame, wrap it in a ZCO, and bp_send it
  *	to destEid over the open endpoint sap.  Returns 0 on success,

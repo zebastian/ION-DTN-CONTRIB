@@ -29,6 +29,7 @@
 static BpSAP	       sap;
 static char	      *ownEid;
 static char	      *remoteEid;
+static char	      *authSecret;	/* shared secret sent in INIT, or NULL */
 static char	       currentCwd[BPSH_CWD_MAX]; /* shell cwd from CWD frames */
 static uvast	       sessionId;
 static uvast	       sendSeq = 0;
@@ -108,10 +109,42 @@ static int sendTyped(BpshMsgType type, unsigned char *payload, size_t len)
 
 static int sendInit(int wantStdin)
 {
-	unsigned char flagByte = 0x01;
+	unsigned char	stackBuf[256];
+	unsigned char  *buf = stackBuf;
+	size_t		secretLen = authSecret ? strlen(authSecret) : 0;
+	size_t		len;
+	int		rc;
 
-	return sendTyped(BpshMsgInit, wantStdin ? &flagByte : NULL,
-			wantStdin ? 1 : 0);
+	/*	INIT payload: flags byte (bit0 = wantStdin) then the optional
+	 *	password.  Omit it entirely when neither is set.	*/
+	if (secretLen == 0 && !wantStdin)
+	{
+		return sendTyped(BpshMsgInit, NULL, 0);
+	}
+
+	len = 1 + secretLen;
+	if (len > sizeof stackBuf)
+	{
+		buf = MTAKE(len);
+		if (buf == NULL)
+		{
+			return -1;
+		}
+	}
+
+	buf[0] = wantStdin ? 0x01 : 0x00;
+	if (secretLen > 0)
+	{
+		memcpy(buf + 1, authSecret, secretLen);
+	}
+
+	rc = sendTyped(BpshMsgInit, buf, len);
+	if (buf != stackBuf)
+	{
+		MRELEASE(buf);
+	}
+
+	return rc;
 }
 
 static int sendStdinChunk(unsigned char *bytes, size_t len)
@@ -933,6 +966,8 @@ static void usage(void)
 			"  -l <local EID>   local endpoint for replies (mandatory)\n"
 			"  -c <cmd>         run <cmd> as one-shot, exit with its rc.\n"
 			"                   Stdin is forwarded if not a TTY.\n"
+			"  -k <secretfile>  shared secret to authenticate with\n"
+			"                   (also read from env BPSH_SECRET).\n"
 			"\n"
 			"Without -c, runs an interactive REPL.\n");
 }
@@ -947,7 +982,7 @@ int main(int argc, char **argv)
 	pthread_t     forwarder;
 	int	      forwarderStarted = 0;
 
-	while ((opt = getopt(argc, argv, "h:l:c:")) != -1)
+	while ((opt = getopt(argc, argv, "h:l:c:k:")) != -1)
 	{
 		switch (opt)
 		{
@@ -960,10 +995,26 @@ int main(int argc, char **argv)
 		case 'c':
 			cmd = optarg;
 			break;
+		case 'k':
+			authSecret = bpsh_load_secret(optarg);
+			if (authSecret == NULL)
+			{
+				fprintf(stderr,
+					"bpsh: can't read secret file '%s'\n",
+					optarg);
+				return 1;
+			}
+
+			break;
 		default:
 			usage();
 			return 1;
 		}
+	}
+
+	if (authSecret == NULL)
+	{
+		authSecret = getenv("BPSH_SECRET");
 	}
 
 	/*	Backward-compatible positional fallback.		*/
