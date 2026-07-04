@@ -24,6 +24,14 @@
 #include "cbor.h"
 #include "crc.h"
 
+#ifndef USING_BSL
+#define USING_BSL	0
+#endif
+
+#if USING_BSL
+#include "bsl.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -185,9 +193,6 @@ typedef struct
 /*	Administrative record types	*/
 #define	BP_STATUS_REPORT	(1)
 #define	BP_MULTICAST_BRIEFING	(5)
-#define	BP_SAGA_MESSAGE		(6)
-#define	BP_BIBE_PDU		(7)
-#define	BP_BIBE_SIGNAL		(8)	/*	Aggregate, in BIBE.	*/
 
 typedef enum
 {
@@ -429,6 +434,11 @@ typedef struct
 	int		updateStats;	/*	Boolean.		*/
 	char		nss[MAX_NSS_LEN + 1];
 	int		appPid;		/*	Consumes dlv notices.	*/
+	uvast		appCookie;	/*	Owner's per-process
+						instance cookie; used with
+						appPid to distinguish a
+						PID-recycled new process
+						from the original owner.*/
 	sm_SemId	semaphore;	/*	For dlv notices.	*/
 	TallyDelta	statsDeltas[BP_ENDPOINT_STATS];
 } VEndpoint;
@@ -695,6 +705,13 @@ typedef struct
 	unsigned int	bundleCounter;	/*	For value of count.	*/
 	unsigned int	maxBundleCount;	/*	Limits value of count.	*/
 
+#if USING_BSL
+	/*	BPSec library configuration parameters			*/
+
+	Object		bslLocalEid;	/*	SDR string: EID.	*/
+	Object		bslKeyFile;	/*	SDR string: pathname.	*/
+	Object		bslPolicyFile;	/*	SDR string: pathname.	*/
+#endif
 	/*	Network management instrumentation			*/
 
 	time_t		resetTime;	/*	Stats reset time.	*/
@@ -802,7 +819,7 @@ typedef struct
 	TallyDelta	recvDeltas[3];
 	TallyDelta	discardDeltas[3];
 	TallyDelta	xmitDeltas[3];
-	atomic_uint	delDeltas[BP_REASON_STATS];	/*	Count only.	*/
+	ion_ipc_atomic_t	delDeltas[BP_REASON_STATS];	/*	Count only.	*/
 	TallyDelta	dbDeltas[BP_DB_STATS];
 
 	int		bundleCounter;
@@ -1317,6 +1334,21 @@ extern void		readEid(EndpointId *eid, char **str);
 extern int		acquireEid(EndpointId *eid,
 				unsigned char **cursor,
 				unsigned int *bytesRemaining);
+
+/*	String <-> CBOR-structured EID wrappers for extension blocks
+ *	whose CDDL types the EID field as the same RFC 9171 / RFC 9758
+ *	structure used by primary-block EIDs (CTEB, CREB, CBR Bundle
+ *	Sequences).  serializeEidString returns bytes written or -1;
+ *	acquireEidString returns bytes consumed, 0 on malformed input,
+ *	or -1 on internal error.					*/
+
+extern int		serializeEidString(char *eidString,
+				unsigned char *buffer);
+extern int		acquireEidString(char *eidString,
+				size_t eidStrLen,
+				unsigned char **cursor,
+				unsigned int *bytesRemaining);
+
 extern uvast		computeBufferCrc(BpCrcType crcType,
 				unsigned char *buffer,
 				int bytesToProcess,
@@ -1353,6 +1385,7 @@ extern int		addEndpoint(char *endpointName,
 					BpRecvRule recvAction, char *recvScript);
 extern int		updateEndpoint(char *endpointName,
 					BpRecvRule recvAction, char *recvScript);
+/*	Removing an endpoint is also called "unregistering".		*/
 extern int		removeEndpoint(char *endpointName);
 extern void		lookUpEidScheme(EndpointId *eid, VScheme **vscheme);
 extern void		lookUpEndpoint(EndpointId *eid, VScheme *vscheme,
@@ -1425,8 +1458,6 @@ extern int		findBundle(char *sourceEid, BpTimestamp *creationTime,
 				Object *bundleAddr);
 extern int		retrieveSerializedBundle(Object bundleZco, Object *obj);
 
-extern int		deliverBundle(Object bundleObj, Bundle *bundle,
-				VEndpoint *vpoint);
 extern int		forwardBundle(Object bundleObj, Bundle *bundle,
 				char *stationEid);
 
