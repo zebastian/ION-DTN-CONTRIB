@@ -111,11 +111,41 @@ bench/bench-quic             throughput benchmark
   (ION opens the connection), phase 2 with Unibo-BP as the active peer; each
   phase carries a bundle both ways over that one connection. SKIPs unless the
   `unibo-bp*` tools are on `PATH` (or `UNIBO_BP_BIN_DIR`).
+- `tests/dissect-quic` — captures a loopback session, decrypts it with the
+  `SSLKEYLOGFILE` key log, and checks that the `quiccl-wireshark` dissector
+  decodes the QUICCL messages. SKIPs without `tshark`, capture privilege, or
+  the dissector plugin (see below).
+
+## Observing traffic in Wireshark
 
 The [`quiccl-wireshark`](https://gitlab.com/mattiamoffa/quiccl-wireshark)
-dissector plugin decodes QUICCL stream traffic in Wireshark (no rebuild
-needed) and is a convenient way to observe and document a successful interop
-run.
+dissector decodes the QUICCL messages carried on the QUIC streams (and hands
+the reassembled bundles to Wireshark's BPv7 dissector), a convenient way to
+document a successful (interop) run. It is a compiled Wireshark plugin: build
+it against the `wireshark-dev` headers and drop `quiccl.so` into your
+version-specific personal plugin dir, e.g.
+`~/.local/lib/wireshark/plugins/<major.minor>/epan/` (see Wireshark's *Help >
+About > Folders*). It targets recent Wireshark (4.4+); on older releases it
+needs a few source tweaks. It needs Wireshark to decrypt the QUIC layer first.
+
+`quiccla` uses GnuTLS, which writes a TLS key log to the file named by the
+`SSLKEYLOGFILE` environment variable, so the CLA itself needs no change. To
+capture a decryptable session, export the variable before starting ION (so the
+spawned `quiccla` inherits it) and capture UDP on the quic port:
+
+```
+export SSLKEYLOGFILE=/tmp/quic.keys
+# start the node / run a test, then capture, e.g.:
+dumpcap -i lo -f 'udp port 4560' -w /tmp/quic.pcap
+```
+
+Point Wireshark at the key log (*Edit > Preferences > Protocols > TLS >
+(Pre)-Master-Secret log filename*), or use
+`tshark -o tls.keylog_file:/tmp/quic.keys -r /tmp/quic.pcap`; the QUIC frames
+then decrypt and the dissector labels the SESS_INIT / XFER_SEGMENT / XFER_ACK
+messages.
+
+## Verified by inspection
 
 Some behaviours are verified by inspection rather than by the automated
 suite, as they are awkward to drive with the standard BP tools:

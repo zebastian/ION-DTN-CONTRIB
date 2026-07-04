@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+#
+# QUIC CLA Wireshark-dissection test.
+#
+# Captures a loopback QUICCL exchange, decrypts the QUIC layer with the TLS
+# key log that quiccla writes via SSLKEYLOGFILE, and checks that the
+# quiccl-wireshark dissector (https://gitlab.com/mattiamoffa/quiccl-wireshark)
+# decodes the QUICCL messages carried on the streams.  This documents that
+# quiccla traffic is dissectable end to end.
+#
+# SKIPs (exit 2) unless tshark, a usable capture path (the wireshark group, or
+# a sudo rule for dumpcap), and the quiccl dissector plugin are all available.
+#
+
+QUIC_PORT="${QUIC_PORT:-4666}"
+QUICDUCT="127.0.0.1:${QUIC_PORT}"
+CONFIGDIR="./config"
+CERT="$(pwd)/server.pem"
+KEY="$(pwd)/server.key"
+PCAP="$(pwd)/quic.pcapng"
+export SSLKEYLOGFILE="$(pwd)/quic.keys"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Decrypt a captured QUICCL session and confirm the"
+echo "         quiccl-wireshark dissector decodes the messages."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+for t in quiccla tshark openssl bpsendfile bprecvfile; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+# The dissector is a separately built plugin; skip if it is not loaded.
+if ! tshark -G protocols 2>/dev/null | grep -qi 'quiccl'; then
+	echo "SKIP: quiccl dissector plugin not installed"
+	echo "      (build https://gitlab.com/mattiamoffa/quiccl-wireshark and put"
+	echo "       quiccl.so in ~/.local/lib/wireshark/plugins/<ver>/epan/)."
+	exit 2
+fi
+
+# Pick a capture command: plain dumpcap (wireshark group) or, failing that,
+# a non-interactive sudo dumpcap.  '-D' succeeds only with capture rights.
+CAP=""
+if command -v dumpcap >/dev/null 2>&1 && dumpcap -D >/dev/null 2>&1; then
+	CAP="dumpcap"
+elif command -v dumpcap >/dev/null 2>&1 && sudo -n dumpcap -D >/dev/null 2>&1; then
+	CAP="sudo -n dumpcap"
+else
+	echo "SKIP: no capture privilege (add yourself to the 'wireshark' group,"
+	echo "      or allow 'sudo dumpcap')."
+	exit 2
+fi
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -f "quiccla" 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile* sendfile "$PCAP" "$SSLKEYLOGFILE" "$CERT" "$KEY"
+
+echo "Generating self-signed certificate..."
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+sed -e "s|QUICDUCT|${QUICDUCT}|g" -e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
+	"${CONFIGDIR}/dissect.bprc" > "${CONFIGDIR}/dissect_runtime.bprc"
+sed -e "s|QUICDUCT|${QUICDUCT}|g" \
+	"${CONFIGDIR}/dissect.ipnrc" > "${CONFIGDIR}/dissect_runtime.ipnrc"
+
+# Start the capture first so the QUIC handshake is recorded; -a duration is a
+# backstop in case the kill below does not reach dumpcap.
+echo "Starting capture on lo (udp port ${QUIC_PORT})..."
+$CAP -i lo -q -f "udp port ${QUIC_PORT}" -a duration:40 -w - \
+	> "$PCAP" 2>capture.err &
+CAP_PID=$!
+sleep 2
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/dissect.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/dissect_runtime.bprc"
+
+echo "Waiting for the QUIC CLA daemon..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	pgrep -f "quiccla" >/dev/null && break
+	sleep 1
+done
+if ! pgrep -f "quiccla" >/dev/null; then
+	echo "ERROR: QUIC CLA daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	kill $CAP_PID 2>/dev/null
+	ionstop; killm
+	exit 1
+fi
+
+# Drive a transfer: a single reliable bundle to ourselves over QUIC.
+echo "Sending a bundle over QUIC..."
+head -c 200 /dev/urandom | base64 | head -c 200 > sendfile
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 5
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "  bundle delivered over QUIC."
+else
+	fail "bundle not delivered over QUIC (nothing to dissect)."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+# Stop ION, then end the capture and flush the pcap.
+ionstop >/dev/null 2>&1
+sleep 1
+kill -INT $CAP_PID 2>/dev/null
+wait $CAP_PID 2>/dev/null
+killm >/dev/null 2>&1
+
+# --- Dissection check ---------------------------------------------------
+echo "Decrypting and dissecting the capture..."
+if [ ! -s "$SSLKEYLOGFILE" ]; then
+	fail "no TLS key log written (SSLKEYLOGFILE); cannot decrypt."
+fi
+
+TYPES=$(tshark -r "$PCAP" -o tls.keylog_file:"$SSLKEYLOGFILE" \
+	-Y quiccl -T fields -e quiccl.message.type 2>tshark.err | sort -u \
+	| tr '\n' ' ')
+echo "  QUICCL message types dissected: [${TYPES}]"
+
+# Type 2 == XFER_SEGMENT: proof the dissector decoded a carried bundle.
+if echo " ${TYPES} " | grep -q ' 2 '; then
+	echo "  PASS: dissector decoded XFER_SEGMENT on the QUIC stream."
+else
+	fail "dissector produced no XFER_SEGMENT."
+	echo "    keylog lines: $(wc -l < "$SSLKEYLOGFILE" 2>/dev/null)"
+	echo "    pcap bytes:   $(wc -c < "$PCAP" 2>/dev/null)"
+	echo "    tshark stderr:"; sed 's/^/      /' tshark.err 2>/dev/null | tail -5
+fi
+
+echo "Cleaning up..."
+pkill -9 -f "quiccla" 2>/dev/null
+sleep 1
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f testfile* sendfile bpacq.* "$CERT" "$KEY" "$PCAP" "$SSLKEYLOGFILE" \
+	capture.err tshark.err
+rm -f "${CONFIGDIR}/dissect_runtime.bprc" "${CONFIGDIR}/dissect_runtime.ipnrc"
+
+exit $FAIL

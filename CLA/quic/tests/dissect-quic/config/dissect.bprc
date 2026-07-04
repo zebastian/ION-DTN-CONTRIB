@@ -1,0 +1,11 @@
+# bprc for the QUIC CLA Wireshark-dissection test. QUICDUCT/CERT/KEY
+# substituted by dotest.
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+a protocol quic 1400 100
+a induct  quic QUICDUCT 'quiccla -c CERT -k KEY -n'
+a outduct quic QUICDUCT ''
+r 'ipnadmin config/dissect_runtime.ipnrc'
+s

@@ -1,0 +1,2 @@
+# Bundles to node 1 egress via the quic outduct (loopback to self).
+a plan 1 quic/QUICDUCT

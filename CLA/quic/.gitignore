@@ -8,6 +8,9 @@ tests/*/sendfile
 tests/*/bigfile
 tests/*/counter.out
 tests/*/bpacq.*
+tests/*/*.pcapng
+tests/*/*.keys
+tests/*/*.err
 tests/*/bpdriverAduFile
 bench/ion.log
 bench/results.csv

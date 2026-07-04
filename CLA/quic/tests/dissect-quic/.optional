@@ -1,0 +1,2 @@
+Needs tshark, capture privileges (wireshark group or sudo dumpcap), and the
+quiccl-wireshark dissector plugin installed; SKIPs otherwise.

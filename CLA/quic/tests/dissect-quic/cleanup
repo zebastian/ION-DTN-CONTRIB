@@ -1,0 +1,8 @@
+#!/bin/bash
+pkill -9 -f "quiccla" 2>/dev/null
+pkill -9 -f "dumpcap" 2>/dev/null
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f ion.log testfile* sendfile quic.pcapng quic.keys server.pem server.key
+rm -f config/dissect_runtime.bprc config/dissect_runtime.ipnrc
+exit 0
