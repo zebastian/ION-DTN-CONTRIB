@@ -29,12 +29,13 @@ get)
     delta=$(echo "$line" | sed -n 's/.*utcdelta \(-\{0,1\}[0-9]\{1,\}\).*/\1/p')
     error=$(echo "$line" | sed -n 's/.*clockerr \([0-9]\{1,\}\).*/\1/p')
     ct=$(echo "$line" | sed -n 's/.*ctime \([0-9]\{1,\}\).*/\1/p')
+    st=$(echo "$line" | sed -n 's/.*systime \([0-9]\{1,\}\).*/\1/p')
     if [ -z "$ct" ]; then
         echo "clock.sh: can't read ION clock (is the node running?)" >&2
         exit 1
     fi
     printf 'sys=%s\nutcdelta=%ss\nutcerror=%ss\nutc=%s\n' \
-        "$(fmt "$(date -u +%s)")" "$delta" "$error" "$(fmt "$ct")"
+        "$(fmt "$st")" "$delta" "$error" "$(fmt "$ct")"
     ;;
 set)
     case "$2" in -[0-9]* | [0-9]*) ;; *)
