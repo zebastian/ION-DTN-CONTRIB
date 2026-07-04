@@ -32,4 +32,5 @@ endif
 EXTRA_DIST = \
 	README.md \
 	$(POD1) \
+	examples/dirsync.sh \
 	tests
