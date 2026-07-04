@@ -37,6 +37,16 @@ typedef struct BpshSession BpshSession;
 typedef void (*BpshDeferFn)(void *ctx, unsigned char *bytes, size_t len,
 		const char *srcEid);
 
+/*	bpshSessionSetRunAs: make every subsequently opened session's shell
+ *	drop to this uid/gid (and its supplementary groups) before exec.
+ *	name is the login name (used for initgroups); home, if non-NULL,
+ *	becomes $HOME in the shell.  Call once, before any session is
+ *	opened; the daemon typically runs as root and resolves the user
+ *	named by its -u option.  Not calling it leaves shells running as
+ *	the daemon's own user.						*/
+extern void bpshSessionSetRunAs(uid_t uid, gid_t gid, const char *name,
+		const char *home);
+
 /*	bpshSessionOpen: fork a /bin/sh and wire up its pipes.  sap is the
  *	endpoint replies are sent on.  wantStdin keeps the fd-3 stdin pipe
  *	open for forwarding.  Returns NULL on failure.			*/

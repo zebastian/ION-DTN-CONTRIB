@@ -14,6 +14,7 @@
  */
 
 #include <bp.h>
+#include <pwd.h>
 #include "bpsh_proto.h"
 #include "bpshd_session.h"
 
@@ -405,25 +406,77 @@ static int receiveLoop(void)
 static void usage(void)
 {
 	fprintf(stderr,
-			"Usage: bpshd <listen EID>\n"
+			"Usage: bpshd [-u user] <listen EID>\n"
 			"\n"
 			"Listens on <listen EID> for bpsh client requests.  Each\n"
 			"client session gets a persistent /bin/sh; commands are\n"
 			"run inside it (so cd, env-vars persist), and stdout /\n"
-			"stderr / exit-code are returned in separate bundles.\n");
+			"stderr / exit-code are returned in separate bundles.\n"
+			"\n"
+			"  -u user  Run every session's shell as this user (the\n"
+			"           daemon must start with privilege to do so).\n");
+}
+
+/*	Resolve runAsUser (a login name or numeric uid) and configure every
+ *	session's shell to drop to it.  Returns 0 on success, -1 if the user
+ *	is unknown.							*/
+static int configureRunAs(const char *runAsUser)
+{
+	struct passwd *pw;
+
+	pw = getpwnam(runAsUser);
+	if (pw == NULL)
+	{
+		char	*end;
+		long	 uid = strtol(runAsUser, &end, 10);
+
+		if (*runAsUser != '\0' && *end == '\0')
+		{
+			pw = getpwuid((uid_t) uid);
+		}
+	}
+
+	if (pw == NULL)
+	{
+		fprintf(stderr, "bpshd: unknown user '%s'.\n", runAsUser);
+		return -1;
+	}
+
+	bpshSessionSetRunAs(pw->pw_uid, pw->pw_gid, pw->pw_name, pw->pw_dir);
+	return 0;
 }
 
 int main(int argc, char **argv)
 {
 	char *listenEid;
+	char *runAsUser = NULL;
+	int   i = 1;
 
-	if (argc < 2 || argv[1][0] == '-')
+	while (i < argc && argv[i][0] == '-')
+	{
+		if (strcmp(argv[i], "-u") == 0 && i + 1 < argc)
+		{
+			runAsUser = argv[++i];
+			i++;
+			continue;
+		}
+
+		usage();
+		return 1;
+	}
+
+	if (i >= argc)
 	{
 		usage();
 		return 1;
 	}
 
-	listenEid = argv[1];
+	listenEid = argv[i];
+
+	if (runAsUser != NULL && configureRunAs(runAsUser) < 0)
+	{
+		return 1;
+	}
 
 	if (bp_attach() < 0)
 	{

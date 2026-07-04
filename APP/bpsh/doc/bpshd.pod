@@ -4,7 +4,7 @@ bpshd - Bundle Protocol remote shell daemon
 
 =head1 SYNOPSIS
 
-B<bpshd> I<listenEID>
+B<bpshd> [B<-u> I<user>] I<listenEID>
 
 =head1 DESCRIPTION
 
@@ -50,6 +50,14 @@ B<ion.log> log file.
 =head1 OPTIONS
 
 =over 4
+
+=item B<-u> I<user>
+
+Run every session's shell as I<user> instead of the user B<bpshd> was
+started as.  I<user> may be a login name or a numeric UID; its primary and
+supplementary groups are set as well.  B<bpshd> must be started with
+sufficient privilege (typically as root) to change identity.  Optional; when
+omitted, shells run as the daemon's own user.
 
 =item I<listenEID>
 

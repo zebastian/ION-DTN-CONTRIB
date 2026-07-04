@@ -20,11 +20,16 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <grp.h>
 #include "bpsh_proto.h"
 #include "bpshd_session.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
+
+#ifndef LOGIN_NAME_MAX
+#define LOGIN_NAME_MAX 256
 #endif
 
 #define BPSHD_OUTPUT_LIMIT  (16 * 1024 * 1024)
@@ -54,6 +59,59 @@ struct BpshSession
 	uvast replySeq;	    /* per-session monotonic outbound seq		*/
 	int   shellAlive;
 };
+
+/*	Optional unprivileged identity each shell drops to before exec
+ *	(configured via bpshSessionSetRunAs / bpshd's -u option).	*/
+static int   runAsSet = 0;
+static uid_t runAsUid;
+static gid_t runAsGid;
+static char  runAsName[LOGIN_NAME_MAX + 1];
+static char  runAsHome[PATH_MAX];
+
+void bpshSessionSetRunAs(uid_t uid, gid_t gid, const char *name,
+		const char *home)
+{
+	runAsUid = uid;
+	runAsGid = gid;
+	istrcpy(runAsName, name, sizeof runAsName);
+	if (home != NULL)
+	{
+		istrcpy(runAsHome, home, sizeof runAsHome);
+	}
+	else
+	{
+		runAsHome[0] = '\0';
+	}
+
+	runAsSet = 1;
+}
+
+/*	Child-side privilege drop: set supplementary groups, gid, then uid
+ *	(gid before uid, since dropping uid first would forfeit the
+ *	privilege needed to change gid).  Returns 0, or -1 if any step
+ *	fails -- in which case the caller must not exec.		*/
+static int dropPrivileges(void)
+{
+	if (!runAsSet)
+	{
+		return 0;
+	}
+
+	if (initgroups(runAsName, runAsGid) < 0 || setgid(runAsGid) < 0
+			|| setuid(runAsUid) < 0)
+	{
+		return -1;
+	}
+
+	if (runAsHome[0] != '\0')
+	{
+		setenv("HOME", runAsHome, 1);
+	}
+
+	setenv("USER", runAsName, 1);
+	setenv("LOGNAME", runAsName, 1);
+	return 0;
+}
 
 static void closeFd(int *fd)
 {
@@ -133,6 +191,13 @@ BpshSession *bpshSessionOpen(BpSAP sap, const char *sourceEid, uvast sessionId,
 		 *	running together (used to abort a stalled command
 		 *	when the client reconnects).			*/
 		setpgid(0, 0);
+		/*	Drop to the configured unprivileged user, if any,
+		 *	before handing control to the shell.		*/
+		if (dropPrivileges() < 0)
+		{
+			_exit(127);
+		}
+
 		execl("/bin/sh", "sh", (char *) NULL);
 		_exit(127);
 	}
