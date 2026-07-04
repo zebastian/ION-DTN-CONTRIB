@@ -9,8 +9,6 @@
  * /bin/sh child, command execution and output streaming -- live in
  * the bpshd_session object (bpshd_session.c / .h).
  *
- * Still missing: bpsec gate, ionadmin configuration, idle-session
- * reaper.
  */
 
 #include <bp.h>
@@ -344,6 +342,31 @@ static int handleFrame(BpshFrame *frame, char *sourceEid)
 	}
 }
 
+/*	Lazily reap sessions whose client has gone silent past the idle
+ *	timeout (default 24h).  Called opportunistically each time the
+ *	receive loop wakes, so a session is torn down the next time any
+ *	bundle arrives after it expires.				*/
+static void pruneIdleSessions(void)
+{
+	int i = 0;
+
+	while (i < sessionCount)
+	{
+		if (bpshSessionExpired(sessions[i]))
+		{
+			writeMemoNote("[i] bpshd reaping idle session",
+					(char *) bpshSessionEid(sessions[i]));
+			/*	removeSession swaps the last entry into slot i,
+			 *	so re-check i rather than advancing.		*/
+			removeSession(sessions[i]);
+		}
+		else
+		{
+			i++;
+		}
+	}
+}
+
 /*	Replay one bundle deferred while a command ran.  Returns 1 if a
  *	deferred bundle was handled (call again), 0 if the queue is empty.*/
 static int drainDeferred(void)
@@ -398,6 +421,7 @@ static int receiveLoop(void)
 
 		handleFrame(&frame, srcEid);
 		MRELEASE(bytes);
+		pruneIdleSessions();
 	}
 
 	return 0;

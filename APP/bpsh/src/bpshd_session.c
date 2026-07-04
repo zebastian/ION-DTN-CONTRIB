@@ -41,6 +41,10 @@
  *	shell) is killed; overridable via env BPSHD_CMD_TIMEOUT (seconds,
  *	0 disables).							*/
 #define BPSHD_CMD_TIMEOUT_MS (300 * 1000)
+/*	Default idle limit: a session with no command activity for this long
+ *	is reaped.  Overridable via env BPSHD_IDLE_TIMEOUT (seconds, 0
+ *	disables).							*/
+#define BPSHD_IDLE_TIMEOUT_S (24 * 60 * 60)
 
 struct BpshSession
 {
@@ -58,6 +62,7 @@ struct BpshSession
 
 	uvast replySeq;	    /* per-session monotonic outbound seq		*/
 	int   shellAlive;
+	time_t lastActivity; /* wall-clock time of last command; for reaper	*/
 };
 
 /*	Optional unprivileged identity each shell drops to before exec
@@ -272,6 +277,7 @@ BpshSession *bpshSessionOpen(BpSAP sap, const char *sourceEid, uvast sessionId,
 	s->userStdinReq = wantStdin ? 1 : 0;
 	s->replySeq = 0;
 	s->shellAlive = 1;
+	s->lastActivity = time(NULL);
 	return s;
 
 fail:
@@ -562,6 +568,40 @@ static long cmdTimeoutMs(void)
 	return ms;
 }
 
+/*	Idle-session limit in seconds (0 = disabled).  Read once from
+ *	BPSHD_IDLE_TIMEOUT, else the compiled-in default.		*/
+static long idleTimeoutSecs(void)
+{
+	static int  inited = 0;
+	static long secs = BPSHD_IDLE_TIMEOUT_S;
+
+	if (!inited)
+	{
+		const char *e = getenv("BPSHD_IDLE_TIMEOUT");
+
+		if (e != NULL)
+		{
+			secs = atol(e);		/* 0 or negative disables	*/
+		}
+
+		inited = 1;
+	}
+
+	return secs;
+}
+
+int bpshSessionExpired(const BpshSession *s)
+{
+	long limit = idleTimeoutSecs();
+
+	if (limit <= 0)
+	{
+		return 0;
+	}
+
+	return (long) (time(NULL) - s->lastActivity) >= limit;
+}
+
 /*	Kill the session's process group (command + shell) and mark it
  *	dead -- used for the timeout and output-cap.			*/
 static void killSession(BpshSession *s, BpshExitCause *cause, BpshExitCause why)
@@ -590,6 +630,8 @@ int bpshSessionRun(BpshSession *s, const char *cmdline, const int *running,
 	long	       cmdStartMs;
 	const char    *cmdOpen;
 	const char    *cmdClose;
+
+	s->lastActivity = time(NULL);
 
 	postCap = strlen(cmdline) + 256;
 	postscript = MTAKE(postCap);

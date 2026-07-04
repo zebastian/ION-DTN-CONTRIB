@@ -70,6 +70,11 @@ extern void bpshSessionSendCwd(BpshSession *s);
 extern int bpshSessionRun(BpshSession *s, const char *cmdline,
 		const int *running, BpshDeferFn defer, void *ctx);
 
+/*	bpshSessionExpired: has the session gone without a command longer
+ *	than the idle timeout (default 24h; env BPSHD_IDLE_TIMEOUT, 0
+ *	disables)?  The daemon calls this to lazily reap dead clients.	*/
+extern int bpshSessionExpired(const BpshSession *s);
+
 /*	Accessors the daemon needs for routing and validation.		*/
 extern const char *bpshSessionEid(const BpshSession *s);
 extern uvast	   bpshSessionId(const BpshSession *s);
