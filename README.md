@@ -15,6 +15,17 @@ This repository collects contributions extending ION-DTN:
 - The software in this repository is licensed under MIT.
 - Each sub-project is written and maintained by the author of that project.
 
+## Feedback and Contributions Welcome
+
+Usage reports and contributions are both very welcome:
+
+- **Tell us how you use it:** open an issue describing your setup and what
+  worked or did not. Usage feedback shapes what gets improved.
+- **Report bugs**, however small.
+- **Contribute your own work:** new CLAs, LSAs, applications, examples, tests,
+  and docs are welcome via pull request. Each sub-project is a directory under
+  `<KIND>/<name>` with its own `README.md`.
+
 ## Building
 
 Contributions are built against an **installed** ION-DTN.
