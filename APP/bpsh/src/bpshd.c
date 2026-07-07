@@ -13,6 +13,7 @@
 
 #include <bp.h>
 #include <pwd.h>
+#include <fnmatch.h>
 #include "bpsh_proto.h"
 #include "bpshd_session.h"
 
@@ -36,6 +37,83 @@ static DeferredBundle *deferredTail = NULL;
 static ReqAttendant   attendant;	/* blocking transmission of output */
 static int	      attendantStarted = 0;
 static char	     *authSecret = NULL;	/* NULL = no password gate */
+
+/*	Optional source-EID allowlist: when active, only clients whose bundle
+ *	source EID matches one of these glob patterns are served.	*/
+static char	    **allowedEids;
+static int	      numAllowedEids;
+static int	      allowlistActive;
+
+/*	Parses a comma-separated list of source-EID glob patterns (from the
+ *	-a option) into the allowlist.  The backing copy is held for the
+ *	process lifetime.  Returns 0, or -1 on allocation failure.	*/
+static int parseAllowedEids(const char *arg)
+{
+	size_t len = strlen(arg);
+	char  *copy;
+	char  *tok;
+	int    maxPats = 1;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+	{
+		if (arg[i] == ',')
+		{
+			maxPats++;
+		}
+	}
+
+	copy = MTAKE(len + 1);
+	allowedEids = MTAKE(maxPats * sizeof(char *));
+	if (copy == NULL || allowedEids == NULL)
+	{
+		return -1;
+	}
+
+	memcpy(copy, arg, len + 1);
+	for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
+	{
+		while (*tok == ' ' || *tok == '\t')
+		{
+			tok++;
+		}
+
+		if (*tok != '\0')
+		{
+			allowedEids[numAllowedEids++] = tok;
+		}
+	}
+
+	allowlistActive = 1;
+	return 0;
+}
+
+/*	Returns 1 if the allowlist is inactive or 'sourceEid' matches one of
+ *	its glob patterns, 0 otherwise.					*/
+static int sourceAllowed(const char *sourceEid)
+{
+	int i;
+
+	if (!allowlistActive)
+	{
+		return 1;
+	}
+
+	if (sourceEid == NULL)
+	{
+		return 0;
+	}
+
+	for (i = 0; i < numAllowedEids; i++)
+	{
+		if (fnmatch(allowedEids[i], sourceEid, 0) == 0)
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
 
 /*	Constant-time compare of an INIT's password against authSecret.	*/
 static int authOk(const unsigned char *pw, size_t pwLen)
@@ -258,6 +336,13 @@ static int handleFrame(BpshFrame *frame, char *sourceEid)
 	BpshSession *s;
 	char	    *cmd;
 
+	if (!sourceAllowed(sourceEid))
+	{
+		writeMemoNote("[!] bpshd denied source", sourceEid);
+		return bpsh_send_error(sap, sourceEid, frame->sessionId, 0,
+				"source not permitted");
+	}
+
 	switch (frame->msgType)
 	{
 	case BpshMsgInit:
@@ -467,7 +552,8 @@ static int receiveLoop(void)
 static void usage(void)
 {
 	fprintf(stderr,
-			"Usage: bpshd [-u user] [-k secretfile] <listen EID>\n"
+			"Usage: bpshd [-u user] [-k secretfile] [-a eidlist] "
+			"<listen EID>\n"
 			"\n"
 			"Listens on <listen EID> for bpsh client requests.  Each\n"
 			"client session gets a persistent /bin/sh; commands are\n"
@@ -477,7 +563,10 @@ static void usage(void)
 			"  -u user        Run every session's shell as this user\n"
 			"                 (the daemon must start with privilege).\n"
 			"  -k secretfile  Require clients to present the shared\n"
-			"                 secret in this file (also BPSHD_SECRET).\n");
+			"                 secret in this file (also BPSHD_SECRET).\n"
+			"  -a eidlist     Comma-separated source-EID glob patterns;\n"
+			"                 only matching clients are served\n"
+			"                 (e.g. 'ipn:1.*,ipn:2.3').\n");
 }
 
 /*	Resolve runAsUser (a login name or numeric uid) and configure every
@@ -514,6 +603,7 @@ int main(int argc, char **argv)
 	char *listenEid;
 	char *runAsUser = NULL;
 	char *secretFile = NULL;
+	char *allowArg = NULL;
 	int   i = 1;
 
 	while (i < argc && argv[i][0] == '-')
@@ -532,6 +622,13 @@ int main(int argc, char **argv)
 			continue;
 		}
 
+		if (strcmp(argv[i], "-a") == 0 && i + 1 < argc)
+		{
+			allowArg = argv[++i];
+			i++;
+			continue;
+		}
+
 		usage();
 		return 1;
 	}
@@ -546,6 +643,12 @@ int main(int argc, char **argv)
 
 	if (runAsUser != NULL && configureRunAs(runAsUser) < 0)
 	{
+		return 1;
+	}
+
+	if (allowArg != NULL && parseAllowedEids(allowArg) < 0)
+	{
+		fprintf(stderr, "bpshd: can't parse allowed-EID list.\n");
 		return 1;
 	}
 

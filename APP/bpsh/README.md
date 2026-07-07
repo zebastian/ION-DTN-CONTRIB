@@ -33,6 +33,24 @@ doc/*.pod                  man page sources (bpsh, bpshd)
 tests/bpsh-loopback/       single-node loopback regression (.optional)
 ```
 
+## Security
+
+`bpshd` executes shell commands for remote clients, so deploy it with care:
+
+- `-k secretfile` — require a shared secret in each client's INIT. It is
+  checked only at INIT and travels in band, so it is access control, not
+  authentication.
+- `-a eidlist` — serve only source EIDs matching the comma-separated globs
+  (e.g. `ipn:1.*,ipn:2.3`). A source EID is spoofable unless the bundles are
+  authenticated by BPSec, so `-a` is only meaningful over BPSec-protected
+  links — run `bpshd` under BPSec for both authenticity and confidentiality.
+- `-u user` — the preferred containment: drop each shell to a dedicated
+  unprivileged identity, then bound its reach with the target machine's own
+  permission mechanics (file ownership and modes, sudoers, and the like)
+  rather than relying on `bpshd` itself.
+
+See the `bpshd` man page for details.
+
 ## License
 
 See the repository root for details.
