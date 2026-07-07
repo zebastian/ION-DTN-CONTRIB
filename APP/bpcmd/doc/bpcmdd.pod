@@ -95,6 +95,22 @@ the bundle source.
 
 Reply bundle lifetime, in seconds.  Defaults to 86400.
 
+=item B<-a> I<eidlist>
+
+Act only on bundles whose source EID matches one of the comma-separated glob
+patterns in I<eidlist> (for example C<ipn:1.*,ipn:2.3>); bundles from any other
+source are ignored.  The patterns use shell wildcards (B<*>, B<?>).  Optional;
+when omitted, bundles from any source EID are accepted.  Because a source EID
+can be spoofed, this filter is only meaningful when combined with BPSec (see
+B<SECURITY>).
+
+=item B<-u> I<user>
+
+Run every command as I<user> (a login name or numeric UID) instead of the user
+B<bpcmdd> was started as; its primary and supplementary groups are set as well.
+B<bpcmdd> must start with sufficient privilege (typically as root) to change
+identity.  Optional; when omitted, commands run as the daemon's own user.
+
 =item I<ownEndpointID>
 
 The local endpoint ID on which B<bpcmdd> listens.  Mandatory.
@@ -145,6 +161,24 @@ System error.  Check for earlier diagnostic messages describing the cause of
 the error; correct problem and rerun.
 
 =back
+
+=head1 SECURITY
+
+B<bpcmdd> runs commands on behalf of any node that can deliver a bundle to
+I<ownEndpointID>.  Two controls stand between a sender and code execution: the
+whitelist, which fixes exactly what may run, and the source of the bundle,
+which fixes who may ask.  The whitelist is the primary defence and should be as
+narrow as possible; execution is direct (no shell), so shell metacharacters in
+a payload are inert.  Use B<-a> to additionally restrict which source EIDs are
+served.  A bundle source EID is trivially spoofable unless the bundles are
+authenticated by BPSec, so B<-a> is a meaningful control only when B<bpcmdd> is
+run over links protected by BPSec; do so for any deployment where the command
+set is not safe for arbitrary callers.
+
+Use B<-u> to run commands under a dedicated unprivileged identity, then bound
+that identity's reach with the target machine's own permission mechanics (file
+ownership and modes, sudoers, and the like) rather than relying on B<bpcmdd>
+alone.
 
 =head1 BUGS
 

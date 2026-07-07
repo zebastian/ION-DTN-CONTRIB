@@ -34,6 +34,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <grp.h>
+#include <limits.h>
+#include <pwd.h>
 #include <regex.h>
 #include <signal.h>
 #include <stdio.h>
@@ -42,6 +45,13 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef LOGIN_NAME_MAX
+#define LOGIN_NAME_MAX 256
+#endif
 
 typedef enum
 {
@@ -63,8 +73,22 @@ static int   running = 1;
 static Rule *rules;
 static int   numRules;
 
+/*	Optional source-EID allowlist: when active, only bundles whose source
+ *	EID matches one of these glob patterns are acted on.		*/
+static char **allowedEids;
+static int    numAllowedEids;
+static int    allowlistActive;
+
+/*	Optional unprivileged identity each command is exec'd under
+ *	(configured via -u).						*/
+static int   runAsSet;
+static uid_t runAsUid;
+static gid_t runAsGid;
+static char  runAsName[LOGIN_NAME_MAX + 1];
+static char  runAsHome[PATH_MAX];
+
 static const char usage[] =
-		"Usage: bpcmdd [-n] [-t ttl] <own endpoint ID> "
+		"Usage: bpcmdd [-n] [-t ttl] [-a eidlist] <own endpoint ID> "
 		"<whitelist file>\n\n"
 		"Each delivered bundle's payload is a command line: bpcmdd "
 		"splits it on\nwhitespace and, if the whitelist permits it, "
@@ -72,8 +96,12 @@ static const char usage[] =
 		"bundle source as a reply bundle.\n\n"
 		"  -n        do not send the command's stdout back to the "
 		"source\n"
-		"  -t ttl    reply bundle lifetime in seconds (default 86400)"
-		"\n\n"
+		"  -t ttl    reply bundle lifetime in seconds (default 86400)\n"
+		"  -a list   comma-separated source-EID glob patterns; only "
+		"matching\n            sources are served (e.g. "
+		"'ipn:1.*,ipn:2.3')\n"
+		"  -u user   run every command as this unprivileged user "
+		"(the daemon\n            must start with privilege)\n\n"
 		"Whitelist file: one rule per line; '#' comments and blank "
 		"lines are\nignored.  Each rule is\n"
 		"  exact <command line>   literal whole-line match\n"
@@ -297,6 +325,150 @@ static int commandAllowed(const char *cmdline)
 	return 0;
 }
 
+/*	Parses a comma-separated list of source-EID glob patterns (from the
+ *	-a option) into the allowlist.  Empty items are skipped.  Returns 0,
+ *	or -1 on allocation failure.					*/
+
+static int parseAllowedEids(const char *arg)
+{
+	char *copy;
+	char *tok;
+
+	copy = strdup(arg);
+	if (copy == NULL)
+	{
+		return -1;
+	}
+
+	for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
+	{
+		char **bigger;
+		char  *pat;
+
+		while (*tok == ' ' || *tok == '\t')
+		{
+			tok++;
+		}
+
+		if (*tok == '\0')
+		{
+			continue;
+		}
+
+		bigger = realloc(allowedEids,
+				(numAllowedEids + 1) * sizeof(char *));
+		if (bigger == NULL)
+		{
+			free(copy);
+			return -1;
+		}
+
+		allowedEids = bigger;
+		pat = strdup(tok);
+		if (pat == NULL)
+		{
+			free(copy);
+			return -1;
+		}
+
+		allowedEids[numAllowedEids++] = pat;
+	}
+
+	free(copy);
+	allowlistActive = 1;
+	return 0;
+}
+
+/*	Returns 1 if the allowlist is inactive or 'srcEid' matches one of its
+ *	glob patterns, 0 otherwise.					*/
+
+static int sourceAllowed(const char *srcEid)
+{
+	int i;
+
+	if (!allowlistActive)
+	{
+		return 1;
+	}
+
+	if (srcEid == NULL)
+	{
+		return 0;
+	}
+
+	for (i = 0; i < numAllowedEids; i++)
+	{
+		if (fnmatch(allowedEids[i], srcEid, 0) == 0)
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/*	Resolves the -u argument (a login name or numeric uid) into the
+ *	identity every command will be exec'd under.  Returns 0, or -1 if the
+ *	user is unknown.						*/
+
+static int configureRunAs(const char *runAsUser)
+{
+	struct passwd *pw;
+
+	pw = getpwnam(runAsUser);
+	if (pw == NULL)
+	{
+		char *end;
+		long  uid = strtol(runAsUser, &end, 10);
+
+		if (*runAsUser != '\0' && *end == '\0')
+		{
+			pw = getpwuid((uid_t) uid);
+		}
+	}
+
+	if (pw == NULL)
+	{
+		fprintf(stderr, "bpcmdd: unknown user '%s'.\n", runAsUser);
+		return -1;
+	}
+
+	runAsUid = pw->pw_uid;
+	runAsGid = pw->pw_gid;
+	istrcpy(runAsName, pw->pw_name, sizeof runAsName);
+	istrcpy(runAsHome, pw->pw_dir ? pw->pw_dir : "", sizeof runAsHome);
+	runAsSet = 1;
+	return 0;
+}
+
+/*	Child-side privilege drop: supplementary groups, gid, then uid (gid
+ *	before uid, since dropping uid first would forfeit the privilege
+ *	needed to change gid).  Returns 0, or -1 on any failure -- in which
+ *	case the caller must not exec.					*/
+
+static int dropPrivileges(void)
+{
+	if (!runAsSet)
+	{
+		return 0;
+	}
+
+	if (initgroups(runAsName, runAsGid) < 0 || setgid(runAsGid) < 0
+			|| setuid(runAsUid) < 0)
+	{
+		return -1;
+	}
+
+	if (runAsHome[0] != '\0')
+	{
+		setenv("HOME", runAsHome, 1);
+	}
+
+	setenv("USER", runAsName, 1);
+	setenv("LOGNAME", runAsName, 1);
+	return 0;
+}
+
 /*	Reads the entire payload of a delivered bundle into a freshly
  *	malloc'd buffer.  Returns the buffer (caller frees) and sets
  *	*length, or NULL on failure.  A zero-length payload yields a
@@ -466,6 +638,11 @@ static int runCommand(char **cmdArgv, char *srcEid, char *ownEid,
 		}
 
 		setenv("BP_DEST_EID", ownEid, 1);
+		if (dropPrivileges() < 0)
+		{
+			_exit(127);
+		}
+
 		execvp(cmdArgv[0], cmdArgv);
 		_exit(127); /*	exec failed.	*/
 	}
@@ -598,10 +775,12 @@ int main(int argc, char **argv)
 	int	   replyTtl = 86400;
 	char	  *ownEid;
 	char	  *whitelistPath;
+	char	  *allowArg = NULL;
+	char	  *runAsUser = NULL;
 	BpDelivery dlv;
 	int	   c;
 
-	while ((c = getopt(argc, argv, "nt:")) != -1)
+	while ((c = getopt(argc, argv, "nt:a:u:")) != -1)
 	{
 		switch (c)
 		{
@@ -617,6 +796,14 @@ int main(int argc, char **argv)
 				return 1;
 			}
 
+			break;
+
+		case 'a':
+			allowArg = optarg;
+			break;
+
+		case 'u':
+			runAsUser = optarg;
 			break;
 
 		default:
@@ -646,6 +833,19 @@ int main(int argc, char **argv)
 	if (loadWhitelist(whitelistPath) < 0)
 	{
 		putErrmsg("bpcmdd can't load whitelist.", whitelistPath);
+		bp_detach();
+		return 1;
+	}
+
+	if (allowArg != NULL && parseAllowedEids(allowArg) < 0)
+	{
+		putErrmsg("bpcmdd can't parse allowed-EID list.", allowArg);
+		bp_detach();
+		return 1;
+	}
+
+	if (runAsUser != NULL && configureRunAs(runAsUser) < 0)
+	{
 		bp_detach();
 		return 1;
 	}
@@ -692,6 +892,15 @@ int main(int argc, char **argv)
 
 		if (dlv.result != BpPayloadPresent)
 		{
+			bp_release_delivery(&dlv, 1);
+			continue;
+		}
+
+		if (!sourceAllowed(dlv.bundleSourceEid))
+		{
+			writeMemoNote("[?] bpcmdd denied source",
+					dlv.bundleSourceEid ? dlv.bundleSourceEid
+							    : "(anonymous)");
 			bp_release_delivery(&dlv, 1);
 			continue;
 		}

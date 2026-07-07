@@ -27,11 +27,15 @@ sudo make install
 ## Usage
 
 ```
-bpcmdd [-n] [-t ttl] <own endpoint ID> <whitelist file>
+bpcmdd [-n] [-t ttl] [-a eidlist] [-u user] <own endpoint ID> <whitelist file>
 ```
 
 - `-n` — do not send the command's stdout back to the source.
 - `-t ttl` — reply bundle lifetime in seconds (default 86400).
+- `-a eidlist` — comma-separated source-EID glob patterns (e.g.
+  `ipn:1.*,ipn:2.3`); only matching sources are served. Omitted: any source.
+- `-u user` — run every command as this unprivileged user (the daemon must
+  start with privilege). Omitted: commands run as the daemon's own user.
 
 For every bundle, `bpcmdd` splits the payload into an argument vector,
 matches it against the whitelist, and — if allowed — spawns a fresh
@@ -116,9 +120,13 @@ Each script's header lists suggested whitelist rules.
 
 ## Notes
 
-- The whitelist is the only access control at the protocol level; the
-  endpoint itself is not authenticated. Restrict the endpoint and use
-  OS-level controls as needed, and keep rules as tight as possible
-  (`glob *` or `regex .*` authorise everything).
+- The whitelist fixes *what* may run; it is the primary defence, so keep
+  rules as tight as possible (`glob *` or `regex .*` authorise everything).
+  Use `-a` to also restrict *who* may ask, but a source EID is spoofable
+  unless the bundles are authenticated by BPSec, so `-a` is only meaningful
+  over BPSec-protected links. Use `-u` to run commands under a dedicated
+  unprivileged identity and bound its reach with OS-level controls (file
+  ownership and modes, sudoers, and the like) rather than relying on the
+  daemon alone.
 - Long-running commands block subsequent bundles (serial processing).
   Wrap with your own dispatcher if you need concurrency.
