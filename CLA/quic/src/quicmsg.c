@@ -123,7 +123,7 @@ static const uint8_t *rBytes(Reader *r, size_t len)
 {
 	const uint8_t *p;
 
-	if (!r->ok || r->off + len > r->len)
+	if (!r->ok || len > r->len - r->off)
 	{
 		r->ok = 0;
 		return NULL;

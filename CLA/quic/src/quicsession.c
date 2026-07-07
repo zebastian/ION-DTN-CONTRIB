@@ -115,10 +115,12 @@ typedef struct QuicConn
 	uint64_t       dgRxId;	  /* current inbound transfer (receiver).	*/
 	int	       dgRxActive;
 	int	       dgRxTotal;
-	int	       dgRxCount;
+	int	       dgRxCount;  /* distinct segments received so far.	*/
 	uint64_t       dgRxBundleLen;
 	unsigned char *dgRxBuf;
 	int	       dgRxCap;
+	unsigned char *dgRxSeen;  /* per-segmentId received bitmap.	*/
+	int	       dgRxSeenCap; /* bytes allocated for dgRxSeen.	*/
 } QuicConn;
 
 /*	QUICCL session states.						*/
@@ -277,8 +279,12 @@ static int sendSessInit(QuicConn *qc)
 	 *	timeout (cfg.idleSec) so the session stays live when idle.	*/
 
 	init.keepalive = (uint16_t) (s->cfg.idleSec > 1 ? s->cfg.idleSec / 2 : 1);
-	init.segmentMru = s->cfg.segmentMru > 0 ? (uint64_t) s->cfg.segmentMru :
-						  QUICCLA_BUFSZ;
+	/*	Never advertise an MRU larger than the receive path enforces
+	 *	(QUICCLA_BUFSZ), so a peer is not told it may send more than we
+	 *	will accept.						*/
+	init.segmentMru = s->cfg.segmentMru > 0
+					&& (uint64_t) s->cfg.segmentMru < QUICCLA_BUFSZ
+			? (uint64_t) s->cfg.segmentMru : QUICCLA_BUFSZ;
 	init.datagramMru = 0;
 	init.transferMru = QUICCLA_BUFSZ;
 	isprintf(nodeId, sizeof(nodeId), "ipn:" UVAST_FIELDSPEC ".0",
@@ -570,6 +576,15 @@ static int xferReassemble(QuicConn *qc, const QuicXferSegment *seg,
 		return -1; /* Segment without a START.		*/
 	}
 
+	/*	Reject a transfer whose segments sum beyond the bundle length
+	 *	its START declared, rather than growing without bound.		*/
+	if (seg->segmentLength > qc->xferBundleLen
+			|| (uint64_t) qc->xferLen
+					> qc->xferBundleLen - seg->segmentLength)
+	{
+		return -1;
+	}
+
 	if (qc->xferLen + (int) seg->segmentLength > qc->xferCap)
 	{
 		int newCap = qc->xferCap ? qc->xferCap : QUICCLA_BUFSZ;
@@ -786,20 +801,27 @@ static int recvStreamDataCb(ngtcp2_conn *conn, uint32_t flags,
 }
 
 /*	Place one received unreliable XFER_SEGMENT into the datagram
- *	reassembly buffer and deliver the bundle once all segments are in.
- *	Each segment is self-locating: a full (non-END) segment sits at
- *	segmentId * its length; the END segment sits at the bundle tail.
- *	Loss simply leaves a transfer incomplete (dropped) until the next
+ *	reassembly buffer and deliver the bundle once every distinct segment
+ *	has arrived.  Each segment is self-locating: a full (non-END) segment
+ *	sits at segmentId * its length; the END segment sits at the bundle
+ *	tail.  A per-segmentId bitmap tracks distinct coverage so duplicates
+ *	cannot fake completion, and the buffer is zeroed per transfer so an
+ *	incomplete or inconsistent transfer never delivers stale heap.  Loss
+ *	simply leaves a transfer incomplete (dropped) until the next
  *	transfer's segments arrive.  Returns 0, or -1 on a fatal error.	*/
 
 static int dgReassemble(QuicConn *qc, const QuicXferSegment *seg,
 		const uint8_t *segData)
 {
-	QuicSession *s = qc->owner;
-	int	     offset;
+	QuicSession  *s = qc->owner;
+	int	      segId = seg->segmentId;
+	int	      byteIdx = segId >> 3;	   /* bitmap byte for segId.	*/
+	unsigned char bitMask = (unsigned char) (1 << (segId & 7)); /* its bit.*/
+	int	      offset;
 
 	if (seg->bundleLength > QUICCLA_BUFSZ
-			|| seg->segmentLength > QUICCLA_BUFSZ)
+			|| seg->segmentLength > QUICCLA_BUFSZ
+			|| seg->totalSegments == 0)
 	{
 		return 0; /* Drop implausible segment.		*/
 	}
@@ -807,6 +829,10 @@ static int dgReassemble(QuicConn *qc, const QuicXferSegment *seg,
 	if ((seg->flags & QMSG_FLAG_START) || !qc->dgRxActive
 			|| seg->transferId != qc->dgRxId)
 	{
+		/*	First segment seen for this transfer: (re)size and reset
+		 *	the reassembly buffer and the coverage bitmap.		*/
+		int seenBytes = (seg->totalSegments + 7) / 8;
+
 		qc->dgRxId = seg->transferId;
 		qc->dgRxActive = 1;
 		qc->dgRxTotal = seg->totalSegments;
@@ -837,6 +863,40 @@ static int dgReassemble(QuicConn *qc, const QuicXferSegment *seg,
 			qc->dgRxBuf = nb;
 			qc->dgRxCap = newCap;
 		}
+
+		if (seenBytes > qc->dgRxSeenCap)
+		{
+			unsigned char *nb = MTAKE(seenBytes);
+
+			if (nb == NULL)
+			{
+				qc->dgRxActive = 0;
+				return 0;
+			}
+
+			if (qc->dgRxSeen)
+			{
+				MRELEASE(qc->dgRxSeen);
+			}
+
+			qc->dgRxSeen = nb;
+			qc->dgRxSeenCap = seenBytes;
+		}
+
+		memset(qc->dgRxSeen, 0, seenBytes); /* No segments seen yet.	*/
+
+		/*	Zero the payload area so any gap left by a lost or
+		 *	inconsistent segment is delivered as zeros, never as
+		 *	stale heap contents.				*/
+		if (qc->dgRxBuf && seg->bundleLength > 0)
+		{
+			memset(qc->dgRxBuf, 0, (size_t) seg->bundleLength);
+		}
+	}
+
+	if (segId >= qc->dgRxTotal)
+	{
+		return 0; /* Segment outside this transfer.	*/
 	}
 
 	offset = (seg->flags & QMSG_FLAG_END) ?
@@ -848,9 +908,16 @@ static int dgReassemble(QuicConn *qc, const QuicXferSegment *seg,
 	}
 
 	memcpy(qc->dgRxBuf + offset, segData, seg->segmentLength);
-	qc->dgRxCount++;
 
-	if (qc->dgRxCount >= qc->dgRxTotal)
+	/*	Count only the first arrival of each segmentId; a duplicate
+	 *	must not advance the completion count.			*/
+	if ((qc->dgRxSeen[byteIdx] & bitMask) == 0)
+	{
+		qc->dgRxSeen[byteIdx] |= bitMask;
+		qc->dgRxCount++;
+	}
+
+	if (qc->dgRxCount == qc->dgRxTotal) /* Every segment now present.	*/
 	{
 		qc->dgRxActive = 0;
 		if (s->cb
@@ -1334,6 +1401,11 @@ static void freeConn(QuicConn *qc)
 	if (qc->dgRxBuf)
 	{
 		MRELEASE(qc->dgRxBuf);
+	}
+
+	if (qc->dgRxSeen)
+	{
+		MRELEASE(qc->dgRxSeen);
 	}
 
 	while (qc->dgHead)
