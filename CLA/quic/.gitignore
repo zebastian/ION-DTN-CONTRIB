@@ -11,6 +11,9 @@ tests/*/bpacq.*
 tests/*/*.pcapng
 tests/*/*.keys
 tests/*/*.err
+# but keep the committed sample capture the dissect test falls back to
+!tests/dissect-quic/sample.pcapng
+!tests/dissect-quic/sample.keys
 tests/*/bpdriverAduFile
 bench/ion.log
 bench/results.csv

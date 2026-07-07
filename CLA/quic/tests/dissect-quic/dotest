@@ -32,12 +32,12 @@ echo "########################################"
 FAIL=0
 fail() { echo "FAILURE: $1"; FAIL=1; }
 
-for t in quiccla tshark openssl bpsendfile bprecvfile; do
-	if ! command -v "$t" >/dev/null 2>&1; then
-		echo "SKIP: '$t' not found."
-		exit 2
-	fi
-done
+# tshark is needed in both modes; the live-capture tools are checked below,
+# only when we are actually generating a capture.
+if ! command -v tshark >/dev/null 2>&1; then
+	echo "SKIP: 'tshark' not found."
+	exit 2
+fi
 
 # The dissector is a separately built plugin; skip if it is not loaded.
 if ! tshark -G protocols 2>/dev/null | grep -qi 'quiccl'; then
@@ -47,18 +47,40 @@ if ! tshark -G protocols 2>/dev/null | grep -qi 'quiccl'; then
 	exit 2
 fi
 
-# Pick a capture command: plain dumpcap (wireshark group) or, failing that,
-# a non-interactive sudo dumpcap.  '-D' succeeds only with capture rights.
+# Capture live if we have the privilege (plain dumpcap for the wireshark group,
+# or a non-interactive sudo dumpcap; '-D' succeeds only with capture rights).
+# Otherwise fall back to the committed sample capture so the dissector is still
+# exercised instead of skipping.
+SAMPLE_PCAP="$(pwd)/sample.pcapng"
+SAMPLE_KEYS="$(pwd)/sample.keys"
 CAP=""
 if command -v dumpcap >/dev/null 2>&1 && dumpcap -D >/dev/null 2>&1; then
 	CAP="dumpcap"
 elif command -v dumpcap >/dev/null 2>&1 && sudo -n dumpcap -D >/dev/null 2>&1; then
 	CAP="sudo -n dumpcap"
+fi
+
+if [ -n "$CAP" ]; then
+	MODE=live
+elif [ -s "$SAMPLE_PCAP" ] && [ -s "$SAMPLE_KEYS" ]; then
+	MODE=sample
+	PCAP="$SAMPLE_PCAP"
+	export SSLKEYLOGFILE="$SAMPLE_KEYS"
+	echo "No capture privilege; dissecting the committed sample capture."
 else
 	echo "SKIP: no capture privilege (add yourself to the 'wireshark' group,"
-	echo "      or allow 'sudo dumpcap')."
+	echo "      or allow 'sudo dumpcap') and no committed sample capture."
 	exit 2
 fi
+
+if [ "$MODE" = live ]; then
+
+for t in quiccla openssl bpsendfile bprecvfile; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found (needed to generate a live capture)."
+		exit 2
+	fi
+done
 
 echo "Killing old ION..."
 killm >/dev/null 2>&1
@@ -129,6 +151,8 @@ kill -INT $CAP_PID 2>/dev/null
 wait $CAP_PID 2>/dev/null
 killm >/dev/null 2>&1
 
+fi	# MODE = live
+
 # --- Dissection check ---------------------------------------------------
 echo "Decrypting and dissecting the capture..."
 if [ ! -s "$SSLKEYLOGFILE" ]; then
@@ -155,7 +179,8 @@ pkill -9 -f "quiccla" 2>/dev/null
 sleep 1
 ionstop >/dev/null 2>&1
 killm >/dev/null 2>&1
-rm -f testfile* sendfile bpacq.* "$CERT" "$KEY" "$PCAP" "$SSLKEYLOGFILE" \
+# Remove only the live-capture artifacts by name; never the committed sample.
+rm -f testfile* sendfile bpacq.* "$CERT" "$KEY" quic.pcapng quic.keys \
 	capture.err tshark.err
 rm -f "${CONFIGDIR}/dissect_runtime.bprc" "${CONFIGDIR}/dissect_runtime.ipnrc"
 
