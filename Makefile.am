@@ -3,6 +3,9 @@ ACLOCAL_AMFLAGS = -I m4
 # One subdirectory per contribution; each is included only when enabled at
 # configure time (see --disable-cla-mqtt / --disable-app-bpsh).
 SUBDIRS =
+if ENABLE_CLA_MAIL
+SUBDIRS += CLA/mail
+endif
 if ENABLE_CLA_MQTT
 SUBDIRS += CLA/mqtt
 endif
