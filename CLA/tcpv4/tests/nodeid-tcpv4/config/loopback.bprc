@@ -1,10 +1,11 @@
-# bprc for the TCPCLv4 CLA loopback test. TCPDUCT/CERT/KEY substituted by dotest.
+# bprc for the NODE-ID authentication test.  TCPDUCT and CLICMD are
+# substituted per phase by dotest.
 1
 a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
 a protocol tcpv4 1400 100
-a induct  tcpv4 TCPDUCT 'tcpv4cla -c CERT -k KEY -C CERT -K 5'
+a induct  tcpv4 TCPDUCT 'CLICMD'
 a outduct tcpv4 TCPDUCT ''
 r 'ipnadmin config/loopback_runtime.ipnrc'
 s

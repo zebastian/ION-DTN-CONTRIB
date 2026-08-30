@@ -43,12 +43,14 @@ Tcpv4TlsCreds *tcpv4TlsCredsNew(const Tcpv4ClaConfig *cfg, int isServer)
 
 	if (cfg->caFile[0] != '\0')
 	{
-		if (gnutls_certificate_set_x509_trust_file(creds->cred,
-				    cfg->caFile, GNUTLS_X509_FMT_PEM)
-				< 0)
+		int rc = gnutls_certificate_set_x509_trust_file(creds->cred,
+				cfg->caFile, GNUTLS_X509_FMT_PEM);
+
+		if (rc < 1) /* Negative on error, 0 if it held no CA.	*/
 		{
 			putErrmsg("tcpv4cla: can't load CA file.",
-					(char *) cfg->caFile);
+					rc < 0 ? (char *) gnutls_strerror(rc)
+					       : (char *) cfg->caFile);
 			gnutls_certificate_free_credentials(creds->cred);
 			MRELEASE(creds);
 			return NULL;
@@ -288,6 +290,230 @@ int tcpv4TlsRecv(Tcpv4TlsConn *conn, void *into, int len)
 int tcpv4TlsPeerAuthenticated(Tcpv4TlsConn *conn)
 {
 	return conn == NULL ? 0 : conn->peerAuthenticated;
+}
+
+/*	*	*	NODE-ID authentication	*	*	*	*/
+
+/*	id-on-bundleEID, the PKIX Other Name Form RFC 9174 8.10 registers
+ *	for a bundle endpoint ID.					*/
+#define TCPV4_OID_BUNDLE_EID "1.3.6.1.5.5.7.8.11"
+
+/*	Read one DER tag-length-value of the expected tag at *off.  On
+ *	success *off is left at the first content octet and *vlen holds the
+ *	content length.  Returns 0 on success, -1 otherwise.		*/
+
+static int derTlv(const unsigned char *der, size_t len, size_t *off,
+		unsigned char tag, size_t *vlen)
+{
+	size_t	      i = *off;
+	size_t	      n;
+	unsigned char b;
+
+	if (i >= len || len - i < 2 || der[i] != tag)
+	{
+		return -1;
+	}
+
+	i++;
+	b = der[i++];
+	if (b < 0x80)
+	{
+		n = b;
+	}
+	else
+	{
+		unsigned int octets = b & 0x7F;
+
+		if (octets == 0 || octets > sizeof(size_t) || len - i < octets)
+		{
+			return -1;
+		}
+
+		n = 0;
+		while (octets-- > 0)
+		{
+			n = (n << 8) | der[i++];
+		}
+	}
+
+	if (n > len - i)
+	{
+		return -1;
+	}
+
+	*off = i;
+	*vlen = n;
+	return 0;
+}
+
+/*	Extract the URI from a BundleEID otherName value.  RFC 9174
+ *	4.4.2.1 encodes it as an IA5String; Appendix C shows it inside the
+ *	[0] EXPLICIT wrapper of AnotherName's value field.  GnuTLS hands
+ *	back the raw DER of that value for an OID it does not know, which
+ *	across versions is either the wrapper or the IA5String alone, so
+ *	accept both.  Returns 0 on success, -1 if the value is not an
+ *	IA5String this code can read.					*/
+
+static int bundleEidUri(const unsigned char *der, size_t len, char *into,
+		size_t cap)
+{
+	size_t off = 0;
+	size_t vlen;
+	size_t end = len;
+
+	if (derTlv(der, len, &off, 0xA0, &vlen) == 0)
+	{
+		end = off + vlen; /* Descend into the [0] wrapper.	*/
+	}
+	else
+	{
+		off = 0;
+	}
+
+	if (derTlv(der, end, &off, 0x16, &vlen) < 0) /* IA5String.	*/
+	{
+		return -1;
+	}
+
+	if (vlen == 0 || vlen >= cap)
+	{
+		return -1;
+	}
+
+	memcpy(into, der + off, vlen);
+	into[vlen] = '\0';
+
+	/*	A node ID is text; an embedded NUL would make the URI we
+	 *	compare shorter than the one the certificate carries.	*/
+
+	if (strlen(into) != vlen)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+/*	RFC 9174 4.4.1: an entry whose value is some URI other than a node
+ *	ID is ignored rather than counted as a failed NODE-ID.  A node ID
+ *	is an endpoint ID that names a node and nothing on it: for ipn that
+ *	is service number 0, for dtn an empty demux (RFC 9171 4.2.5).  A
+ *	scheme this code has no rule for is left in play, so that an exact
+ *	match still authenticates it.					*/
+
+static int isNodeId(const char *uri)
+{
+	size_t len = strlen(uri);
+
+	if (strncmp(uri, "ipn:", 4) == 0)
+	{
+		return len > 6 && strcmp(uri + len - 2, ".0") == 0;
+	}
+
+	if (strncmp(uri, "dtn:", 4) == 0)
+	{
+		return strcmp(uri, "dtn:none") == 0
+				|| (len > 6 && uri[len - 1] == '/');
+	}
+
+	return 1;
+}
+
+int tcpv4TlsMatchNodeId(Tcpv4TlsConn *conn, const char *nodeId)
+{
+	const gnutls_datum_t *certs;
+	gnutls_x509_crt_t     crt;
+	unsigned int	      count = 0;
+	unsigned int	      seq;
+	int		      found = 0;
+	int		      matched = 0;
+
+	if (conn == NULL || nodeId == NULL || *nodeId == '\0')
+	{
+		return TCPV4_NODEID_ERROR;
+	}
+
+	certs = gnutls_certificate_get_peers(conn->session, &count);
+	if (certs == NULL || count == 0)
+	{
+		return TCPV4_NODEID_ERROR;
+	}
+
+	if (gnutls_x509_crt_init(&crt) < 0)
+	{
+		return TCPV4_NODEID_ERROR;
+	}
+
+	/*	certs[0] is the peer's end-entity certificate; only that one
+	 *	identifies the entity (RFC 9174 4.4.4.3).		*/
+
+	if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) < 0)
+	{
+		gnutls_x509_crt_deinit(crt);
+		return TCPV4_NODEID_ERROR;
+	}
+
+	for (seq = 0; !matched; seq++)
+	{
+		unsigned char value[512];
+		char	      oid[128];
+		char	      uri[TCPV4_MAX_NODEID_LEN];
+		size_t	      valueLen = sizeof value;
+		size_t	      oidLen = sizeof oid;
+		unsigned int  type = 0;
+		int	      rc;
+
+		rc = gnutls_x509_crt_get_subject_alt_name2(crt, seq, value,
+				&valueLen, &type, NULL);
+		if (rc == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE)
+		{
+			break; /* End of the subjectAltName list.	*/
+		}
+
+		if (rc < 0 || type != GNUTLS_SAN_OTHERNAME)
+		{
+			/*	Too large to be a node ID, or some other
+			 *	name form; either way, not a NODE-ID.	*/
+
+			continue;
+		}
+
+		if (gnutls_x509_crt_get_subject_alt_othername_oid(crt, seq, oid,
+				    &oidLen)
+				< 0)
+		{
+			continue;
+		}
+
+		if (strcmp(oid, TCPV4_OID_BUNDLE_EID) != 0)
+		{
+			continue;
+		}
+
+		if (bundleEidUri(value, valueLen, uri, sizeof uri) < 0)
+		{
+			continue; /* Malformed; not a NODE-ID we can use.*/
+		}
+
+		if (!isNodeId(uri))
+		{
+			continue;
+		}
+
+		found = 1;
+		if (strcmp(uri, nodeId) == 0)
+		{
+			matched = 1;
+		}
+	}
+
+	gnutls_x509_crt_deinit(crt);
+	if (matched)
+	{
+		return TCPV4_NODEID_SUCCESS;
+	}
+
+	return found ? TCPV4_NODEID_FAILURE : TCPV4_NODEID_ABSENT;
 }
 
 void tcpv4TlsClose(Tcpv4TlsConn *conn, int graceful)

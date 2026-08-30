@@ -36,7 +36,7 @@ done
 
 echo "Killing old ION..."
 killm >/dev/null 2>&1
-pkill -9 -f "tcpv4cla" 2>/dev/null
+pkill -9 -x tcpv4cla 2>/dev/null
 ./cleanup 2>/dev/null
 sleep 1
 rm -f ion.log testfile* sendfile counter.out
@@ -53,7 +53,7 @@ bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
 
 echo "Waiting for the TCPCLv4 CLA daemon to start..."
 for i in 1 2 3 4 5 6 7 8 9 10; do
-	if pgrep -f "tcpv4cla" >/dev/null; then
+	if pgrep -x tcpv4cla >/dev/null; then
 		echo "TCPCLv4 CLA daemon is running."
 		break
 	fi
@@ -61,7 +61,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 sleep 2
 
-if ! pgrep -f "tcpv4cla" >/dev/null; then
+if ! pgrep -x tcpv4cla >/dev/null; then
 	echo "ERROR: TCPCLv4 CLA daemon did not start."
 	tail -30 ion.log 2>/dev/null
 	ionstop; killm
@@ -128,7 +128,7 @@ fi
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 
 echo "Cleaning up..."
-pkill -9 -f "tcpv4cla" 2>/dev/null
+pkill -9 -x tcpv4cla 2>/dev/null
 sleep 1
 ionstop
 sleep 1

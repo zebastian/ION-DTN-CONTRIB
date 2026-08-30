@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# NODE-ID authentication test for the TCPCLv4 CLA (RFC 9174 4.4.4.3).
+#
+# A certificate authenticates a peer's node ID only when it carries an
+# id-on-bundleEID otherName naming that node (RFC 9174 4.4.1).  Without
+# one, the peer's SESS_INIT is just a claim, and RFC 9174 7.9 ("Threat:
+# BP Node Impersonation") is why a claim must not be enough to collect
+# that node's traffic.
+#
+# Two phases, each with a certificate that carries no NODE-ID:
+#
+#   -E require  the session must be refused with "Contact Failure", and
+#               no bundle may get through.
+#   -E prefer   the session comes up, but the accepted (passive) side is
+#               marked inbound only, so a peer that merely claims a node
+#               ID cannot be selected to carry bundles to it.  Egress
+#               still works over the session this node opened, whose node
+#               number came from the egress plan rather than the wire.
+#
+# Requires openssl (1.1.1+ for -addext) plus the standard bp test tools.
+#
+
+TCP_PORT="${TCPV4_PORT:-4758}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+CONFIGDIR="./config"
+
+# Short path: ION caps an induct command at 255 characters and 11
+# arguments (see the loopback test).
+CERTDIR="${TMPDIR:-/tmp}/tcpv4cla-nodeid"
+CERT="$CERTDIR/n.pem"
+KEY="$CERTDIR/n.key"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing RFC 9174 4.4.4.3 NODE-ID authentication policy and"
+echo "         that an unauthenticated node ID cannot attract egress."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+for t in tcpv4cla openssl bpsendfile bprecvfile; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -x tcpv4cla 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile* sendfile
+rm -rf "$CERTDIR"
+mkdir -p "$CERTDIR" || { echo "SKIP: cannot create $CERTDIR."; exit 2; }
+
+# A valid, self-signed, self-trusted certificate that identifies the host
+# but says nothing about any node ID.
+echo "Generating a certificate with no NODE-ID..."
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+if openssl x509 -in "$CERT" -outform DER 2>/dev/null | xxd -p | tr -d '\n' \
+		| grep -q '06082b0601050507080b'; then
+	echo "SKIP: certificate unexpectedly carries a NODE-ID."
+	exit 2
+fi
+
+head -c 512 /dev/urandom | base64 | head -c 512 > sendfile
+
+# Bring the node up with the given tcpv4cla command line.
+start_node()
+{
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" -e "s|CLICMD|$1|g" \
+		-e "s|config/loopback.ipnrc|config/loopback_runtime.ipnrc|g" \
+		"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+		"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+	killm >/dev/null 2>&1
+	sleep 1
+	ionadmin "${CONFIGDIR}/loopback.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/loopback_runtime.bprc" >/dev/null 2>&1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -x tcpv4cla >/dev/null && break
+		sleep 1
+	done
+	sleep 3
+}
+
+stop_node()
+{
+	pkill -9 -x tcpv4cla 2>/dev/null
+	sleep 1
+	ionstop >/dev/null 2>&1
+	sleep 1
+	killm >/dev/null 2>&1
+}
+
+# --- Phase 1: -E require refuses a peer with no NODE-ID ----------------
+echo "Phase 1: -E require refuses a certificate with no NODE-ID..."
+: > ion.log
+start_node "tcpv4cla -c $CERT -k $KEY -C $CERT -E require"
+
+if ! pgrep -x tcpv4cla >/dev/null; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile >/dev/null 2>&1
+sleep 6
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+if grep -q "carries no NODE-ID and policy requires one" ion.log; then
+	echo "  PASS: session refused for want of a NODE-ID."
+else
+	fail "session was not refused under -E require."
+fi
+if grep -q "session established" ion.log; then
+	fail "a session was established despite -E require."
+else
+	echo "  PASS: no session established."
+fi
+if [ -f testfile1 ]; then
+	fail "a bundle was delivered over a refused session."
+else
+	echo "  PASS: no bundle delivered."
+fi
+stop_node
+
+# --- Phase 2: -E prefer keeps the session but not for egress -----------
+echo "Phase 2: -E prefer allows the session, inbound only when accepted..."
+: > ion.log
+start_node "tcpv4cla -c $CERT -k $KEY -C $CERT -E prefer"
+
+if ! pgrep -x tcpv4cla >/dev/null; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile >/dev/null 2>&1
+sleep 6
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+if grep "session established" ion.log | grep -q "node ID not authenticated"
+then
+	echo "  PASS: node ID reported as unauthenticated."
+else
+	fail "node ID was not reported as unauthenticated."
+fi
+
+# The accepted side must not be selectable for egress; the side this node
+# opened may be, because its node number came from the egress plan.
+if grep "session established" ion.log | grep -q "inbound only"; then
+	echo "  PASS: accepted session marked inbound only."
+else
+	fail "no session was marked inbound only ($(grep -o \
+		'session established.*' ion.log | tail -1))."
+fi
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "  PASS: egress still works over the session this node opened."
+else
+	fail "bundle not delivered under -E prefer."
+fi
+stop_node
+
+echo "Cleaning up..."
+rm -f testfile* sendfile bpacq.*
+rm -rf "$CERTDIR"
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL

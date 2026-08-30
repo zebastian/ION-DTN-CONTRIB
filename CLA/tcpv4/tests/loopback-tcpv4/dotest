@@ -3,10 +3,16 @@
 # Loopback test for the TCPCLv4 CLA (tcpv4cla), RFC 9174 over TLS.
 #
 # A single ION node sends to itself over TCPCLv4 and exercises: the
-# contact header / TLS / SESS_INIT establishment sequence, a single
-# segment transfer, a multi-segment transfer (Segment MRU forced small
-# with -S), multiple streamed bundles, KEEPALIVE on an idle session, and
-# a graceful SESS_TERM exchange on shutdown.
+# contact header / TLS / SESS_INIT establishment sequence with full
+# certificate validation and RFC 9174 4.4.4.3 NODE-ID authentication, a
+# single segment transfer, a multi-segment transfer (a bundle larger than
+# the default 64 KiB Segment MRU), multiple streamed bundles, KEEPALIVE on
+# an idle session, and a graceful SESS_TERM exchange on shutdown.
+#
+# The certificate is self-signed and is also handed to the daemon as its
+# own trust anchor (-C), so the chain really is validated rather than
+# waved through with -n; it carries an id-on-bundleEID otherName naming
+# ipn:1.0, which is what lets the node ID be authenticated.
 #
 # Requires openssl plus the standard bp test tools.
 #
@@ -14,8 +20,14 @@
 TCP_PORT="${TCPV4_PORT:-4756}"
 TCPDUCT="127.0.0.1:${TCP_PORT}"
 CONFIGDIR="./config"
-CERT="$(pwd)/server.pem"
-KEY="$(pwd)/server.key"
+
+# ION stores an induct's command as an SDR string, capped at MAX_SDRSTRING
+# (255) characters, and truncates silently past that.  Three absolute
+# certificate paths under a deep source tree overrun it and the daemon then
+# fails to open a half-a-path, so keep the credentials somewhere short.
+CERTDIR="${TMPDIR:-/tmp}/tcpv4cla-test"
+CERT="$CERTDIR/n.pem"
+KEY="$CERTDIR/n.key"
 
 echo "########################################"
 echo
@@ -38,22 +50,50 @@ done
 
 echo "Killing old ION..."
 killm >/dev/null 2>&1
-pkill -9 -f "tcpv4cla" 2>/dev/null
+pkill -9 -x tcpv4cla 2>/dev/null
 ./cleanup 2>/dev/null
 sleep 1
-rm -f ion.log testfile* sendfile bigfile counter.out "$CERT" "$KEY"
+rm -f ion.log testfile* sendfile bigfile counter.out
+rm -rf "$CERTDIR"
+mkdir -p "$CERTDIR" || { echo "SKIP: cannot create $CERTDIR."; exit 2; }
 
-echo "Generating self-signed certificate..."
+echo "Generating self-signed certificate with a NODE-ID..."
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	-addext "subjectAltName=DNS:localhost,IP:127.0.0.1,\
+otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0" \
 	>/dev/null 2>&1
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
-	echo "SKIP: could not generate a certificate."
+	echo "SKIP: could not generate a certificate (openssl 1.1.1+ needed"
+	echo "      for -addext)."
+	exit 2
+fi
+if ! openssl x509 -in "$CERT" -outform DER 2>/dev/null | xxd -p \
+		| tr -d '\n' | grep -q '06082b0601050507080b'; then
+	echo "SKIP: openssl did not encode the id-on-bundleEID otherName."
 	exit 2
 fi
 
 sed -e "s|TCPDUCT|${TCPDUCT}|g" -e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
 	"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+
+# Fail loudly rather than let ION truncate or refuse the command.  ION
+# stores it as an SDR string (255 chars) and its spawn helper accepts at
+# most 11 arguments, the duct name ION appends included.
+CMD=$(sed -n "s/^a induct .*'\(.*\)'$/\1/p" \
+	"${CONFIGDIR}/loopback_runtime.bprc")
+CMDLEN=$(printf '%s' "$CMD" | wc -c)
+CMDARGS=$(printf '%s' "$CMD" | wc -w)
+if [ "$CMDLEN" -gt 255 ]; then
+	echo "SKIP: induct command is ${CMDLEN} chars, over ION's 255-char"
+	echo "      SDR string limit; run from a shorter path."
+	exit 2
+fi
+if [ "$((CMDARGS + 1))" -gt 11 ]; then
+	echo "SKIP: induct command has $((CMDARGS + 1)) arguments (the duct"
+	echo "      name included), over ION's limit of 11."
+	exit 2
+fi
 sed -e "s|TCPDUCT|${TCPDUCT}|g" \
 	"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
 
@@ -64,7 +104,7 @@ bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
 
 echo "Waiting for the TCPCLv4 CLA daemon to start..."
 for i in 1 2 3 4 5 6 7 8 9 10; do
-	if pgrep -f "tcpv4cla" >/dev/null; then
+	if pgrep -x tcpv4cla >/dev/null; then
 		echo "TCPCLv4 CLA daemon is running."
 		break
 	fi
@@ -72,7 +112,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 sleep 2
 
-if ! pgrep -f "tcpv4cla" >/dev/null; then
+if ! pgrep -x tcpv4cla >/dev/null; then
 	echo "ERROR: TCPCLv4 CLA daemon did not start."
 	tail -30 ion.log 2>/dev/null
 	ionstop; killm
@@ -94,8 +134,8 @@ else
 fi
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 
-# --- Phase 2: session establishment over TLS ---------------------------
-echo "Phase 2: session established with TLS..."
+# --- Phase 2: session establishment, TLS and NODE-ID -------------------
+echo "Phase 2: session established with TLS and an authenticated node ID..."
 if grep -q "tcpv4cla session established" ion.log; then
 	echo "  PASS: TCPCL session established."
 else
@@ -106,15 +146,29 @@ if grep "session established" ion.log | grep -q "no TLS"; then
 else
 	echo "  PASS: session negotiated TLS."
 fi
+# RFC 9174 4.4.4.3: the certificate NODE-ID must authenticate the node ID
+# the peer claims in its SESS_INIT, and only then may the session carry
+# bundles outward (RFC 9174 7.9).
+if grep "session established" ion.log | grep -q "node ID authenticated"; then
+	echo "  PASS: peer node ID authenticated from the certificate."
+else
+	fail "peer node ID was not authenticated ($(grep -o \
+		'session established.*' ion.log | tail -1))."
+fi
+if grep "session established" ion.log | grep -q "bidirectional"; then
+	echo "  PASS: session usable in both directions."
+else
+	fail "session not marked bidirectional."
+fi
 
-# --- Phase 3: multi-segment transfer (6 KB > 2000-byte Segment MRU) ----
-echo "Phase 3: multi-segment file (~6 KB, Segment MRU 2000)..."
-head -c 6000 /dev/urandom | base64 | head -c 6000 > bigfile
+# --- Phase 3: multi-segment transfer (200 KB > 64 KiB Segment MRU) -----
+echo "Phase 3: multi-segment file (~200 KB, default Segment MRU 64 KiB)..."
+head -c 200000 /dev/urandom | base64 | head -c 200000 > bigfile
 rm -f testfile*
 bprecvfile ipn:1.2 & RP=$!
 sleep 1
 bpsendfile ipn:1.1 ipn:1.2 bigfile
-sleep 5
+sleep 8
 if [ -f testfile1 ] && cmp -s bigfile testfile1; then
 	echo "  PASS: multi-segment bundle reassembled."
 else
@@ -169,14 +223,14 @@ else
 fi
 
 echo "Cleaning up..."
-pkill -9 -f "tcpv4cla" 2>/dev/null
+pkill -9 -x tcpv4cla 2>/dev/null
 sleep 1
 ionstop
 sleep 1
 killm
 
-rm -f testfile* sendfile bigfile counter.out bpdriverAduFile bpacq.* \
-	"$CERT" "$KEY"
+rm -f testfile* sendfile bigfile counter.out bpdriverAduFile bpacq.*
+rm -rf "$CERTDIR"
 rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
 
 exit $FAIL

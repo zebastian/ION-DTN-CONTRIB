@@ -1,0 +1,1 @@
+Requires openssl with -addext; exercises RFC 9174 4.4.4.3 NODE-ID policy.

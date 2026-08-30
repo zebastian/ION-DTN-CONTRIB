@@ -68,7 +68,8 @@ typedef struct Tcpv4Conn
 	char  peerName[TCPV4_MAX_HOST_LEN]; /* Duct name / peer address.	*/
 	uvast peerNode;			    /* From the peer's node ID.	*/
 	char  peerNodeId[TCPV4_MAX_NODEID_LEN];
-	int   peerAuthenticated;
+	int   peerAuthenticated;   /* Certificate chain validated.	*/
+	int   nodeIdAuthenticated; /* NODE-ID matched (RFC 9174 4.4.4.3).*/
 
 	/*	Negotiated session parameters (RFC 9174 4.7).		*/
 	int	 keepalive;   /* min of the two proposals, seconds.	*/
@@ -542,12 +543,18 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 	uvast	     peerNode;
 	size_t	     off = 0;
 	Tcpv4ExtItem item;
+	char	     claimed[TCPV4_MAX_NODEID_LEN] = {0};
+	int	     authenticated = 0;
 	int	     rc;
 
 	if (peer->segmentMru == 0 || peer->transferMru == 0)
 	{
+		/*	RFC 9174 4.7: an unacceptable MRU ends the session
+		 *	with "Contact Failure".				*/
+
 		writeMemoNote("[?] tcpv4cla got an unusable MRU from",
 				conn->peerName);
+		oK(sendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
 		return -1;
 	}
 
@@ -563,6 +570,7 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 			writeMemoNote("[?] tcpv4cla got a critical session"
 				      " extension it cannot handle from",
 					conn->peerName);
+			oK(sendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
 			return -1;
 		}
 	}
@@ -572,8 +580,61 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 		writeMemoNote("[?] tcpv4cla got a malformed session extension"
 			      " list from",
 				conn->peerName);
+		oK(sendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
 		return -1;
 	}
+
+	if (peer->nodeIdLen > 0 && peer->nodeIdLen < TCPV4_MAX_NODEID_LEN)
+	{
+		memcpy(claimed, peer->nodeId, peer->nodeIdLen);
+		claimed[peer->nodeIdLen] = '\0';
+	}
+
+	/*	RFC 9174 4.4.4.3: immediately before parameter negotiation,
+	 *	validate the certificate NODE-ID against the node ID the peer
+	 *	claims in its SESS_INIT.  Only a certificate that was itself
+	 *	validated can authenticate anything, so -n (do not verify)
+	 *	and a plaintext session leave the node ID unauthenticated.	*/
+
+	if (conn->tls != NULL && !e->cfg.noVerify
+			&& e->cfg.eidPolicy != TCPV4_EIDPOL_NONE
+			&& claimed[0] != '\0')
+	{
+		switch (tcpv4TlsMatchNodeId(conn->tls, claimed))
+		{
+		case TCPV4_NODEID_SUCCESS:
+			authenticated = 1;
+			break;
+
+		case TCPV4_NODEID_FAILURE:
+			/*	NODE-IDs are present and none of them is the
+			 *	node ID claimed: the peer is not who it says
+			 *	it is.  Terminate, whatever the policy.	*/
+
+			writeMemoNote("[?] tcpv4cla: peer's certificate does"
+				      " not authenticate the node ID it"
+				      " claims;",
+					conn->peerName);
+			oK(sendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
+			return -1;
+
+		default: /* ABSENT, or no usable certificate.		*/
+			if (e->cfg.eidPolicy == TCPV4_EIDPOL_REQUIRE)
+			{
+				writeMemoNote("[?] tcpv4cla: peer's certificate"
+					      " carries no NODE-ID and policy"
+					      " requires one;",
+						conn->peerName);
+				oK(sendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE,
+						0));
+				return -1;
+			}
+
+			break;
+		}
+	}
+
+	peerNode = nodeNbrFromNodeId(claimed);
 
 	pthread_mutex_lock(&e->mutex);
 	conn->segmentMtu = peer->segmentMru;
@@ -581,19 +642,44 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 	conn->keepalive = (peer->keepalive < e->cfg.keepalive
 					? peer->keepalive
 					: e->cfg.keepalive);
-	if (peer->nodeIdLen > 0 && peer->nodeIdLen < TCPV4_MAX_NODEID_LEN)
-	{
-		memcpy(conn->peerNodeId, peer->nodeId, peer->nodeIdLen);
-		conn->peerNodeId[peer->nodeIdLen] = '\0';
-		peerNode = nodeNbrFromNodeId(conn->peerNodeId);
-		if (peerNode != 0)
-		{
-			/*	RFC 9174 4.6: a session is associated with
-			 *	the node ID the peer actually gave, even if
-			 *	that is not the one we dialled.		*/
+	istrcpy(conn->peerNodeId, claimed, sizeof(conn->peerNodeId));
+	conn->nodeIdAuthenticated = authenticated;
 
-			conn->peerNode = peerNode;
+	if (authenticated)
+	{
+		/*	RFC 9174 4.6: the session is associated with the node
+		 *	ID the peer actually gave, even if that is not the
+		 *	one we dialled - now that the certificate says the
+		 *	peer is entitled to it.				*/
+
+		conn->peerNode = peerNode;
+	}
+	else if (conn->activeRole)
+	{
+		/*	We opened this session, so its node number came from
+		 *	the egress plan and not from the wire.  Keep it -
+		 *	unless the peer answers with a different node ID,
+		 *	which nothing here can check and so nothing here
+		 *	will route on.					*/
+
+		if (peerNode != 0 && peerNode != conn->peerNode)
+		{
+			writeMemoNote("[?] tcpv4cla: peer claims an"
+				      " unauthenticated node ID that is not"
+				      " the one dialled; not routing to it;",
+					conn->peerName);
+			conn->peerNode = 0;
 		}
+	}
+	else
+	{
+		/*	An accepted session whose node ID is unauthenticated
+		 *	never carries bundles outward (RFC 9174 7.9, "Threat:
+		 *	BP Node Impersonation"): any peer could otherwise
+		 *	name itself as some node and collect that node's
+		 *	traffic.  It can still deliver bundles inward.	*/
+
+		conn->peerNode = 0;
 	}
 
 	pthread_mutex_unlock(&e->mutex);
@@ -764,19 +850,36 @@ static int establishSession(Tcpv4Conn *conn)
 	pthread_mutex_unlock(&e->mutex);
 
 	{
-		char txt[512];
+		char	    txt[512];
+		const char *security;
+
+		if (conn->tls == NULL)
+		{
+			security = "no TLS";
+		}
+		else if (!conn->peerAuthenticated)
+		{
+			security = "TLS, peer not verified";
+		}
+		else if (conn->nodeIdAuthenticated)
+		{
+			security = "TLS, node ID authenticated";
+		}
+		else
+		{
+			security = "TLS, node ID not authenticated";
+		}
 
 		isprintf(txt, sizeof(txt),
 				"[i] tcpv4cla session established with '%s'"
-				" (node '%s'%s, keepalive %d s, segment MTU "
-				UVAST_FIELDSPEC ").",
+				" (node '%s', %s, %s, keepalive %d s, segment"
+				" MTU " UVAST_FIELDSPEC ").",
 				conn->peerName,
 				conn->peerNodeId[0] ? conn->peerNodeId
 						   : "unknown",
-				conn->tls == NULL ? ", no TLS"
-						  : (conn->peerAuthenticated
-										  ? ", authenticated"
-										  : ", unauthenticated"),
+				security,
+				conn->peerNode == 0 ? "inbound only"
+						    : "bidirectional",
 				conn->keepalive, (uvast) conn->segmentMtu);
 		writeMemo(txt);
 	}
@@ -1916,9 +2019,18 @@ static Tcpv4Conn *claimConn(Tcpv4Engine *e, uvast nodeNbr, int *exists)
 	Tcpv4Conn *conn;
 
 	*exists = 0;
+	if (nodeNbr == 0)
+	{
+		return NULL;
+	}
+
 	for (conn = e->conns; conn != NULL; conn = conn->next)
 	{
-		if (conn->failed || conn->receiverDone
+		/*	peerNode is left 0 for any session whose peer identity
+		 *	is not established well enough to route on, so such a
+		 *	session is never selected here (see applySessInit).	*/
+
+		if (conn->failed || conn->receiverDone || conn->peerNode == 0
 				|| conn->peerNode != nodeNbr)
 		{
 			continue;

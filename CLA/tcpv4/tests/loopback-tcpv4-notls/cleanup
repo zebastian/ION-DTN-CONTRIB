@@ -1,5 +1,5 @@
 #!/bin/bash
-pkill -9 -f "tcpv4cla" 2>/dev/null
+pkill -9 -x tcpv4cla 2>/dev/null
 ionstop >/dev/null 2>&1
 killm >/dev/null 2>&1
 rm -f ion.log testfile1 sendfile counter.out

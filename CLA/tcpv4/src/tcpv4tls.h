@@ -63,6 +63,19 @@ int tcpv4TlsRecv(Tcpv4TlsConn *conn, void *into, int len);
  *	unauthenticated peer node ID is not to be trusted for routing.	*/
 int tcpv4TlsPeerAuthenticated(Tcpv4TlsConn *conn);
 
+/*	Result of validating an identity against certificate claims, in the
+ *	three-way form RFC 9174 4.4.4 defines.				*/
+#define TCPV4_NODEID_SUCCESS 1	/* A NODE-ID is present and matches.	*/
+#define TCPV4_NODEID_ABSENT  0	/* The certificate carries no NODE-ID.	*/
+#define TCPV4_NODEID_FAILURE (-1) /* NODE-IDs present, none matches.	*/
+#define TCPV4_NODEID_ERROR   (-2) /* No usable peer certificate.	*/
+
+/*	Validate nodeId against the NODE-IDs of the peer's end-entity
+ *	certificate (RFC 9174 4.4.4.3), a NODE-ID being a subjectAltName
+ *	otherName of form id-on-bundleEID whose value is a node ID
+ *	(RFC 9174 4.4.1).  Returns one of TCPV4_NODEID_*.		*/
+int tcpv4TlsMatchNodeId(Tcpv4TlsConn *conn, const char *nodeId);
+
 /*	Tear down the TLS session.  When graceful is non-zero a close_notify
  *	is sent first.  Does not close the underlying socket.		*/
 void tcpv4TlsClose(Tcpv4TlsConn *conn, int graceful);

@@ -60,7 +60,9 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | `SESS_TERM`, REPLY flag, Ending state (§6.1) | implemented |
 | Idle session termination (§6.2) | implemented (`-t`) |
 | Reconnection backoff, contact timeout (§4.1) | implemented (binary backoff, capped at 60 s) |
-| Node ID authentication for routing (§4.4.4, §7.9) | peer node ID is used for session reuse only; the authenticated flag is logged, not enforced |
+| NODE-ID authentication (§4.4.1, §4.4.4.3, §7.9) | implemented (`-E`); an unauthenticated node ID never attracts egress |
+| Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
+| OCSP checking, EKU policy (§4.4.4.1) | **not implemented** |
 | TCPCLv3 fallback after "Version mismatch" (§4.3) | **not implemented** (an implementation matter; use `tcpcli` for v3 peers) |
 | Emitting session / transfer extension items | **not implemented** (none defined) |
 
@@ -75,6 +77,38 @@ while still using TLS, and the session is then reported as unauthenticated.
 `-T` sets the policy applied to the negotiated Enable TLS value: `require`
 (default), `prefer` (opportunistic security, RFC 7435), or `none` (plaintext).
 Only TLS 1.3 is offered, per §4.4.3.
+
+### Node ID authentication
+
+A peer's `SESS_INIT` node ID is only a claim. RFC 9174 §4.4.1 defines a
+**NODE-ID** as a `subjectAltName` `otherName` of form `id-on-bundleEID`
+(OID `1.3.6.1.5.5.7.8.11`) whose value is that node ID, and §4.4.4.3 requires
+validating it against the claim. §7.9 explains why: without it, any peer that
+can complete a session — in a shared-CA deployment, *any* certificate holder —
+can name itself as some other node and collect that node's traffic.
+
+`-E` sets the policy: `require` (default, and what §4.4.5 recommends),
+`prefer`, or `none`. Independently of the policy, **a node ID that was not
+authenticated is never used to route bundles to the peer**: a session this
+node accepted is marked *inbound only* and will not be selected to carry
+bundles outward. A session this node opened keeps the node number from its
+egress plan, which came from configuration rather than from the wire, so
+egress works even in plaintext — but if such a peer answers claiming a
+*different* node ID that cannot be authenticated, that session is dropped from
+egress selection too.
+
+Because `-n` is a decision not to authenticate the peer at all, it implies
+`-E none` unless `-E` is given explicitly — a NODE-ID in an unvalidated
+certificate proves nothing.
+
+Generating a certificate that carries a NODE-ID, with OpenSSL 1.1.1+:
+
+```
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout node.key -out node.pem -days 365 -nodes -subj "/CN=node1.example" \
+    -addext "subjectAltName=DNS:node1.example,\
+otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0"
+```
 
 The TLS code is isolated behind `tcpv4tls.h`, so an OpenSSL or wolfSSL backend
 can be added as a sibling `tcpv4tls_*.c` without touching the engine.
@@ -92,13 +126,24 @@ a outduct tcpv4 'peer.example:4556' ''
 ```
 
 Flags (on the `tcpv4cla` induct command): `-c`/`-k` cert/key, `-C` CA file,
-`-n` no-verify, `-T` TLS policy (`require`/`prefer`/`none`), `-K` keepalive
+`-n` no-verify, `-T` TLS policy (`require`/`prefer`/`none`), `-E` NODE-ID
+policy (`require`/`prefer`/`none`), `-K` keepalive
 interval to propose, `-t` idle session timeout, `-S`/`-M` advertised Segment
 and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
 (`SO_RCVBUF`/`SO_SNDBUF`; 0 = OS default).
 
 Note that ION's own `tcp` protocol (TCPCLv3, `tcpcli`) also defaults to port
 4556; give one of them a different port if both run on the same node.
+
+**Two ION limits constrain the induct command**, and both fail in ways that do
+not name themselves. ION stores the command as an SDR string capped at
+`MAX_SDRSTRING` (255) characters and truncates past that, so a long
+certificate path can leave the daemon opening half a filename ("Error while
+reading file"). Its spawn helper accepts at most **11 arguments**, the duct
+name ION appends included, and rejects the command outright ("More than 11
+args in command") — `-c X -k Y -C Z -T t -E e -K k` is already 13. Keep
+credentials on short paths and lean on the defaults; both loopback tests check
+these limits before starting ION so the failure is legible.
 
 ## Layout
 
@@ -113,6 +158,7 @@ src/tcpv4cla.c          daemon (accepts + opens sessions, drains outducts)
 doc/*.pod               man page sources
 tests/loopback-tcpv4/       single-node loopback over TLS (.optional)
 tests/loopback-tcpv4-notls/ single-node plaintext loopback (.optional)
+tests/nodeid-tcpv4/         NODE-ID authentication policy (.optional)
 bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 ```
 
@@ -137,6 +183,11 @@ one session blocking on ZCO space does not disturb another.
 - `tests/loopback-tcpv4-notls` — `-T none`: Enable TLS negotiated to false,
   bundle transfer, idle session termination (`-t 8`), and re-establishment of
   the session afterwards.
+- `tests/nodeid-tcpv4` — RFC 9174 §4.4.4.3: with a certificate carrying no
+  NODE-ID, `-E require` refuses the session with "Contact Failure" and no
+  bundle gets through, while `-E prefer` keeps the session but marks the
+  accepted side inbound only, so a merely claimed node ID cannot attract
+  egress.
 
 Both loopback tests are marked `.optional`; the TLS one needs `openssl` to
 generate a throwaway certificate.
@@ -211,8 +262,10 @@ tshark -o tls.keylog_file:/tmp/tcpv4.keys -r /tmp/tcpv4.pcap
 Some behaviours are verified by inspection rather than by the automated suite,
 as they are awkward to drive with the standard BP tools: `MSG_REJECT`
 generation, `XFER_REFUSE` on an oversized transfer or an unknown CRITICAL
-extension item, the "Version mismatch" and "Contact Failure" termination paths,
-and the reconnection backoff.
+extension item, the "Version mismatch" termination path, and the reconnection
+backoff.  A NODE-ID that is present but names a *different* node (the
+`Failure` case of RFC 9174 §4.4.4, as against the `Absent` case the test
+covers) is likewise verified by inspection.
 
 ## License
 

@@ -36,6 +36,15 @@ extern "C" {
 #define TCPV4_TLS_PREFER	1
 #define TCPV4_TLS_DISABLE	2
 
+/*	Local policy for NODE-ID authentication (RFC 9174 4.4.4.3): whether
+ *	the peer's certificate must authenticate the node ID it claims in
+ *	its SESS_INIT.  REQUIRE is the policy RFC 9174 4.4.5 recommends.
+ *	A node ID that is not authenticated is never used to route bundles
+ *	to the peer, whatever the policy (RFC 9174 4.6, 7.9).		*/
+#define TCPV4_EIDPOL_REQUIRE	0
+#define TCPV4_EIDPOL_PREFER	1
+#define TCPV4_EIDPOL_NONE	2
+
 /*
  * Configuration parsed from command-line arguments.  A certificate and key
  * are required whenever TLS is not disabled: RFC 9174 4.4.3 has the passive
@@ -51,6 +60,7 @@ typedef struct
 	char caFile[TCPV4_MAX_PATH_LEN];   /* trust anchors (PEM).	*/
 	int  noVerify;			   /* skip peer verification.	*/
 	int  tlsPolicy;			   /* TCPV4_TLS_*.		*/
+	int  eidPolicy;			   /* TCPV4_EIDPOL_*.		*/
 	int  keepalive;	   /* Keepalive Interval we propose, seconds.	*/
 	int  idleSec;	   /* Idle session termination; 0 disables.	*/
 	int  segmentMru;   /* advertised Segment MRU.			*/
@@ -133,6 +143,7 @@ static int parseTcpv4DuctName(const char *ductName, char *host, int *port)
  *   -C <cafile>    CA trust anchors (PEM)
  *   -n             do not verify the peer certificate
  *   -T <policy>    TLS policy: require (default), prefer, none
+ *   -E <policy>    NODE-ID authentication: require (default), prefer, none
  *   -K <seconds>   Keepalive Interval to propose (default 30, 0 disables)
  *   -t <seconds>   idle session termination timeout (default 0 = never)
  *   -S <bytes>     advertised Segment MRU (default 65536)
@@ -147,10 +158,12 @@ static int parseTcpv4DuctName(const char *ductName, char *host, int *port)
 static int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 {
 	int i;
+	int eidGiven = 0;
 
 	memset(cfg, 0, sizeof(Tcpv4ClaConfig));
 	cfg->port = TCPV4_DEFAULT_PORT;
 	cfg->tlsPolicy = TCPV4_TLS_REQUIRE;
+	cfg->eidPolicy = TCPV4_EIDPOL_REQUIRE;
 	cfg->keepalive = TCPV4_DEFAULT_KEEPALIVE;
 	cfg->segmentMru = TCPV4_DEFAULT_SEGMENT_MRU;
 	cfg->transferMru = TCPV4CLA_BUFSZ;
@@ -193,6 +206,29 @@ static int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 				putErrmsg("tcpv4cla: bad -T policy.", argv[i]);
 				return -1;
 			}
+		}
+		else if (strcmp(argv[i], "-E") == 0 && i + 1 < argc)
+		{
+			i++;
+			if (strcmp(argv[i], "require") == 0)
+			{
+				cfg->eidPolicy = TCPV4_EIDPOL_REQUIRE;
+			}
+			else if (strcmp(argv[i], "prefer") == 0)
+			{
+				cfg->eidPolicy = TCPV4_EIDPOL_PREFER;
+			}
+			else if (strcmp(argv[i], "none") == 0)
+			{
+				cfg->eidPolicy = TCPV4_EIDPOL_NONE;
+			}
+			else
+			{
+				putErrmsg("tcpv4cla: bad -E policy.", argv[i]);
+				return -1;
+			}
+
+			eidGiven = 1;
 		}
 		else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc)
 		{
@@ -256,6 +292,16 @@ static int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 		putErrmsg("tcpv4cla: -c and -k are required unless -T none.",
 				NULL);
 		return -1;
+	}
+
+	/*	A NODE-ID is only as good as the certificate that carries
+	 *	it, so -n - which is a decision not to authenticate the peer
+	 *	at all - also gives up on authenticating its node ID, unless
+	 *	the operator asked for a policy explicitly.		*/
+
+	if (cfg->noVerify && !eidGiven)
+	{
+		cfg->eidPolicy = TCPV4_EIDPOL_NONE;
 	}
 
 	return 0;
