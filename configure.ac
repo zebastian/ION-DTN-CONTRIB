@@ -70,6 +70,7 @@ m4_include([CLA/mail/configure.m4])
 m4_include([CLA/mqtt/configure.m4])
 m4_include([CLA/mysql/configure.m4])
 m4_include([CLA/quic/configure.m4])
+m4_include([CLA/tcpv4/configure.m4])
 m4_include([APP/bpsh/configure.m4])
 m4_include([APP/bpcmd/configure.m4])
 

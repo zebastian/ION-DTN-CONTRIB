@@ -1,0 +1,13 @@
+# bprc for the TCPCLv4 CLA benchmark.  PROTO, DUCT and CLICMD are
+# substituted at runtime, one set per mode being measured, so that every
+# mode is driven through exactly the same node configuration.
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+m payloadcrc 0
+a protocol PROTO 1400 100
+a induct  PROTO DUCT 'CLICMD'
+a outduct PROTO DUCT ''
+r 'ipnadmin config/bench.ipnrc'
+s

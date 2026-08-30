@@ -1,0 +1,131 @@
+=head1 NAME
+
+tcpv4cla - DTN TCPCLv4 convergence layer task
+
+=head1 SYNOPSIS
+
+B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-n>]
+[B<-T> I<policy>] [B<-K> I<keepalive>] [B<-t> I<idlesec>]
+[B<-S> I<segmentmru>] [B<-M> I<transfermru>] [B<-r> I<bytes>]
+[B<-w> I<bytes>] I<host>[:I<port>]
+
+=head1 DESCRIPTION
+
+B<tcpv4cla> is a background "daemon" task that implements version 4 of the
+DTN TCP convergence-layer protocol, RFC 9174, over TLS 1.3 (GnuTLS).  TCPCLv4
+sessions are bidirectional: once established, either entity may transfer
+bundles over the session regardless of which one opened the TCP connection.
+
+B<tcpv4cla> listens on I<host>:I<port> (default port 4556) and accepts TCPCL
+sessions, injecting the bundles they carry into ION.  It also opens sessions
+for the egress plans that cite "tcpv4" outducts (each outduct name being the
+peer's I<host>[:I<port>]) and drains those outducts, transmitting each bundle
+over the session to that node - reusing an already-established session to the
+node, whether B<tcpv4cla> accepted it or opened it, rather than opening a
+second one.  Each bundle is one TCPCL transfer, segmented to the peer's
+Segment MTU and carried in XFER_SEGMENT messages that the peer acknowledges
+with cumulative XFER_ACKs.
+
+Session establishment follows RFC 9174 section 4: the entity that opened the
+connection sends its contact header first, the peer answers with its own, the
+Enable TLS parameter is the logical AND of the two CAN_TLS flags, and - when
+TLS is in use - the TLS handshake runs before the SESS_INIT exchange that
+negotiates the keepalive interval and the Segment and Transfer MRUs.
+
+A certificate (B<-c>) and private key (B<-k>) are required unless TLS is
+disabled with B<-T none>: RFC 9174 has the passive entity supply a certificate
+and request one from the active entity, so both roles need credentials.
+
+B<tcpv4cla> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the spawning command text is supplied when the "tcpv4"
+convergence layer protocol is added to the BP database.  The task is
+terminated by B<bpadmin> in response to an 'x' (STOP) command, at which point
+it terminates each session with a SESS_TERM exchange.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-c> I<cert>
+
+End-entity certificate (PEM).  Required unless B<-T none>.
+
+=item B<-k> I<key>
+
+Private key (PEM).  Required unless B<-T none>.
+
+=item B<-C> I<cafile>
+
+PEM file of trusted CA certificates, used to verify both peers that connect
+to this node and peers this node connects to.  Without it the system trust
+store is used.
+
+=item B<-n>
+
+Do not verify the peer's certificate.  A peer certificate is still requested
+and TLS is still used, but the session is reported as unauthenticated; useful
+with self-signed certificates.
+
+=item B<-T> I<policy>
+
+TLS policy applied to the negotiated Enable TLS value: C<require> (the
+default) terminates the session with "Contact Failure" when the peer cannot
+do TLS, C<prefer> accepts a plaintext session when the peer cannot (the
+opportunistic security model of RFC 7435), and C<none> clears this node's
+CAN_TLS flag so every session is plaintext.
+
+=item B<-K> I<keepalive>
+
+Keepalive Interval to propose, in seconds (default 30, 0 disables
+KEEPALIVEs).  The session uses the smaller of the two proposals.  RFC 9174
+recommends no less than 30 s on a shared network and no more than 600 s.
+
+=item B<-t> I<idlesec>
+
+Terminate a session that has carried no message other than KEEPALIVEs for
+this many seconds (RFC 9174 section 6.2).  0, the default, never terminates
+an idle session.
+
+=item B<-S> I<segmentmru>
+
+Segment MRU to advertise, in bytes (default 65536): the largest XFER_SEGMENT
+payload this node will accept.
+
+=item B<-M> I<transfermru>
+
+Transfer MRU to advertise, in bytes (default 262144): the largest bundle this
+node will accept in one transfer.
+
+=item B<-r> I<bytes>
+
+Socket receive buffer (B<SO_RCVBUF>), in bytes; 0 (default) leaves the
+operating-system default.
+
+=item B<-w> I<bytes>
+
+Socket send buffer (B<SO_SNDBUF>), in bytes; 0 (default) leaves the
+operating-system default.
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<tcpv4cla> terminated normally.
+
+=item "1"
+
+B<tcpv4cla> terminated abnormally; see the B<ion.log> file.
+
+=back
+
+=head1 EXAMPLES
+
+    a induct tcpv4 0.0.0.0:4556 'tcpv4cla -c /etc/tcpcl/node.pem -k /etc/tcpcl/node.key -C /etc/tcpcl/ca.pem'
+
+=head1 SEE ALSO
+
+bpadmin(1), bprc(5), tcpcli(1)

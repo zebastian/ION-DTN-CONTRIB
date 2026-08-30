@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# Plaintext loopback test for the TCPCLv4 CLA (tcpv4cla -T none).
+#
+# RFC 9174 4.3 negotiates Enable TLS as the logical AND of the two
+# contact headers' CAN_TLS flags, then applies local policy; "-T none"
+# clears our flag, so the session must come up without TLS and still
+# transfer bundles.  This test also exercises idle session termination
+# (RFC 9174 6.2) with "-t 8".
+#
+# Needs no certificate, so it runs wherever the bp test tools do.
+#
+
+TCP_PORT="${TCPV4_PORT:-4757}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+CONFIGDIR="./config"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the TCPCLv4 CLA without TLS (CAN_TLS negotiation,"
+echo "         bundle transfer, idle session termination)."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+for t in tcpv4cla bpsendfile bprecvfile bpdriver bpcounter; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -f "tcpv4cla" 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile* sendfile counter.out
+
+sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+	"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+	"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+
+echo "Waiting for the TCPCLv4 CLA daemon to start..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	if pgrep -f "tcpv4cla" >/dev/null; then
+		echo "TCPCLv4 CLA daemon is running."
+		break
+	fi
+	sleep 1
+done
+sleep 2
+
+if ! pgrep -f "tcpv4cla" >/dev/null; then
+	echo "ERROR: TCPCLv4 CLA daemon did not start."
+	tail -30 ion.log 2>/dev/null
+	ionstop; killm
+	exit 1
+fi
+
+# --- Phase 1: plaintext session establishment --------------------------
+echo "Phase 1: transfer over a plaintext session..."
+head -c 4000 /dev/urandom | base64 | head -c 4000 > sendfile
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 5
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "  PASS: bundle delivered over a plaintext session."
+else
+	fail "bundle not delivered over a plaintext session."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+if grep "session established" ion.log | grep -q "no TLS"; then
+	echo "  PASS: session negotiated Enable TLS = false."
+else
+	fail "session did not report a plaintext session."
+fi
+
+# --- Phase 2: multiple streamed bundles --------------------------------
+echo "Phase 2: 30 streamed bundles..."
+bpcounter ipn:1.2 30 > counter.out 2>&1 & CP=$!
+sleep 1
+bpdriver 30 ipn:1.1 ipn:1.2 -1024 >/dev/null 2>&1
+for i in $(seq 1 30); do kill -0 $CP 2>/dev/null || break; sleep 1; done
+kill -9 $CP 2>/dev/null
+if grep -q "bundles received: 30" counter.out; then
+	echo "  PASS: 30 bundles received."
+else
+	fail "did not receive 30 bundles ($(grep -o 'received: [0-9]*' \
+		counter.out | tail -1))."
+fi
+
+# --- Phase 3: idle session termination (RFC 9174 6.2) ------------------
+# "-t 8" terminates a session after 8 s without a non-KEEPALIVE message.
+echo "Phase 3: idle session terminated after 8 s..."
+sleep 14
+if grep -q "tcpv4cla terminating idle session" ion.log; then
+	echo "  PASS: idle session terminated with SESS_TERM."
+else
+	fail "idle session was not terminated."
+fi
+
+# A new bundle must still get through: the session is re-established.
+echo "Phase 4: session re-established after idle termination..."
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 6
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "  PASS: bundle delivered on a re-established session."
+else
+	fail "bundle not delivered after idle termination."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+echo "Cleaning up..."
+pkill -9 -f "tcpv4cla" 2>/dev/null
+sleep 1
+ionstop
+sleep 1
+killm
+
+rm -f testfile* sendfile counter.out bpdriverAduFile bpacq.*
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL

@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# Loopback test for the TCPCLv4 CLA (tcpv4cla), RFC 9174 over TLS.
+#
+# A single ION node sends to itself over TCPCLv4 and exercises: the
+# contact header / TLS / SESS_INIT establishment sequence, a single
+# segment transfer, a multi-segment transfer (Segment MRU forced small
+# with -S), multiple streamed bundles, KEEPALIVE on an idle session, and
+# a graceful SESS_TERM exchange on shutdown.
+#
+# Requires openssl plus the standard bp test tools.
+#
+
+TCP_PORT="${TCPV4_PORT:-4756}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+CONFIGDIR="./config"
+CERT="$(pwd)/server.pem"
+KEY="$(pwd)/server.key"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the TCPCLv4 CLA (session establishment over TLS,"
+echo "         segmentation, multiple bundles, keepalive, termination)."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+for t in tcpv4cla openssl bpsendfile bprecvfile bpdriver bpcounter; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -f "tcpv4cla" 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile* sendfile bigfile counter.out "$CERT" "$KEY"
+
+echo "Generating self-signed certificate..."
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+sed -e "s|TCPDUCT|${TCPDUCT}|g" -e "s|CERT|${CERT}|g" -e "s|KEY|${KEY}|g" \
+	"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+	"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+
+echo "Waiting for the TCPCLv4 CLA daemon to start..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	if pgrep -f "tcpv4cla" >/dev/null; then
+		echo "TCPCLv4 CLA daemon is running."
+		break
+	fi
+	sleep 1
+done
+sleep 2
+
+if ! pgrep -f "tcpv4cla" >/dev/null; then
+	echo "ERROR: TCPCLv4 CLA daemon did not start."
+	tail -30 ion.log 2>/dev/null
+	ionstop; killm
+	exit 1
+fi
+
+# --- Phase 1: single-segment transfer ----------------------------------
+echo "Phase 1: single-segment file..."
+head -c 64 /dev/urandom | base64 | head -c 64 > sendfile
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 5
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "  PASS: single-segment bundle delivered."
+else
+	fail "single-segment bundle not delivered."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+# --- Phase 2: session establishment over TLS ---------------------------
+echo "Phase 2: session established with TLS..."
+if grep -q "tcpv4cla session established" ion.log; then
+	echo "  PASS: TCPCL session established."
+else
+	fail "no established session logged."
+fi
+if grep "session established" ion.log | grep -q "no TLS"; then
+	fail "session did not negotiate TLS."
+else
+	echo "  PASS: session negotiated TLS."
+fi
+
+# --- Phase 3: multi-segment transfer (6 KB > 2000-byte Segment MRU) ----
+echo "Phase 3: multi-segment file (~6 KB, Segment MRU 2000)..."
+head -c 6000 /dev/urandom | base64 | head -c 6000 > bigfile
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 bigfile
+sleep 5
+if [ -f testfile1 ] && cmp -s bigfile testfile1; then
+	echo "  PASS: multi-segment bundle reassembled."
+else
+	fail "multi-segment bundle not reassembled."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+# --- Phase 4: multiple streamed bundles --------------------------------
+echo "Phase 4: 50 streamed bundles..."
+bpcounter ipn:1.2 50 > counter.out 2>&1 & CP=$!
+sleep 1
+bpdriver 50 ipn:1.1 ipn:1.2 -1024 >/dev/null 2>&1
+for i in $(seq 1 30); do kill -0 $CP 2>/dev/null || break; sleep 1; done
+kill -9 $CP 2>/dev/null
+if grep -q "bundles received: 50" counter.out; then
+	echo "  PASS: 50 bundles received."
+else
+	fail "did not receive 50 bundles ($(grep -o 'received: [0-9]*' \
+		counter.out | tail -1))."
+fi
+
+# --- Phase 5: idle session survives on KEEPALIVEs ----------------------
+# The negotiated keepalive is 5 s (-K 5); an idle session must still be
+# usable well past twice that, which it is only if KEEPALIVEs flow.
+echo "Phase 5: idle session kept alive (negotiated interval 5 s)..."
+sleep 14
+rm -f testfile*
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+sleep 5
+if [ -f testfile1 ] && cmp -s sendfile testfile1; then
+	echo "  PASS: session survived an idle period."
+else
+	fail "session did not survive an idle period."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+if grep -q "tcpv4cla session timed out" ion.log; then
+	fail "session timed out while idle."
+fi
+
+# --- Phase 6: graceful SESS_TERM on shutdown ---------------------------
+# One daemon owns both ends of the loopback session, so stopping it sends
+# a SESS_TERM on each established session and the peer end replies.
+echo "Phase 6: graceful SESS_TERM..."
+pkill -TERM -x tcpv4cla 2>/dev/null
+sleep 3
+if grep -q "tcpv4cla sending SESS_TERM" ion.log; then
+	echo "  PASS: SESS_TERM sent on shutdown."
+else
+	fail "no SESS_TERM observed on shutdown."
+fi
+
+echo "Cleaning up..."
+pkill -9 -f "tcpv4cla" 2>/dev/null
+sleep 1
+ionstop
+sleep 1
+killm
+
+rm -f testfile* sendfile bigfile counter.out bpdriverAduFile bpacq.* \
+	"$CERT" "$KEY"
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL

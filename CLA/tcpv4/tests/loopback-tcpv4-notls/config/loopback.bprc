@@ -1,0 +1,10 @@
+# bprc for the plaintext TCPCLv4 CLA loopback test. TCPDUCT substituted by dotest.
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+a protocol tcpv4 1400 100
+a induct  tcpv4 TCPDUCT 'tcpv4cla -T none -S 2000 -t 8 -K 30'
+a outduct tcpv4 TCPDUCT ''
+r 'ipnadmin config/loopback_runtime.ipnrc'
+s

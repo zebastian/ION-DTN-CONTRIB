@@ -1,0 +1,7 @@
+#!/bin/bash
+pkill -9 -f "tcpv4cla" 2>/dev/null
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f ion.log testfile1 sendfile bigfile counter.out server.pem server.key
+rm -f config/loopback_runtime.bprc config/loopback_runtime.ipnrc
+exit 0

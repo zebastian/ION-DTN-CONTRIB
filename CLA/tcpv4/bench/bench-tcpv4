@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+#
+# bench-tcpv4 — throughput benchmark for the TCPCLv4 CLA (tcpv4cla).
+#
+# Drives a single-node loopback with bpdriver -> [CL] -> bpcounter over a
+# sweep of bundle payload sizes and records the throughput each size
+# achieves, in the same shape as CLA/quic/bench/bench-quic so the numbers
+# can be read alongside it.
+#
+# Three modes are swept, all through the identical measurement path so
+# that the differences between them are the protocol's and not the
+# harness's:
+#
+#   tls        tcpv4cla with TLS 1.3, the RFC 9174 default
+#   plaintext  tcpv4cla -T none, the cost of the CL without TLS
+#   tcpv3      ION's stock tcpcli (TCPCLv3, RFC 7242), as a baseline
+#
+# The service is chosen by the induct's command line, so it is fixed for
+# the life of the daemon and each mode needs a node of its own; the node
+# is torn down and restarted between modes.
+#
+# Like ION's own demos/bench-tcp, the sweep holds the *total bytes* per
+# size constant and derives the bundle count from it (TOTALBYTES/size,
+# capped at MAXBUNDLES).  Sending a fixed number of bundles at every size
+# instead would quadruple the queued payload from one size to the next
+# and run the SDR heap out at the large end, which stalls the run rather
+# than measuring it.
+#
+# Tunables (env overridable):
+#   MESSAGE_SIZE_MIN  smallest payload, bytes    (default 1024)
+#   MESSAGE_SIZE_MAX  largest payload, bytes     (default 65536)
+#   TOTALBYTES        payload per size, bytes    (default 32000000)
+#   MAXBUNDLES        cap on bundles per size    (default 10000)
+#   BENCH_MODES       modes to sweep             (default "tls plaintext tcpv3")
+#   TCPV4_PORT        TCP port for the tcpv4 link  (default 4856)
+#   TCPV3_PORT        TCP port for the tcpcli link (default 4857)
+#   BENCH_RCVBUF      SO_RCVBUF, bytes           (default 0 = OS default)
+#   BENCH_SNDBUF      SO_SNDBUF, bytes           (default 0 = OS default)
+#   STALL_SECS        seconds without an arrival before a size is done (10)
+#
+# Output: a table on stdout and results.csv
+# (mode,size_bytes,sent,received,seconds,mbps,bundles_per_s).
+#
+# TOTALBYTES must fit the SDR heap that config/bench.ionconfig asks for;
+# raising one means raising the other, or bpdriver stops being able to
+# enqueue and the size reports a partial delivery.
+#
+# Requires tcpv4cla (build with --enable-cla-tcpv4), ION's tcpcli for the
+# tcpv3 baseline, bpdriver, bpcounter, and openssl.
+
+set -u
+
+MESSAGE_SIZE_MIN="${MESSAGE_SIZE_MIN:-1024}"
+MESSAGE_SIZE_MAX="${MESSAGE_SIZE_MAX:-65536}"
+TOTALBYTES="${TOTALBYTES:-32000000}"
+MAXBUNDLES="${MAXBUNDLES:-10000}"
+BENCH_MODES="${BENCH_MODES:-tls plaintext tcpv3}"
+TCPV4_PORT="${TCPV4_PORT:-4856}"
+TCPV3_PORT="${TCPV3_PORT:-4857}"
+BENCH_RCVBUF="${BENCH_RCVBUF:-0}"
+BENCH_SNDBUF="${BENCH_SNDBUF:-0}"
+STALL_SECS="${STALL_SECS:-10}"
+
+CONFIGDIR="./config"
+CERT="$(pwd)/server.pem"
+KEY="$(pwd)/server.key"
+RESULTS="$(pwd)/results.csv"
+
+# Optional socket-buffer sizing, passed to tcpv4cla (-r/-w).  ION's tcpcli
+# takes no such flags, so the tcpv3 baseline always uses the OS defaults;
+# leave these at 0 when comparing against it.
+SOCKOPTS=""
+[ "$BENCH_RCVBUF" -gt 0 ] && SOCKOPTS="$SOCKOPTS -r $BENCH_RCVBUF"
+[ "$BENCH_SNDBUF" -gt 0 ] && SOCKOPTS="$SOCKOPTS -w $BENCH_SNDBUF"
+
+# How many bundles of this size make up one size's byte budget.
+bundles_for()
+{
+	n=$((TOTALBYTES / $1))
+	[ "$n" -lt 1 ] && n=1
+	[ "$n" -gt "$MAXBUNDLES" ] && n="$MAXBUNDLES"
+	echo "$n"
+}
+
+# What each mode puts into the node configuration.
+mode_proto()
+{
+	case "$1" in
+	tcpv3) echo "tcp" ;;
+	*) echo "tcpv4" ;;
+	esac
+}
+
+mode_port()
+{
+	case "$1" in
+	tcpv3) echo "$TCPV3_PORT" ;;
+	*) echo "$TCPV4_PORT" ;;
+	esac
+}
+
+mode_daemon()
+{
+	case "$1" in
+	tcpv3) echo "tcpcli" ;;
+	*) echo "tcpv4cla" ;;
+	esac
+}
+
+mode_clicmd()
+{
+	case "$1" in
+	tls) echo "tcpv4cla${SOCKOPTS} -c ${CERT} -k ${KEY} -n" ;;
+	plaintext) echo "tcpv4cla${SOCKOPTS} -T none" ;;
+	tcpv3) echo "tcpcli" ;;
+	*)
+		echo "ERROR: unknown mode '$1'." >&2
+		exit 1
+		;;
+	esac
+}
+
+for tool in tcpv4cla tcpcli bpdriver bpcounter openssl ionadmin bpadmin; do
+	if ! command -v "$tool" >/dev/null 2>&1; then
+		echo "ERROR: '$tool' not found in PATH." >&2
+		exit 1
+	fi
+done
+
+cleanup_ion()
+{
+	# Ask the CLA to stop before insisting: SIGKILL on a daemon that is in
+	# the middle of a transfer can leave it holding the SDR, and the next
+	# mode's node then cannot start its own CLA.
+
+	pkill -TERM -f "tcpv4cla" 2>/dev/null
+	pkill -TERM -f "tcpcli" 2>/dev/null
+	pkill -TERM -f "bpcounter" 2>/dev/null
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -f "tcpv4cla|tcpcli" >/dev/null || break
+		sleep 1
+	done
+
+	pkill -9 -f "tcpv4cla" 2>/dev/null
+	pkill -9 -f "tcpcli" 2>/dev/null
+	pkill -9 -f "bpcounter" 2>/dev/null
+	ionstop >/dev/null 2>&1
+	killm >/dev/null 2>&1
+}
+
+trap 'cleanup_ion; exit 130' INT TERM
+
+# Bring up the single node with the convergence layer this mode selects.
+start_node()
+{
+	mode="$1"
+	proto="$(mode_proto "$mode")"
+	duct="127.0.0.1:$(mode_port "$mode")"
+	daemon="$(mode_daemon "$mode")"
+	clicmd="$(mode_clicmd "$mode")"
+
+	sed -e "s|PROTO|${proto}|g" -e "s|DUCT|${duct}|g" \
+		-e "s|CLICMD|${clicmd}|g" \
+		-e "s|config/bench.ipnrc|config/bench_runtime.ipnrc|g" \
+		"${CONFIGDIR}/bench.bprc" > "${CONFIGDIR}/bench_runtime.bprc"
+	sed -e "s|PROTO|${proto}|g" -e "s|DUCT|${duct}|g" \
+		"${CONFIGDIR}/bench.ipnrc" > "${CONFIGDIR}/bench_runtime.ipnrc"
+
+	cleanup_ion
+	sleep 1
+	ionadmin "${CONFIGDIR}/bench.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/bench_runtime.bprc" >/dev/null 2>&1
+
+	# Wait for the CLA rather than assume it: bpadmin returns as soon as it
+	# has spawned the task, which still has ION to attach to.
+	for _ in $(seq 1 15); do
+		pgrep -f "$daemon" >/dev/null && break
+		sleep 1
+	done
+
+	if ! pgrep -f "$daemon" >/dev/null; then
+		echo "ERROR: $daemon did not start in mode '$mode'." >&2
+		grep -iE "$daemon|can't|error" ion.log 2>/dev/null | tail -10
+		cleanup_ion
+		exit 1
+	fi
+
+	sleep 2
+}
+
+# What bpcounter has counted so far: it prints as it goes, and prints a
+# final report when interrupted, so a run that never completes is still
+# measured.
+received_so_far()
+{
+	grep -oiE "bundles received: [0-9]+" counter.out 2>/dev/null \
+		| tail -1 | grep -oE "[0-9]+"
+}
+
+# Send this size's share of the byte budget through the link, and report
+# what arrived.
+measure()
+{
+	mode="$1"
+	size="$2"
+	count="$(bundles_for "$size")"
+
+	: > counter.out
+
+	bpcounter ipn:1.2 "$count" > counter.out 2>&1 &
+	cpid=$!
+	sleep 1
+
+	# A negative size selects bpdriver's streaming mode (no per-bundle ack),
+	# which is the mode paired with bpcounter.
+	bpdriver "$count" ipn:1.1 ipn:1.2 "-$size" >/dev/null 2>&1
+
+	# Wait for the receiver, but give up once bundles have stopped arriving,
+	# so that a wedged run still yields a number instead of hanging.
+	last=""
+	stalled=0
+	while kill -0 "$cpid" 2>/dev/null; do
+		sleep 1
+		now="$(received_so_far)"
+		if [ "$now" = "$last" ]; then
+			stalled=$((stalled + 1))
+			[ "$stalled" -ge "$STALL_SECS" ] && break
+		else
+			stalled=0
+			last="$now"
+		fi
+	done
+
+	# SIGINT, not SIGKILL: bpcounter reports its count, its elapsed time and
+	# its throughput when interrupted, so an incomplete run is still measured.
+	if kill -0 "$cpid" 2>/dev/null; then
+		kill -INT "$cpid" 2>/dev/null
+		sleep 2
+	fi
+
+	wait "$cpid" 2>/dev/null
+	kill -9 "$cpid" 2>/dev/null
+
+	rcvd="$(received_so_far)"
+	[ -z "$rcvd" ] && rcvd=0
+
+	# bpcounter reports via PUTMEMO, which lands in counter.out or ion.log.
+	mbps=$(grep -h "Throughput (Mbps)" counter.out ion.log 2>/dev/null | tail -1 \
+		| sed -E 's/.*Throughput \(Mbps\)[: ]+([0-9.]+).*/\1/')
+	secs=$(grep -h "Time (seconds)" counter.out ion.log 2>/dev/null | tail -1 \
+		| sed -E 's/.*Time \(seconds\)[: ]+([0-9.]+).*/\1/')
+	[ -z "$mbps" ] && mbps="n/a"
+	[ -z "$secs" ] && secs="n/a"
+
+	if [ "$secs" != "n/a" ] && [ "$secs" != "0.000" ] && [ "$rcvd" -gt 0 ]; then
+		bps=$(awk -v c="$rcvd" -v s="$secs" 'BEGIN{printf "%.0f", c/s}')
+	else
+		bps="n/a"
+	fi
+
+	printf '%-11s %9s %7s %9s %8s %11s %11s\n' \
+		"$mode" "$size" "$count" "$rcvd" "$secs" "$mbps" "$bps"
+	echo "${mode},${size},${count},${rcvd},${secs},${mbps},${bps}" >> "$RESULTS"
+
+	# Both TCPCL versions are reliable: they retransmit until the peer
+	# acknowledges, so a short count means the run was cut off with bundles
+	# still in flight, not that any were dropped.  The usual cause is the
+	# SDR heap: check TOTALBYTES against heapWords in bench.ionconfig.
+	if [ "$rcvd" -lt "$count" ]; then
+		echo "  note: $mode delivered $rcvd of $count; the run was cut off" \
+			"after ${STALL_SECS}s without an arrival. Raise STALL_SECS," \
+			"or lower TOTALBYTES." >&2
+	fi
+
+	sleep 2
+}
+
+echo "TCPCLv4 CLA benchmark: modes [$BENCH_MODES]," \
+	"$((TOTALBYTES / 1000000)) MB per size (max $MAXBUNDLES bundles)," \
+	"sizes ${MESSAGE_SIZE_MIN}..${MESSAGE_SIZE_MAX}"
+
+cleanup_ion
+sleep 1
+rm -f ion.log server.pem server.key counter.out
+echo "mode,size_bytes,sent,received,seconds,mbps,bundles_per_s" > "$RESULTS"
+
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ]; then
+	echo "ERROR: could not generate a certificate." >&2
+	exit 1
+fi
+
+printf '%-11s %9s %7s %9s %8s %11s %11s\n' \
+	"mode" "size(B)" "sent" "received" "sec" "Mbps" "bundles/s"
+
+for mode in $BENCH_MODES; do
+	start_node "$mode"
+
+	size="$MESSAGE_SIZE_MIN"
+	while [ "$size" -le "$MESSAGE_SIZE_MAX" ]; do
+		measure "$mode" "$size"
+		size=$((size * 2))
+	done
+done
+
+echo "Results written to $RESULTS"
+cleanup_ion
+trap - INT TERM
+rm -f server.pem server.key counter.out bpdriverAduFile
+rm -f "${CONFIGDIR}/bench_runtime.bprc" "${CONFIGDIR}/bench_runtime.ipnrc"

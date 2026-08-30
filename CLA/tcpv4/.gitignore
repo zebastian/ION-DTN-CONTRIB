@@ -1,0 +1,33 @@
+# test run artifacts
+tests/*/ion.log
+tests/*/config/*_runtime.*
+tests/*/server.pem
+tests/*/server.key
+tests/*/testfile*
+tests/*/sendfile
+tests/*/bigfile
+tests/*/counter.out
+tests/*/bpacq.*
+tests/*/bpdriverAduFile
+
+# bench run artifacts
+bench/ion.log
+bench/results.csv
+bench/server.pem
+bench/server.key
+bench/counter.out
+bench/config/bench_runtime.*
+bench/bpacq.*
+bench/bpdriverAduFile
+
+# Generated man pages
+doc/*.1
+
+# Built daemon
+tcpv4cla
+
+# make check artifacts
+tcpv4msg_test
+tcpv4msg_test.log
+tcpv4msg_test.trs
+test-suite.log
