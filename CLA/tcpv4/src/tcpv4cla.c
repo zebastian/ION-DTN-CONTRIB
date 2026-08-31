@@ -161,6 +161,39 @@ static void pauseReceivers(void)
 	pthread_mutex_unlock(&ReceiversMutex);
 }
 
+/*	ION acquires a bundle into the SDR heap only while it fits
+ *	maxAcqInHeap - bpadmin's "m heapmax" - and writes it to a file
+ *	otherwise, one open/write/close/unlink per bundle.  That costs far
+ *	more than this convergence layer does, and the default is 560
+ *	bytes, so a node that has not raised it spools very nearly every
+ *	bundle through the file system.  The cliff is silent, so say so.	*/
+
+static void checkAcqHeapMax(int transferMru)
+{
+	Sdr sdr = getIonsdr();
+	OBJ_POINTER(BpDB, bpdb);
+	unsigned int maxAcqInHeap;
+	char	     txt[512];
+
+	CHKVOID(sdr_begin_xn(sdr));
+	GET_OBJ_POINTER(sdr, BpDB, bpdb, getBpDbObject());
+	maxAcqInHeap = bpdb->maxAcqInHeap;
+	sdr_exit_xn(sdr);
+
+	if (maxAcqInHeap >= (unsigned int) transferMru)
+	{
+		return;
+	}
+
+	isprintf(txt, sizeof(txt),
+			"[?] tcpv4cla: ION acquires at most %u bytes into the"
+			" heap, below this induct's Transfer MRU of %d;"
+			" every larger bundle is spooled through a file on"
+			" reception.  Consider 'm heapmax %d' in bpadmin.",
+			maxAcqInHeap, transferMru, transferMru);
+	writeMemo(txt);
+}
+
 /*	*	*	Transmission	*	*	*	*	*/
 
 /*	Parse the node number from an "ipn:<node>[.<service>]" EID.  Returns
@@ -443,8 +476,13 @@ int main(int argc, char *argv[])
 	if (ductName == NULL)
 	{
 		PUTS("Usage: tcpv4cla -c cert -k key [-C cafile] [-n] "
-		     "[-T require|prefer|none] [-K keepalive] [-t idlesec] "
-		     "[-S segmentmru] [-M transfermru] <host[:port]>");
+		     "[-T require|prefer|none] [-E require|prefer|none] "
+		     "[-K keepalive] [-t idlesec] [-S segmentmru] "
+		     "[-M transfermru] [-r rcvbuf] [-w sndbuf] "
+		     "<host[:port]>");
+		PUTS("  -r/-w set SO_RCVBUF/SO_SNDBUF; leaving them at 0 "
+		     "keeps the kernel's socket buffer autotuning, which "
+		     "is usually the better choice.");
 		return 0;
 	}
 
@@ -481,6 +519,8 @@ int main(int argc, char *argv[])
 				itoa(vduct->cliPid));
 		return -1;
 	}
+
+	checkAcqHeapMax(cfg.transferMru);
 
 	RxInduct = vduct;
 	rx.open = rxOpen;

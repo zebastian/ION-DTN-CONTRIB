@@ -135,6 +135,30 @@ and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
 Note that ION's own `tcp` protocol (TCPCLv3, `tcpcli`) also defaults to port
 4556; give one of them a different port if both run on the same node.
 
+### Tuning
+
+**Set `m heapmax` in your `bprc`.** This is by far the largest throughput
+lever, and it is not in this CLA at all. ION acquires a received bundle into
+the SDR heap only while it fits `maxAcqInHeap`, and otherwise spools it
+through a file — one `open`/`write`/`close`/`unlink` per bundle. The default
+is **560 bytes**, so a node that has not raised it writes very nearly every
+bundle to disk on reception. Raising it to the largest bundle you expect
+(here, the Transfer MRU) is worth 40–80% of throughput on its own, and helps
+`tcpcli` exactly as much. `tcpv4cla` logs a warning at start-up when
+`maxAcqInHeap` is below its advertised Transfer MRU:
+
+```
+m heapmax 262144
+```
+
+The SDR heap has to be sized for it (`heapWords` in the `.ionconfig`).
+
+`-r`/`-w` set `SO_RCVBUF`/`SO_SNDBUF`. Leave them at 0 unless you have
+measured a reason not to: setting either one **disables Linux's socket buffer
+autotuning**, so a hand-set value is usually worse than the default, and on a
+high bandwidth-delay path it is the autotuned maximum (`net.ipv4.tcp_rmem`)
+you want to raise instead.
+
 **Two ION limits constrain the induct command**, and both fail in ways that do
 not name themselves. ION stores the command as an SDR string capped at
 `MAX_SDRSTRING` (255) characters and truncates past that, so a long

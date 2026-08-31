@@ -2,6 +2,12 @@
 # substituted at runtime, one set per mode being measured, so that every
 # mode is driven through exactly the same node configuration.
 1
+# ION acquires a bundle into the SDR heap only while it fits
+# maxAcqInHeap, and spools it through a file otherwise - one
+# open/write/close/unlink per bundle, which costs far more than the
+# convergence layer does.  The default is 560 bytes, so without this
+# line essentially every bundle is written to disk on reception.
+m heapmax 262144
 a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
