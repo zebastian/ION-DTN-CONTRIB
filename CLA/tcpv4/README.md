@@ -148,7 +148,8 @@ these limits before starting ION so the failure is legible.
 ## Layout
 
 ```
-src/tcpv4cla.h          constants, config, duct/arg parsing
+src/tcpv4cla.h          constants and configuration struct
+src/tcpv4cfg.c          duct-name and command-line argument parsing
 src/tcpv4msg.{c,h}      RFC 9174 wire-message codec (dependency-free)
 src/tcpv4tls.h          TLS backend interface
 src/tcpv4tls_gnutls.c   GnuTLS backend (TLS 1.3)

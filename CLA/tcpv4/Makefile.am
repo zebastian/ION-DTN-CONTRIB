@@ -21,8 +21,8 @@ TCPV4_TLS_SOURCES = src/tcpv4tls_gnutls.c
 TCPV4_SESSION_SOURCES = src/tcpv4session.c src/tcpv4io.c \
 	src/tcpv4negotiate.c src/tcpv4rx.c src/tcpv4tx.c
 
-tcpv4cla_SOURCES = src/tcpv4cla.c $(TCPV4_SESSION_SOURCES) src/tcpv4msg.c \
-	$(TCPV4_TLS_SOURCES)
+tcpv4cla_SOURCES = src/tcpv4cla.c src/tcpv4cfg.c $(TCPV4_SESSION_SOURCES) \
+	src/tcpv4msg.c $(TCPV4_TLS_SOURCES)
 tcpv4cla_LDADD = $(ION_LIBS) $(TCPV4_LIBS) -lpthread
 
 # --- unit tests (make check) --- #
