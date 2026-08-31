@@ -68,6 +68,46 @@ Tcpv4TlsCreds *tcpv4TlsCredsNew(const Tcpv4ClaConfig *cfg, int isServer)
 		gnutls_certificate_set_x509_system_trust(creds->cred);
 	}
 
+	/*	RFC 9174 4.4.4.1 has the entity perform the certification
+	 *	path validation of RFC 5280, of which checking whether the
+	 *	issuer has withdrawn the certificate is a part (RFC 5280
+	 *	6.3).  The RFC names OCSP as the way to ask that question
+	 *	and puts the distribution of revocation lists outside its
+	 *	scope (1.1), but a list is a file, and a file is something
+	 *	a disconnected node can be given in advance - or carried
+	 *	one over the DTN itself - where an OCSP responder is
+	 *	something it may have no way to reach.
+	 *
+	 *	The lists have to be loaded after the trust anchors, which
+	 *	GnuTLS requires, and the check is turned on only when at
+	 *	least one list was loaded, so that a node without -R
+	 *	behaves exactly as before.				*/
+
+	if (cfg->crlFile[0] != '\0')
+	{
+		int rc = gnutls_certificate_set_x509_crl_file(creds->cred,
+				cfg->crlFile, GNUTLS_X509_FMT_PEM);
+
+		/*	An operator who asked for revocation checking has
+		 *	to be told when it is not happening: a file that
+		 *	cannot be read, or that holds no list, leaves the
+		 *	node believing it checks revocation when it does
+		 *	not.  So this is fatal rather than a warning.	*/
+
+		if (rc < 1)
+		{
+			putErrmsg("tcpv4cla: can't load CRL file.",
+					rc < 0 ? (char *) gnutls_strerror(rc)
+					       : (char *) cfg->crlFile);
+			gnutls_certificate_free_credentials(creds->cred);
+			MRELEASE(creds);
+			return NULL;
+		}
+
+		gnutls_certificate_set_flags(creds->cred,
+				GNUTLS_CERTIFICATE_VERIFY_CRLS);
+	}
+
 	/*	RFC 9174 4.4.3: the passive entity supplies a certificate
 	 *	and the active entity supplies one in response to the
 	 *	passive entity's certificate request, so both roles load
@@ -200,6 +240,27 @@ Tcpv4TlsConn *tcpv4TlsHandshake(const Tcpv4ClaConfig *cfg,
 
 	if (rc < 0)
 	{
+		/*	"Certificate error" tells an operator nothing about
+		 *	which of the checks of RFC 9174 4.4.4 said no.  A
+		 *	withdrawn certificate in particular is a fact about
+		 *	the peer rather than about this node's
+		 *	configuration, and worth naming as such.	*/
+
+		unsigned int status = 0;
+
+		if (!cfg->noVerify)
+		{
+			status = gnutls_session_get_verify_cert_status(
+					conn->session);
+		}
+
+		if (status & GNUTLS_CERT_REVOKED)
+		{
+			writeMemoNote("[?] tcpv4cla: peer's certificate has"
+				      " been revoked by its issuer;",
+					(char *) hostName);
+		}
+
 		putErrmsg("tcpv4cla: TLS handshake failed.",
 				(char *) gnutls_strerror(rc));
 		gnutls_deinit(conn->session);

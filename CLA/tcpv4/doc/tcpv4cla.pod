@@ -4,7 +4,7 @@ tcpv4cla - DTN TCPCLv4 convergence layer task
 
 =head1 SYNOPSIS
 
-B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-n>]
+B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-R> I<crlfile>] [B<-n>]
 [B<-T> I<policy>] [B<-E> I<policy>] [B<-K> I<keepalive>] [B<-t> I<idlesec>]
 [B<-S> I<segmentmru>] [B<-M> I<transfermru>] [B<-r> I<bytes>]
 [B<-w> I<bytes>] [B<-L> I<sessions>] [B<-P> I<priority>] I<host>[:I<port>]
@@ -71,6 +71,20 @@ Private key (PEM).  Required unless B<-T none>.
 PEM file of trusted CA certificates, used to verify both peers that connect
 to this node and peers this node connects to.  Without it the system trust
 store is used.
+
+=item B<-R> I<crlfile>
+
+Certificate revocation lists (PEM).  RFC 9174 section 4.4.4.1 makes the
+certification path validation of RFC 5280 mandatory, and checking whether the
+issuer has withdrawn a certificate is part of it (RFC 5280 section 6.3).  The
+RFC names OCSP as the mechanism and leaves the distribution of revocation
+lists out of scope; a list is used here because it is a file, which a
+disconnected node can be given in advance, where an OCSP responder may be
+unreachable.
+
+A file that cannot be read, or that holds no list, stops the daemon rather
+than leaving it to run as though revocation were being checked.  Giving
+B<-R> together with B<-n> is an error.
 
 =item B<-n>
 

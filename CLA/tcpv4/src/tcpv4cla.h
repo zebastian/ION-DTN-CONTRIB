@@ -87,6 +87,7 @@ typedef struct
 	char certFile[TCPV4_MAX_PATH_LEN]; /* end-entity cert (PEM).	*/
 	char keyFile[TCPV4_MAX_PATH_LEN];  /* private key (PEM).	*/
 	char caFile[TCPV4_MAX_PATH_LEN];   /* trust anchors (PEM).	*/
+	char crlFile[TCPV4_MAX_PATH_LEN];  /* revocation lists (PEM).	*/
 	int  noVerify;			   /* skip peer verification.	*/
 	int  tlsPolicy;			   /* TCPV4_TLS_*.		*/
 	int  eidPolicy;			   /* TCPV4_EIDPOL_*.		*/
@@ -116,6 +117,7 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port);
  *   -c <certfile>  end-entity certificate (PEM)  [required unless -T none]
  *   -k <keyfile>   private key (PEM)             [required unless -T none]
  *   -C <cafile>    CA trust anchors (PEM)
+ *   -R <crlfile>   certificate revocation lists (PEM)
  *   -n             do not verify the peer certificate
  *   -T <policy>    TLS policy: require (default), prefer, none
  *   -E <policy>    NODE-ID authentication: require (default), prefer, none

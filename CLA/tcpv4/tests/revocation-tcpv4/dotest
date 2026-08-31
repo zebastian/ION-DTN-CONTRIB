@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+#
+# Certificate revocation test for the TCPCLv4 CLA (RFC 9174 4.4.4.1).
+#
+# 4.4.4.1 has the entity "perform the certification path validation
+# described in [RFC5280] up to one of the entity's trusted CA
+# certificates", and RFC 5280 6.3 makes checking whether the issuer has
+# withdrawn the certificate part of that validation.  The RFC names OCSP
+# as the way to ask (4.4.4.1, if enabled by local policy) and puts the
+# distribution of revocation lists out of its own scope (1.1) - but a
+# list is a file, and a file can reach a disconnected node where an OCSP
+# responder cannot.
+#
+# Three phases against a real CA, since a self-signed certificate has no
+# issuer to withdraw it:
+#
+#   valid        the CRL names nothing; the session comes up and carries
+#                a bundle.
+#   revoked      the CA withdraws the node's certificate and reissues the
+#                CRL; no session, and the log says why.
+#   broken CRL   -R names a file that is not a CRL.  The daemon must
+#                refuse to start rather than run on believing it checks
+#                revocation when it does not.
+#
+# Requires openssl plus the standard bp test tools.
+#
+
+TCP_PORT="${TCPV4_PORT:-4762}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+CONFIGDIR="./config"
+
+# Short path, and short names within it: ION caps an induct command at
+# 255 characters and 11 arguments, the duct name included.  The command
+# below is 10 arguments, so there is no room for another option.
+CADIR="${TMPDIR:-/tmp}/tcpv4cla-crl"
+CA="$CADIR/ca.pem"
+CERT="$CADIR/n.pem"
+KEY="$CADIR/n.key"
+CRL="$CADIR/crl.pem"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing RFC 9174 4.4.4.1 path validation, that a"
+echo "         certificate its issuer has revoked is refused."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+pass() { echo "  PASS: $1"; }
+
+for t in tcpv4cla openssl bpsendfile bprecvfile; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -x tcpv4cla 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile* sendfile
+rm -rf "$CADIR"
+mkdir -p "$CADIR/newcerts" || { echo "SKIP: cannot create $CADIR."; exit 2; }
+
+head -c 512 /dev/urandom | base64 | head -c 512 > sendfile
+
+# A CA that can withdraw what it issued.  openssl needs a database to
+# revoke against, so this is the full "openssl ca" scaffold rather than
+# a bare "openssl x509 -req".
+echo "Building a CA and issuing a node certificate..."
+: > "$CADIR/index.txt"
+echo 1000 > "$CADIR/serial"
+echo 1000 > "$CADIR/crlnumber"
+cat > "$CADIR/ca.cnf" <<EOF
+[ ca ]
+default_ca = CA_default
+[ CA_default ]
+dir = $CADIR
+database = \$dir/index.txt
+new_certs_dir = \$dir/newcerts
+certificate = \$dir/ca.pem
+private_key = \$dir/ca.key
+serial = \$dir/serial
+crlnumber = \$dir/crlnumber
+default_md = sha256
+default_days = 1
+default_crl_days = 1
+policy = policy_any
+email_in_dn = no
+unique_subject = no
+[ policy_any ]
+commonName = supplied
+[ req ]
+distinguished_name = req_dn
+[ req_dn ]
+[ ca_ext ]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+[ node_ext ]
+subjectAltName = DNS:localhost,IP:127.0.0.1,otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0
+extendedKeyUsage = serverAuth,clientAuth
+keyUsage = digitalSignature
+EOF
+
+# The CA extensions come from a config section rather than -addext:
+# "req -x509" emits basicConstraints of its own, and the duplicate makes
+# the certificate unloadable ("Duplicate extension in X.509 certificate").
+openssl req -x509 -config "$CADIR/ca.cnf" -extensions ca_ext \
+	-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+	-keyout "$CADIR/ca.key" -out "$CA" -days 2 \
+	-subj "/CN=tcpv4-test-ca" >/dev/null 2>&1
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+	-keyout "$KEY" -out "$CADIR/n.csr" -subj "/CN=localhost" >/dev/null 2>&1
+openssl ca -batch -config "$CADIR/ca.cnf" -extensions node_ext \
+	-in "$CADIR/n.csr" -out "$CERT" >/dev/null 2>&1
+openssl ca -batch -config "$CADIR/ca.cnf" -gencrl -out "$CRL" >/dev/null 2>&1
+
+if [ ! -s "$CA" ] || [ ! -s "$CERT" ] || [ ! -s "$KEY" ] || [ ! -s "$CRL" ]
+then
+	echo "SKIP: could not build a CA, certificate and CRL."
+	exit 2
+fi
+
+start_node()
+{
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+		-e "s|CLICMD|tcpv4cla -c $CERT -k $KEY -C $CA -R $1|g" \
+		-e "s|config/loopback.ipnrc|config/loopback_runtime.ipnrc|g" \
+		"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+		"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+	killm >/dev/null 2>&1
+	sleep 1
+	: > ion.log
+	ionadmin "${CONFIGDIR}/loopback.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/loopback_runtime.bprc" >/dev/null 2>&1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -x tcpv4cla >/dev/null && break
+		sleep 1
+	done
+	sleep 3
+	pgrep -x tcpv4cla >/dev/null
+}
+
+stop_node()
+{
+	pkill -9 -x tcpv4cla 2>/dev/null
+	sleep 1
+	ionstop >/dev/null 2>&1
+	sleep 1
+	killm >/dev/null 2>&1
+}
+
+# A session is opened on demand, so traffic comes before the log is read.
+send_bundle()
+{
+	rm -f testfile*
+	bprecvfile ipn:1.2 & RP=$!
+	sleep 1
+	bpsendfile ipn:1.1 ipn:1.2 sendfile >/dev/null 2>&1
+	sleep 6
+	kill $RP 2>/dev/null; wait $RP 2>/dev/null
+	[ -f testfile1 ] && cmp -s sendfile testfile1
+}
+
+# --- Phase 1: a CRL that revokes nothing -------------------------------
+echo "Phase 1: a certificate the CRL does not name is accepted..."
+if ! start_node "$CRL"; then
+	echo "ERROR: daemon did not start with a valid CRL."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+send_bundle && DELIVERED=1 || DELIVERED=0
+
+if grep -q "session established" ion.log; then
+	pass "session established with revocation checking enabled."
+else
+	fail "no session established with a valid, empty CRL."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	pass "bundle delivered."
+else
+	fail "no bundle delivered with a valid, empty CRL."
+fi
+stop_node
+
+# --- Phase 2: the issuer withdraws the certificate ---------------------
+echo "Phase 2: a revoked certificate is refused..."
+openssl ca -batch -config "$CADIR/ca.cnf" -revoke "$CERT" >/dev/null 2>&1
+openssl ca -batch -config "$CADIR/ca.cnf" -gencrl -out "$CRL" >/dev/null 2>&1
+if ! openssl crl -in "$CRL" -noout -text 2>/dev/null | grep -q "Serial Number"
+then
+	echo "SKIP: could not revoke the certificate."
+	stop_node
+	exit 2
+fi
+
+if ! start_node "$CRL"; then
+	echo "ERROR: daemon did not start with the updated CRL."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+send_bundle && DELIVERED=1 || DELIVERED=0
+
+if grep -q "has been revoked" ion.log; then
+	pass "the revocation was named in the log."
+else
+	fail "the revocation was not reported."
+fi
+if grep -q "session established" ion.log; then
+	fail "a session was established on a revoked certificate."
+else
+	pass "no session established."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	fail "a bundle was delivered over a revoked certificate."
+else
+	pass "no bundle delivered."
+fi
+stop_node
+
+# --- Phase 3: a CRL file that is not a CRL -----------------------------
+# An operator who asked for revocation checking has to be told when it is
+# not happening.  Carrying on without it would leave the node believing
+# it checks revocation when it does not, which is worse than not asking.
+echo "Phase 3: an unusable CRL file stops the daemon..."
+: > ion.log
+if start_node "$CA"; then
+	fail "the daemon started with a CRL file that is not a CRL."
+	stop_node
+else
+	pass "the daemon refused to start."
+fi
+if grep -q "can't load CRL file" ion.log; then
+	pass "the reason was reported."
+else
+	fail "no reason was reported ($(tail -3 ion.log 2>/dev/null | tr '\n' ' '))."
+fi
+stop_node
+
+echo "Cleaning up..."
+rm -f testfile* sendfile bpacq.*
+rm -rf "$CADIR"
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL

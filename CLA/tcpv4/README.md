@@ -76,7 +76,7 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | NODE-ID authentication (§4.4.1, §4.4.4.3, §7.9) | implemented (`-E`); an unauthenticated node ID never attracts egress |
 | Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
 | Certificate profile, extended key usage (§4.4.2) | implemented; a certificate restricted to other purposes is refused |
-| OCSP / CRL revocation checking (§4.4.4.1) | **not implemented** |
+| Path validation and revocation (§4.4.4.1) | implemented; revocation lists via `-R` (RFC 5280 §6.3). OCSP **not implemented** |
 | TCPCLv3 fallback after "Version mismatch" (§4.3) | **not implemented** (an implementation matter; use `tcpcli` for v3 peers) |
 | Emitting session extension items | **not implemented** (none defined) |
 
@@ -116,6 +116,34 @@ egress selection too.
 Because `-n` is a decision not to authenticate the peer at all, it implies
 `-E none` unless `-E` is given explicitly — a NODE-ID in an unvalidated
 certificate proves nothing.
+
+### Revocation
+
+RFC 9174 §4.4.4.1 has the entity "perform the certification path validation
+described in [RFC5280] up to one of the entity's trusted CA certificates", and
+checking whether the issuer has withdrawn the certificate is part of that
+validation (RFC 5280 §6.3). The RFC names **OCSP** as the way to ask — "if
+enabled by local policy, the entity SHALL perform an OCSP check of each
+certificate providing OCSP authority information" — and §4.4.5 recommends
+enabling it. It says nothing about OCSP stapling, and it puts the
+"deploying or accessing [of] certificate revocation lists (CRLs)" explicitly
+out of its own scope (§1.1).
+
+`-R <crlfile>` loads revocation lists (PEM) and turns the check on. It is
+revocation lists rather than OCSP because a list is a file: it can be given to
+a node in advance, or carried to one over the DTN itself, where an OCSP
+responder is something a disconnected node may have no way to reach — and
+making session establishment wait on a live query to an internet responder,
+inside the contact timeout of §4.1, is the wrong shape for this protocol. A
+deployment that *can* reach a responder is exactly the one that should follow
+§4.4.5 and enable OCSP, which this CLA does not yet do.
+
+A file named by `-R` that cannot be read, or that holds no list, **stops the
+daemon**. An operator who asked for revocation checking has to be told when it
+is not happening; carrying on would leave the node believing it checks
+revocation when it does not, which is worse than never having asked. `-R` with
+`-n` is rejected for the same reason: revocation is a question about a
+certificate one is checking at all.
 
 ### Certificate profile
 
@@ -159,7 +187,7 @@ a outduct tcpv4 'peer.example:4556' ''
 ```
 
 Flags (on the `tcpv4cla` induct command): `-c`/`-k` cert/key, `-C` CA file,
-`-n` no-verify, `-T` TLS policy (`require`/`prefer`/`none`), `-E` NODE-ID
+`-R` CRL file, `-n` no-verify, `-T` TLS policy (`require`/`prefer`/`none`), `-E` NODE-ID
 policy (`require`/`prefer`/`none`), `-K` keepalive
 interval to propose, `-t` idle session timeout, `-S`/`-M` advertised Segment
 and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
@@ -234,6 +262,7 @@ tests/loopback-tcpv4/       single-node loopback over TLS (.optional)
 tests/loopback-tcpv4-notls/ single-node plaintext loopback (.optional)
 tests/nodeid-tcpv4/         NODE-ID authentication policy (.optional)
 tests/certprofile-tcpv4/    certificate profile / key usage (.optional)
+tests/revocation-tcpv4/     path validation against a CRL (.optional)
 tests/protocol-tcpv4/       error paths, against a synthetic peer (.optional)
 bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 bench/bench-tcpv4-impaired  the same sweep over a delayed / lossy link
@@ -329,6 +358,12 @@ limit while BP was congested.
   alone is refused, and nothing gets through; no extension at all is
   accepted, since RFC 5280 §4.2.1.12 makes that unrestricted, with the
   deviation logged.
+- `tests/revocation-tcpv4` — RFC 9174 §4.4.4.1, against a real CA, since a
+  self-signed certificate has no issuer to withdraw it: a certificate the CRL
+  does not name carries a bundle; the same certificate, once the CA has
+  revoked it and reissued the CRL, establishes no session and the log says
+  why; and a `-R` file that is not a CRL stops the daemon instead of leaving
+  it to believe it is checking.
 - `tests/nodeid-tcpv4` — RFC 9174 §4.4.4.3: with a certificate carrying no
   NODE-ID, `-E require` refuses the session with "Contact Failure" and no
   bundle gets through, while `-E prefer` keeps the session but marks the
@@ -426,6 +461,8 @@ wording is deliberately stable:
 | `peer claims an unauthenticated node ID that is not the one dialled` | the session will not be used for egress (§7.9) |
 | `peer's certificate is not valid for this role` | its extended key usage leaves out the purpose this handshake needs (§4.4.2); the session is refused |
 | `peer's certificate carries no extended key usage` | unrestricted, so usable, but not the profile §4.4.2 asks for |
+| `peer's certificate has been revoked by its issuer` | it appears on a list loaded by `-R` (§4.4.4.1, RFC 5280 §6.3) |
+| `can't load CRL file` | `-R` named something unusable; the daemon stops rather than run without the check |
 
 ## Verified by inspection
 

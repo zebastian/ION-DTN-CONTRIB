@@ -86,6 +86,7 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port)
  *   -c <certfile>  end-entity certificate (PEM)  [required unless -T none]
  *   -k <keyfile>   private key (PEM)             [required unless -T none]
  *   -C <cafile>    CA trust anchors (PEM)
+ *   -R <crlfile>   certificate revocation lists (PEM)
  *   -n             do not verify the peer certificate
  *   -T <policy>    TLS policy: require (default), prefer, none
  *   -E <policy>    NODE-ID authentication: require (default), prefer, none
@@ -129,6 +130,10 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 		else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc)
 		{
 			istrcpy(cfg->caFile, argv[++i], TCPV4_MAX_PATH_LEN);
+		}
+		else if (strcmp(argv[i], "-R") == 0 && i + 1 < argc)
+		{
+			istrcpy(cfg->crlFile, argv[++i], TCPV4_MAX_PATH_LEN);
 		}
 		else if (strcmp(argv[i], "-n") == 0)
 		{
@@ -256,6 +261,16 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 	{
 		putErrmsg("tcpv4cla: -c and -k are required unless -T none.",
 				NULL);
+		return -1;
+	}
+
+	/*	Revocation lists say which certificates a CA has withdrawn,
+	 *	which is only a question one can ask of a certificate one
+	 *	is checking at all.				*/
+
+	if (cfg->crlFile[0] != '\0' && cfg->noVerify)
+	{
+		putErrmsg("tcpv4cla: -R is meaningless with -n.", NULL);
 		return -1;
 	}
 
