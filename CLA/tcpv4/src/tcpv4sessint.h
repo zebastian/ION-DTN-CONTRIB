@@ -19,6 +19,7 @@
 #ifndef TCPV4SESSINT_H
 #define TCPV4SESSINT_H
 
+#include <sys/uio.h>
 #include "tcpv4session.h"
 #include "tcpv4msg.h"
 #include "tcpv4tls.h"
@@ -51,17 +52,61 @@ extern "C" {
  *	twice.								*/
 #define TCPV4_RXBUF_DIRECT	 4096
 
-/*	Ceiling on how long a sender waits for a transfer to be fully
- *	acknowledged.  The clock thread normally detects a dead peer much
- *	sooner, but a session with KEEPALIVEs disabled has no such timer,
- *	so no sender is left blocked indefinitely.			*/
+/*	Ceiling on how long a sender waits for a session to this node to
+ *	become usable - to finish negotiating, or to finish the transfer
+ *	another sender is running.  Waiting longer than this serves the
+ *	bundle less well than letting BP requeue it.			*/
+#define TCPV4_CLAIM_TIMEOUT	 10
+
+/*	Ceiling on how long a sender waits for room in a session's
+ *	transmission window.  The clock thread normally detects a dead peer
+ *	much sooner, but a session with KEEPALIVEs disabled has no such
+ *	timer, so no sender is left blocked indefinitely.		*/
 #define TCPV4_XFER_TIMEOUT	 300
+
+/*	Transmission window: how many transfers may be awaiting their
+ *	XFER_ACK at once.  RFC 9174 5.2.2 forbids interleaving the segments
+ *	of two transfers within a session, but not beginning a transfer
+ *	before the previous one has been acknowledged - and it is that
+ *	which keeps a link with any appreciable round-trip time busy,
+ *	rather than idle for one round trip per bundle.
+ *
+ *	The window is bounded by octets as well as by count, because an
+ *	outstanding transfer pins its bundle's outbound ZCO space until the
+ *	acknowledgment retires it.					*/
+#define TCPV4_TX_WINDOW		 100
+#define TCPV4_TX_WINDOW_BYTES	 (4 * 1024 * 1024)
+
+/*	Octets read out of a bundle at a time.  A transfer is streamed
+ *	rather than held in memory, which bounds both a session's transmit
+ *	footprint and the length of the SDR transaction each read costs.	*/
+#define TCPV4_TXBUF_SIZE	 (64 * 1024)
+
+/*	Segments coalesced into a single write.  A peer that advertises a
+ *	small Segment MRU would otherwise cost one write per segment.	*/
+#define TCPV4_TX_SEGS_PER_WRITE	 16
 
 /*	TCPCL session states (the subset the engine acts on; RFC 9174 3.3
  *	names more, but they collapse to these for our purposes).	*/
 #define TCS_NEGOTIATING		 0 /* Contact/TLS/SESS_INIT in progress.	*/
 #define TCS_ESTABLISHED		 1 /* SESS_INIT exchanged both ways.	*/
 #define TCS_ENDING		 2 /* SESS_TERM sent or received.	*/
+
+/*	One bundle being transmitted as one TCPCL transfer.  It is created
+ *	when a sender hands the bundle over and destroyed when its outcome
+ *	has been reported, and until then it sits on exactly one of the
+ *	session's two transmission lists.				*/
+
+typedef struct Tcpv4Xfer
+{
+	struct Tcpv4Xfer *next;
+	Object		  bundle;     /* Opaque to the engine.		*/
+	vast		  length;
+	uint64_t	  transferId;
+	int		  inFlight;   /* Transmit thread still holds it.	*/
+	int		  acked;      /* Peer acknowledged all of it.	*/
+	int		  refused;    /* Peer refused it, or it failed.	*/
+} Tcpv4Xfer;
 
 typedef struct Tcpv4Conn
 {
@@ -72,7 +117,6 @@ typedef struct Tcpv4Conn
 	Tcpv4TlsConn	 *tls;	       /* NULL when TLS was not enabled.*/
 	int		  state;       /* TCS_*.			*/
 	int		  failed;
-	int		  sendBusy;    /* A sender owns the transmit side.*/
 	int		  receiverDone;
 	int		  hasReceiver;
 	int		  cleanClose; /* Session ended by SESS_TERM exchange.*/
@@ -89,15 +133,37 @@ typedef struct Tcpv4Conn
 	uint64_t segmentMtu;  /* = peer's Segment MRU.			*/
 	uint64_t transferMtu; /* = peer's Transfer MRU.			*/
 
-	/*	Transmission: one transfer in flight per session (RFC 9174
-	 *	5.2.2 forbids interleaving within a session).		*/
 	pthread_mutex_t sendMutex; /* Serialises every socket write.	*/
 	int		hasSendMutex;
+
+	/*	Transmission.  A sender thread appends to txQueue and
+	 *	returns; this session's transmit thread moves each transfer
+	 *	to txWindow before it writes the transfer's first octet and
+	 *	leaves it there until an XFER_ACK retires it.  A bundle is
+	 *	therefore on one of the two lists from before any of it is
+	 *	sent until its outcome is reported, so a session that fails
+	 *	loses none of them.  Only the transmit thread writes
+	 *	XFER_SEGMENTs, which is what keeps transfers from
+	 *	interleaving now that several may be outstanding.	*/
+	pthread_mutex_t txMutex;
+	int		hasTxMutex;
+	pthread_cond_t	txCond;
+	int		hasTxCond;
+	pthread_t	xmit;
+	int		hasXmit;
+	Tcpv4Xfer      *txQueue;      /* Awaiting transmission.		*/
+	Tcpv4Xfer      *txQueueTail;
+	Tcpv4Xfer      *txWindow;     /* Awaiting acknowledgment.	*/
+	Tcpv4Xfer      *txWindowTail;
+	int		txCount;      /* On the two lists together.	*/
+	vast		txBytes;      /* On the two lists together.	*/
+	int		txSenders;    /* Senders holding this session.	*/
 	uint64_t	nextTxId;
-	uint64_t	txId;
-	uint64_t	txAcked;   /* Cumulative XFER_ACK length.	*/
-	int		txActive;
-	int		txRefused; /* Refusal reason + 1; 0 = none.	*/
+	uint64_t	txAckedLen;   /* Ack length for the window head.	*/
+	int		txStopped;    /* No further transfers accepted.	*/
+	int		txActive;     /* txCount != 0; read unlocked by
+					 the clock thread, for the idle
+					 timer only.			*/
 
 	/*	Reception, touched only by this session's receiver thread
 	 *	(plus rxActive, which the clock thread reads).		*/
@@ -161,6 +227,7 @@ struct Tcpv4Engine
 	Tcpv4ClaConfig cfg;
 	char	       nodeId[TCPV4_MAX_NODEID_LEN];
 	Tcpv4Receiver  rx;
+	Tcpv4Transmitter tx;
 
 	Tcpv4TlsCreds *serverCreds; /* TLS server role (passive entity).	*/
 	Tcpv4TlsCreds *clientCreds; /* TLS client role (active entity).	*/
@@ -192,11 +259,6 @@ void tcpv4ConnStartBuffering(Tcpv4Conn *conn);
  *	whole message.  Returns 0 on success, -1 on failure.		*/
 int tcpv4ConnSend(Tcpv4Conn *conn, const void *data, int len);
 
-/*	Send a message header and its payload as one unit, so that a
- *	transfer segment costs one write.  Caller holds sendMutex.	*/
-int tcpv4ConnSendSegment(Tcpv4Conn *conn, const void *hdr, int hdrLen,
-		const void *data, int dataLen);
-
 /*	Apply the socket options every TCPCL socket wants.		*/
 void tcpv4TuneSocket(const Tcpv4ClaConfig *cfg, int sock);
 
@@ -217,6 +279,33 @@ int tcpv4SendXferRefuse(Tcpv4Conn *conn, uint8_t reason, uint64_t transferId);
  *	Returns 0 with the session established, -1 otherwise.		*/
 int tcpv4Establish(Tcpv4Conn *conn);
 
+/*	Send a sequence of buffers as one write, so that a run of segments
+ *	costs one call rather than one per segment.  Caller holds
+ *	sendMutex.							*/
+int tcpv4ConnSendIov(Tcpv4Conn *conn, struct iovec *iov, int count);
+
+/*	*	*	tcpv4tx.c: transmission	*	*	*	*/
+
+/*	The transmit thread of an established session: writes the queued
+ *	transfers, one at a time, streaming each out of its bundle.	*/
+void *tcpv4XmitThread(void *parm);
+
+/*	Stop accepting transfers and wake everyone waiting on the window,
+ *	so the transmit thread and any blocked sender can leave.	*/
+void tcpv4TxStop(Tcpv4Conn *conn);
+
+/*	Report the outcome of every transfer still queued or outstanding,
+ *	as a failure, and free them.  Called once the session's threads
+ *	have been joined and no sender still holds the session.		*/
+void tcpv4TxDrain(Tcpv4Conn *conn);
+
+/*	A windowed transfer is finished once the transmit thread has let go
+ *	of it and the peer has either acknowledged all of it or refused it.
+ *	Unlinks and returns it, or NULL when it is not finished yet.
+ *	Called with txMutex held; the caller reports the outcome after
+ *	unlocking, because that call reaches into BP.			*/
+Tcpv4Xfer *tcpv4TxFinished(Tcpv4Conn *conn, Tcpv4Xfer *x);
+
 /*	*	*	tcpv4rx.c: reception	*	*	*	*/
 
 /*	The delivery thread of an established session: hands reassembled
@@ -234,7 +323,8 @@ int tcpv4MessageLoop(Tcpv4Conn *conn);
 
 /*	Open a session to a peer, honouring the reconnection backoff of
  *	RFC 9174 4.1.  Returns 0 when a session is opening or open, -1 when
- *	no attempt was made.  Called with e->mutex held.		*/
+ *	no attempt was made.  Takes e->mutex itself, so the caller must
+ *	not hold it.							*/
 int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName);
 
 #ifdef __cplusplus

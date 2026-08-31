@@ -430,7 +430,9 @@ static int handleXferAck(Tcpv4Conn *conn)
 	Tcpv4Engine *e = conn->owner;
 	Tcpv4XferAck ack;
 	uint8_t	     buf[18];
-	int	     known;
+	Tcpv4Xfer   *done = NULL;
+	Tcpv4Xfer   *head;
+	int	     unexpected = 0;
 
 	buf[0] = TMSG_XFER_ACK;
 	if (tcpv4ConnRecv(conn, buf + 1, 17) != 17)
@@ -443,23 +445,52 @@ static int handleXferAck(Tcpv4Conn *conn)
 		return -1;
 	}
 
-	pthread_mutex_lock(&e->mutex);
-	known = (conn->txActive && ack.transferId == conn->txId);
-	if (known)
+	pthread_mutex_lock(&conn->txMutex);
+	head = conn->txWindow;
+	if (head == NULL || ack.transferId != head->transferId)
 	{
-		conn->txAcked = ack.ackLength;
-		pthread_cond_broadcast(&e->cond);
+		/*	RFC 9174 5.2.2 keeps a session's transfers in
+		 *	sequence, so an acknowledgment can only be for the
+		 *	oldest one still outstanding.  5.1.2 names anything
+		 *	else a "Message Unexpected" case, which does not
+		 *	require closing the session.			*/
+
+		unexpected = 1;
+	}
+	else if (ack.ackLength <= conn->txAckedLen
+			|| ack.ackLength > (uint64_t) head->length)
+	{
+		/*	A cumulative length that does not advance, or that
+		 *	claims more than was sent, tells us nothing usable
+		 *	about the transfer; give up on it.		*/
+
+		unexpected = 1;
+		head->refused = 1;
+		done = tcpv4TxFinished(conn, head);
+	}
+	else
+	{
+		conn->txAckedLen = ack.ackLength;
+		if (conn->txAckedLen == (uint64_t) head->length)
+		{
+			head->acked = 1;
+			done = tcpv4TxFinished(conn, head);
+		}
 	}
 
-	pthread_mutex_unlock(&e->mutex);
+	pthread_mutex_unlock(&conn->txMutex);
 
-	if (!known)
+	if (done != NULL)
 	{
-		/*	RFC 9174 5.1.2 names an XFER_ACK with an unknown
-		 *	Transfer ID as a "Message Unexpected" case; it does
-		 *	not require closing the session.		*/
+		e->tx.done(e->tx.user, done->bundle,
+				done->acked && !done->refused);
+		MRELEASE(done);
+	}
 
-		oK(tcpv4SendMsgReject(conn, TMSG_REJECT_UNEXPECTED, TMSG_XFER_ACK));
+	if (unexpected)
+	{
+		oK(tcpv4SendMsgReject(conn, TMSG_REJECT_UNEXPECTED,
+				TMSG_XFER_ACK));
 	}
 
 	return 0;
@@ -470,7 +501,8 @@ static int handleXferRefuse(Tcpv4Conn *conn)
 	Tcpv4Engine    *e = conn->owner;
 	Tcpv4XferRefuse refuse;
 	uint8_t		buf[10];
-	int		known;
+	Tcpv4Xfer      *done = NULL;
+	Tcpv4Xfer      *x;
 
 	buf[0] = TMSG_XFER_REFUSE;
 	if (tcpv4ConnRecv(conn, buf + 1, 9) != 9)
@@ -483,17 +515,35 @@ static int handleXferRefuse(Tcpv4Conn *conn)
 		return -1;
 	}
 
-	pthread_mutex_lock(&e->mutex);
-	known = (conn->txActive && refuse.transferId == conn->txId);
-	if (known)
+	pthread_mutex_lock(&conn->txMutex);
+	for (x = conn->txWindow; x != NULL; x = x->next)
 	{
-		conn->txRefused = refuse.reason + 1;
-		pthread_cond_broadcast(&e->cond);
+		if (x->transferId == refuse.transferId)
+		{
+			break;
+		}
 	}
 
-	pthread_mutex_unlock(&e->mutex);
+	if (x != NULL)
+	{
+		/*	The transmit thread stops sending the rest of a
+		 *	refused transfer when it next looks; whichever of
+		 *	the two lets go of it last retires it.		*/
 
-	if (known)
+		x->refused = 1;
+		done = tcpv4TxFinished(conn, x);
+		pthread_cond_broadcast(&conn->txCond);
+	}
+
+	pthread_mutex_unlock(&conn->txMutex);
+
+	if (done != NULL)
+	{
+		e->tx.done(e->tx.user, done->bundle, 0);
+		MRELEASE(done);
+	}
+
+	if (x != NULL)
 	{
 		writeMemoNote("[i] tcpv4cla transfer refused by",
 				conn->peerName);

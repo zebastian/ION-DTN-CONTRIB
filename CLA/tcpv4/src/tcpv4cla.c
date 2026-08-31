@@ -211,28 +211,106 @@ static uvast nodeNbrFromEid(const char *eid)
 	return node;
 }
 
-/*	Drain one tcpv4 outduct, transmitting each bundle over the session
- *	to the neighbour (opening one on demand, or reusing an accepted
- *	one).								*/
+/*	The engine reads a bundle's octets through these, so that it needs
+ *	to know nothing of ZCOs or of BP.  A bundle is streamed out a
+ *	bufferful at a time rather than copied whole into memory, which
+ *	keeps each SDR transaction short - the SDR lock is held against
+ *	every other ION task for its duration - and takes the ceiling off
+ *	how large a bundle this CLA can send.				*/
+
+typedef struct
+{
+	Object	  bundle;
+	ZcoReader reader;
+} Tcpv4TxCursor;
+
+static int txOpen(void *user, Object bundle, void **cursor)
+{
+	Tcpv4TxCursor *c;
+
+	(void) user;
+
+	c = MTAKE(sizeof(Tcpv4TxCursor));
+	if (c == NULL)
+	{
+		putErrmsg("tcpv4cla: no memory for a transmission cursor.",
+				NULL);
+		return -1;
+	}
+
+	c->bundle = bundle;
+	zco_start_transmitting(bundle, &c->reader);
+	zco_track_file_offset(&c->reader);
+	*cursor = c;
+	return 0;
+}
+
+static int txRead(void *user, void *cursor, char *into, int len)
+{
+	Sdr	       sdr = getIonsdr();
+	Tcpv4TxCursor *c = cursor;
+	int	       got;
+
+	(void) user;
+
+	CHKERR(sdr_begin_xn(sdr));
+	got = zco_transmit(sdr, &c->reader, len, into);
+	if (sdr_end_xn(sdr) < 0)
+	{
+		putErrmsg("tcpv4cla: can't issue from ZCO.", NULL);
+		return -1;
+	}
+
+	return got;
+}
+
+static void txClose(void *user, void *cursor)
+{
+	(void) user;
+
+	MRELEASE(cursor);
+}
+
+/*	Report one transfer's outcome to BP.  This runs on whichever engine
+ *	thread established it - the receiver thread when an XFER_ACK
+ *	completes the transfer, the clock thread when a failed session is
+ *	reaped - and every bundle handed to the engine reaches it once.	*/
+
+static void txDone(void *user, Object bundle, int succeeded)
+{
+	(void) user;
+
+	if (succeeded)
+	{
+		if (bpHandleXmitSuccess(bundle) < 0)
+		{
+			putErrmsg("tcpv4cla can't handle xmit success.", NULL);
+			ionKillMainThread("tcpv4cla");
+		}
+
+		return;
+	}
+
+	if (bpHandleXmitFailure(bundle) < 0)
+	{
+		putErrmsg("tcpv4cla can't handle xmit failure.", NULL);
+		ionKillMainThread("tcpv4cla");
+	}
+}
+
+/*	Drain one tcpv4 outduct, handing each bundle to the session to the
+ *	neighbour (opening one on demand, or reusing an accepted one).
+ *	The hand-off does not wait for the bundle to be written, let alone
+ *	acknowledged, so this thread goes straight back to the outduct and
+ *	several transfers are in flight at once.			*/
 
 static void *senderThread(void *parm)
 {
 	Tcpv4Neighbor  *nb = parm;
 	Sdr		sdr = getIonsdr();
-	unsigned char  *buffer;
 	Object		bundleZco;
 	BpAncillaryData ancillaryData;
-	unsigned int	bundleLength;
-	ZcoReader	reader;
-	int		bytesToSend;
-
-	buffer = MTAKE(TCPV4CLA_BUFSZ);
-	if (buffer == NULL)
-	{
-		putErrmsg("No memory for TCP buffer in tcpv4cla.", NULL);
-		ionKillMainThread("tcpv4cla");
-		return NULL;
-	}
+	vast		bundleLength;
 
 	/*	Adopt the outduct: mark it serviced by this thread and make
 	 *	sure its semaphore is live so bpDequeue can be woken.	*/
@@ -263,53 +341,24 @@ static void *senderThread(void *parm)
 		bundleLength = zco_length(sdr, bundleZco);
 		sdr_exit_xn(sdr);
 
-		if (bundleLength > TCPV4CLA_BUFSZ)
-		{
-			putErrmsg("Bundle too big for TCPCLv4 CLA buffer.",
-					itoa(bundleLength));
-			if (bpHandleXmitFailure(bundleZco) < 0)
-			{
-				break;
-			}
-
-			continue;
-		}
-
-		zco_start_transmitting(bundleZco, &reader);
-		zco_track_file_offset(&reader);
-		CHKNULL(sdr_begin_xn(sdr));
-		bytesToSend = zco_transmit(sdr, &reader, TCPV4CLA_BUFSZ,
-				(char *) buffer);
-		if (sdr_end_xn(sdr) < 0 || bytesToSend < 0)
-		{
-			putErrmsg("Can't issue from ZCO.", NULL);
-			break;
-		}
+		/*	From here the engine owns the bundle and reports its
+		 *	outcome through txDone - unless it declines it, in
+		 *	which case it is still ours to requeue.		*/
 
 		if (tcpv4EngineSendTo(Engine, nb->nodeNbr, nb->outductName,
-				    buffer, bytesToSend)
+				    bundleZco, bundleLength)
 				< 0)
 		{
-			writeMemo("[?] tcpv4cla: transfer failed; will retry.");
+			writeMemo("[?] tcpv4cla: no session took the bundle;"
+				  " will retry.");
 			if (bpHandleXmitFailure(bundleZco) < 0)
 			{
 				break;
 			}
-
-			continue;
 		}
-
-		if (bpHandleXmitSuccess(bundleZco) < 0)
-		{
-			putErrmsg("Can't handle xmit success.", NULL);
-			break;
-		}
-
-		sm_TaskYield();
 	}
 
 	nb->vduct->hasThread = 0;
-	MRELEASE(buffer);
 	return NULL;
 }
 
@@ -470,6 +519,7 @@ int main(int argc, char *argv[])
 	PsmAddress     vductElt;
 	Tcpv4ClaConfig cfg;
 	Tcpv4Receiver  rx;
+	Tcpv4Transmitter tx;
 	char	       hostName[TCPV4_MAX_HOST_LEN];
 	Tcpv4Neighbor *nb;
 
@@ -528,7 +578,13 @@ int main(int argc, char *argv[])
 	rx.close = rxClose;
 	rx.user = vduct;
 
-	Engine = tcpv4EngineStart(&cfg, &rx);
+	tx.open = txOpen;
+	tx.read = txRead;
+	tx.close = txClose;
+	tx.done = txDone;
+	tx.user = NULL;
+
+	Engine = tcpv4EngineStart(&cfg, &rx, &tx);
 	if (Engine == NULL)
 	{
 		putErrmsg("tcpv4cla: can't start TCPCLv4 engine.", NULL);

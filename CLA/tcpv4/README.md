@@ -35,6 +35,10 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
   messages with START/END flags. Segments are pipelined, not stop-and-wait; the
   receiver acknowledges each with a cumulative `XFER_ACK`, and the sender
   reports transmission success to BP only once the whole transfer is acked.
+  *Transfers* are pipelined too: §5.2.2 forbids interleaving the segments of
+  two transfers, but not beginning one before the previous is acknowledged, so
+  up to 100 transfers (or 4 MB) may be outstanding on a session at once. Each
+  START segment carries a Transfer Length extension item (§5.2.5.1).
 - **Refusal** (§5.2.4): an inbound transfer that would exceed the advertised
   Transfer MRU, that carries an unknown CRITICAL transfer extension item, or
   that starts while the session is Ending is answered with `XFER_REFUSE` and
@@ -57,6 +61,7 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | `XFER_SEGMENT` / `XFER_ACK`, segment pipelining (§5.2.2, §5.2.3) | implemented |
 | `XFER_REFUSE` (§5.2.4) | originated and decoded |
 | Transfer extension items (§5.2.5) | parsed; unknown CRITICAL refuses the transfer |
+| Transfer Length extension item (§5.2.5.1) | emitted and honoured |
 | `SESS_TERM`, REPLY flag, Ending state (§6.1) | implemented |
 | Idle session termination (§6.2) | implemented (`-t`) |
 | Reconnection backoff, contact timeout (§4.1) | implemented (binary backoff, capped at 60 s) |
@@ -64,7 +69,7 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
 | OCSP checking, EKU policy (§4.4.4.1) | **not implemented** |
 | TCPCLv3 fallback after "Version mismatch" (§4.3) | **not implemented** (an implementation matter; use `tcpcli` for v3 peers) |
-| Emitting session / transfer extension items | **not implemented** (none defined) |
+| Emitting session extension items | **not implemented** (none defined) |
 
 ## TLS
 
@@ -184,7 +189,7 @@ src/tcpv4session.c      engine: listening socket, session list, reconnection
 src/tcpv4io.c           message-level session I/O (framing, socket options)
 src/tcpv4negotiate.c    contact header, TLS handshake, SESS_INIT exchange
 src/tcpv4rx.c           receive path: reassembly, message loop, delivery
-src/tcpv4tx.c           send path: one bundle as one segmented transfer
+src/tcpv4tx.c           send path: transmission window and transmit thread
 src/tcpv4cla.c          daemon (accepts + opens sessions, drains outducts)
 doc/*.pod               man page sources
 tests/loopback-tcpv4/       single-node loopback over TLS (.optional)
@@ -197,10 +202,15 @@ bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 
 One accept thread; one clock thread driving keepalives, timeouts and idle
 termination for every session; one sender thread per `tcpv4` outduct, drained
-by `bpDequeue`; and two threads per established session:
+by `bpDequeue`; and three threads per established session:
 
 - the **receiver** thread, which runs the establishment sequence, then the
-  message loop, and owns the other;
+  message loop, and owns the other two;
+- the **transmit** thread, the only writer of `XFER_SEGMENT`s — which is what
+  keeps transfers from interleaving now that several may be outstanding. It
+  streams each bundle out of its ZCO a bufferful at a time rather than copying
+  it whole, so a large bundle neither costs a long SDR transaction nor has to
+  fit a fixed buffer;
 - the **delivery** thread, which hands a reassembled transfer to BP and then
   acknowledges it, so that acquisition overlaps with reading the next transfer
   off the wire.

@@ -222,34 +222,44 @@ int tcpv4ConnSend(Tcpv4Conn *conn, const void *data, int len)
 	return result;
 }
 
-/*	Send a message header and its payload as one unit.  Handing the two
- *	to the kernel (or to TLS) separately is what makes a TCPCL sender
- *	pay Nagle's small-write penalty on every segment: the header goes
- *	out alone and the payload then waits for its acknowledgment.  A
- *	single writev - or, under TLS, a single corked record - keeps the
- *	segment in one segment-sized write.  Caller holds sendMutex.	*/
+/*	Send a sequence of buffers as one write.  Handing a segment's header
+ *	and its payload to the kernel separately is what makes a TCPCL
+ *	sender pay Nagle's small-write penalty on every segment: the header
+ *	goes out alone and the payload then waits for its acknowledgment.
+ *	A single writev - or, under TLS, a single corked record - keeps a
+ *	run of segments in one write.  Caller holds sendMutex.		*/
 
-int tcpv4ConnSendSegment(Tcpv4Conn *conn, const void *hdr, int hdrLen,
-		const void *data, int dataLen)
+int tcpv4ConnSendIov(Tcpv4Conn *conn, struct iovec *iov, int count)
 {
-	struct iovec  iov[2];
-	int	      iovCount;
-	const char   *cursor;
-	size_t	      remaining;
+	size_t remaining = 0;
+	int    i;
+
+	if (count < 1)
+	{
+		return 0;
+	}
 
 	if (conn->tls != NULL)
 	{
-		int result;
+		int result = 0;
 
 		tcpv4TlsCork(conn->tls);
-		result = (tcpv4TlsSend(conn->tls, hdr, hdrLen) == hdrLen
-					&& (dataLen == 0
-							|| tcpv4TlsSend(conn->tls,
-									   data,
-									   dataLen)
-									== dataLen))
-				? 0
-				: -1;
+		for (i = 0; i < count; i++)
+		{
+			if (iov[i].iov_len == 0)
+			{
+				continue;
+			}
+
+			if (tcpv4TlsSend(conn->tls, iov[i].iov_base,
+					    (int) iov[i].iov_len)
+					!= (int) iov[i].iov_len)
+			{
+				result = -1;
+				break;
+			}
+		}
+
 		if (tcpv4TlsUncork(conn->tls) < 0)
 		{
 			result = -1;
@@ -258,16 +268,14 @@ int tcpv4ConnSendSegment(Tcpv4Conn *conn, const void *hdr, int hdrLen,
 		return result;
 	}
 
-	iov[0].iov_base = (void *) hdr;
-	iov[0].iov_len = hdrLen;
-	iov[1].iov_base = (void *) data;
-	iov[1].iov_len = dataLen;
-	iovCount = (dataLen > 0 ? 2 : 1);
-	remaining = (size_t) hdrLen + (size_t) dataLen;
-
-	for (;;)
+	for (i = 0; i < count; i++)
 	{
-		ssize_t sent = writev(conn->sock, iov, iovCount);
+		remaining += iov[i].iov_len;
+	}
+
+	while (remaining > 0)
+	{
+		ssize_t sent = writev(conn->sock, iov, count);
 
 		if (sent < 0)
 		{
@@ -286,23 +294,29 @@ int tcpv4ConnSendSegment(Tcpv4Conn *conn, const void *hdr, int hdrLen,
 		}
 
 		/*	A partial write: drop the octets already sent and
-		 *	go round again.					*/
+		 *	go round again with what is left.		*/
 
 		while (sent > 0 && (size_t) sent >= iov[0].iov_len)
 		{
 			sent -= iov[0].iov_len;
-			iov[0] = iov[1];
-			iovCount--;
-			if (iovCount == 0)
+			iov++;
+			count--;
+			if (count == 0)
 			{
 				return 0;
 			}
 		}
 
-		cursor = (const char *) iov[0].iov_base;
-		iov[0].iov_base = (void *) (cursor + sent);
-		iov[0].iov_len -= (size_t) sent;
+		if (sent > 0)
+		{
+			iov[0].iov_base
+					= (void *) ((char *) iov[0].iov_base
+							+ sent);
+			iov[0].iov_len -= (size_t) sent;
+		}
 	}
+
+	return 0;
 }
 
 /*	Settings every TCPCL socket wants: TCP_NODELAY, because a TCPCL

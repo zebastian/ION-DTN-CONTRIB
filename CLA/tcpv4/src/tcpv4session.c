@@ -27,6 +27,13 @@
 
 static void freeConn(Tcpv4Conn *conn)
 {
+	/*	Every bundle still queued or outstanding is reported as a
+	 *	failed transmission, so that BP requeues it.  By now the
+	 *	session's own threads have been joined and no sender still
+	 *	holds it, so nothing else can touch the lists.		*/
+
+	tcpv4TxDrain(conn);
+
 	if (conn->tls != NULL)
 	{
 		tcpv4TlsClose(conn->tls, conn->cleanClose);
@@ -55,6 +62,16 @@ static void freeConn(Tcpv4Conn *conn)
 	if (conn->hasSendMutex)
 	{
 		pthread_mutex_destroy(&conn->sendMutex);
+	}
+
+	if (conn->hasTxMutex)
+	{
+		pthread_mutex_destroy(&conn->txMutex);
+	}
+
+	if (conn->hasTxCond)
+	{
+		pthread_cond_destroy(&conn->txCond);
 	}
 
 	if (conn->hasDlvMutex)
@@ -86,10 +103,23 @@ static void *receiverThread(void *parm)
 		}
 		else
 		{
-			/*	The delivery thread lives exactly as long as
-			 *	the message loop, and is started and joined
-			 *	here so that it is gone before the session
-			 *	is declared finished.			*/
+			/*	The transmit and delivery threads live
+			 *	exactly as long as the message loop, and are
+			 *	started and joined here so that both are gone
+			 *	before the session is declared finished.	*/
+
+			if (pthread_begin(&conn->xmit, NULL, tcpv4XmitThread,
+					    conn)
+					== 0)
+			{
+				conn->hasXmit = 1;
+			}
+			else
+			{
+				putSysErrmsg("tcpv4cla can't start transmit"
+					     " thread",
+						conn->peerName);
+			}
 
 			if (pthread_begin(&conn->dlv, NULL,
 					    tcpv4DeliveryThread, conn)
@@ -104,10 +134,22 @@ static void *receiverThread(void *parm)
 						conn->peerName);
 			}
 
-			if (conn->hasDlv)
+			if (conn->hasXmit && conn->hasDlv)
 			{
 				conn->cleanClose
 						= (tcpv4MessageLoop(conn) == 0);
+			}
+
+			/*	Shut the socket down before joining, so that
+			 *	a transmit thread blocked in a write to a
+			 *	peer that has stopped reading comes back.	*/
+
+			tcpv4ConnFail(conn);
+			tcpv4TxStop(conn);
+			if (conn->hasXmit)
+			{
+				pthread_join(conn->xmit, NULL);
+				conn->hasXmit = 0;
 			}
 
 			tcpv4DeliveryStop(conn);
@@ -164,6 +206,10 @@ static Tcpv4Conn *startConn(Tcpv4Engine *e, int sock, int activeRole,
 	istrcpy(conn->peerName, peerName, sizeof(conn->peerName));
 	pthread_mutex_init(&conn->sendMutex, NULL);
 	conn->hasSendMutex = 1;
+	pthread_mutex_init(&conn->txMutex, NULL);
+	conn->hasTxMutex = 1;
+	pthread_cond_init(&conn->txCond, NULL);
+	conn->hasTxCond = 1;
 	pthread_mutex_init(&conn->dlvMutex, NULL);
 	conn->hasDlvMutex = 1;
 	pthread_cond_init(&conn->dlvCond, NULL);
@@ -207,7 +253,7 @@ static void reapConns(Tcpv4Engine *e)
 	while (*pp != NULL)
 	{
 		conn = *pp;
-		if (conn->receiverDone && !conn->sendBusy)
+		if (conn->receiverDone && conn->txSenders == 0)
 		{
 			*pp = conn->next;
 			conn->next = dead;
@@ -497,7 +543,7 @@ static Tcpv4Dial *findDial(Tcpv4Engine *e, uvast nodeNbr)
 /*	*	*	Engine	*	*	*	*	*	*/
 
 Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
-		const Tcpv4Receiver *rx)
+		const Tcpv4Receiver *rx, const Tcpv4Transmitter *tx)
 {
 	Tcpv4Engine	 *e;
 	IonEndpointSpec	  spec;
@@ -517,6 +563,7 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
 	e->listenSock = -1;
 	e->cfg = *cfg;
 	e->rx = *rx;
+	e->tx = *tx;
 	pthread_mutex_init(&e->mutex, NULL);
 	pthread_cond_init(&e->cond, NULL);
 
@@ -722,11 +769,12 @@ void tcpv4EngineStop(Tcpv4Engine *e)
 
 	pthread_mutex_unlock(&e->mutex);
 
-	/*	Release the delivery threads, so that the sessions can be
-	 *	taken down.						*/
+	/*	Release any sender still waiting for window room, so that
+	 *	the sessions can be taken down.				*/
 
 	for (conn = e->conns; conn != NULL; conn = conn->next)
 	{
+		tcpv4TxStop(conn);
 		tcpv4DeliveryStop(conn);
 	}
 
