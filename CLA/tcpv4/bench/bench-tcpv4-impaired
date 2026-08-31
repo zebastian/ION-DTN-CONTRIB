@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+#
+# TCPCLv4 CLA benchmark over an impaired link.
+#
+# bench-tcpv4 sweeps bundle size on an unimpaired loopback, where the
+# round-trip time is nil.  That hides the thing that most separates one
+# convergence layer implementation from another: whether it keeps more than
+# one bundle in flight.  A CL that waits for each transfer to be
+# acknowledged before starting the next one moves, at best,
+#
+#	one bundle per round trip
+#
+# no matter how much capacity the link has - and on loopback that costs
+# nothing at all, so the unimpaired sweep cannot see it.  This script puts
+# the delay back.
+#
+# It drives the same single node, the same bpdriver/bpcounter measurement
+# path and the same three modes as bench-tcpv4 (tls, plaintext, tcpv3), but
+# sweeps *one-way delay* at a fixed bundle size instead of sweeping size,
+# and can add jitter and loss.  Impairment comes from misc/linkimpair,
+# which holds packets out of an NFQUEUE and releases them late; iptables
+# rules on this node's own CL port put both directions of the link into
+# that queue, so the delay applies to data and acknowledgments alike and
+#
+#	RTT is approximately 2 x delay.
+#
+# Only the impairment needs privilege, and the script asks for as little of
+# it as it can.  ION, the CLA, bpdriver and bpcounter all stay unprivileged:
+# an ION run as root leaves root-owned shared memory and POSIX named
+# semaphores behind, which an ordinary run afterwards can neither use nor
+# clean up.  So do not run this whole script under sudo.
+#
+# What it needs is:
+#
+#   * iptables, to put the CL port into the NFQUEUE and to take it out
+#     again.  Run as root it calls iptables directly; otherwise it calls
+#     it through "sudo -n", and prints the exact sudoers record to allow
+#     if that is refused.
+#
+#   * CAP_NET_ADMIN for linkimpair, to bind the queue.  Grant it once with
+#
+#         sudo setcap cap_net_admin+ep .../misc/linkimpair/linkimpair
+#
+#     which is narrower than running it as root and keeps its log file
+#     owned by the invoking user.
+#
+# The iptables rules are removed on every exit path, including Ctrl-C, and
+# they carry --queue-bypass so that a linkimpair that dies takes the
+# impairment away rather than the link.
+#
+# Tunables (env overridable):
+#   BENCH_DELAYS      one-way delays to sweep, ms   (default "0 5 25 100")
+#   BENCH_JITTER      extra uniform jitter, ms      (default 0)
+#   BENCH_LOSS        packets dropped, percent      (default 0)
+#   BENCH_MSS         clamp TCP MSS, bytes          (default 0 = off)
+#   BENCH_IMPAIRER    linkimpair | netem            (default linkimpair)
+#   MESSAGE_SIZE      payload, bytes                (default 4096)
+#   TOTALBYTES        payload per delay, bytes      (default 4000000)
+#   MAXBUNDLES        cap on bundles per delay      (default 2000)
+#   BENCH_MODES       modes to sweep                (default "tls plaintext tcpv3")
+#   TCPV4_PORT        TCP port for the tcpv4 link   (default 4856)
+#   TCPV3_PORT        TCP port for the tcpcli link  (default 4857)
+#   NFQUEUE_NUM       NFQUEUE number to use         (default 17)
+#   IPTABLES          path to iptables              (default /usr/sbin/iptables)
+#   LINKIMPAIR        path to the linkimpair binary
+#   STALL_SECS        seconds without an arrival before a delay is done (30)
+#
+# Output: a table on stdout and results-impaired.csv
+# (mode,delay_ms,jitter_ms,loss_pct,size_bytes,sent,received,seconds,mbps,
+#  bundles_per_s).
+#
+# The byte budget per delay is much smaller than bench-tcpv4's, because a
+# delayed link is slower by construction and the point here is the ratio
+# between the modes rather than an absolute rate.
+#
+# A word on segment size.  Loopback has an MTU of 65536, so by default TCP
+# sends very large segments and the delay lands on a handful of packets per
+# transfer.  The round-trip time is faithful either way - which is what
+# transfer pipelining depends on - but a real 1500-byte path behaves
+# differently, particularly under loss, and it puts forty times as many
+# packets through the impairer.  BENCH_MSS clamps the MSS that both ends
+# advertise in their SYN, which produces realistically sized segments
+# without touching this machine's loopback MTU:
+#
+#	BENCH_MSS=1460 ./bench-tcpv4-impaired
+#
+# 1460 is the MSS of a 1500-byte Ethernet path (1500 - 20 IP - 20 TCP).
+# The clamp is a mangle-table rule on the CL port, removed with the rest.
+#
+# Realistic segments mean forty times as many packets, and that is more than
+# linkimpair can carry: it is a userspace NFQUEUE handler, and it tops out
+# around 150 packets per second at a 25 ms delay, which becomes the thing
+# being measured rather than the convergence layer.  For a clamped MSS use
+# netem instead, which does the same job inside the kernel:
+#
+#	BENCH_IMPAIRER=netem BENCH_MSS=1460 ./bench-tcpv4-impaired
+#
+# netem is attached to the loopback device as a whole rather than to one
+# port, so it delays *all* loopback traffic while it is installed.  That is
+# fine for a machine running nothing else, and it is removed on exit.  It
+# needs tc, so add to the sudoers record:
+#
+#	sebastian ALL=(root) NOPASSWD: /usr/sbin/tc
+
+set -u
+
+BENCH_DELAYS="${BENCH_DELAYS:-0 5 25 100}"
+BENCH_JITTER="${BENCH_JITTER:-0}"
+BENCH_LOSS="${BENCH_LOSS:-0}"
+BENCH_MSS="${BENCH_MSS:-0}"
+BENCH_IMPAIRER="${BENCH_IMPAIRER:-linkimpair}"
+TC="${TC:-/usr/sbin/tc}"
+
+# nfnetlink's queue is 1024 packets deep and, on the nf_tables iptables
+# backend, --queue-maxlen is not accepted, so it cannot be raised from
+# here.  That matters because --queue-bypass makes a *full* queue bypass
+# rather than drop: the excess skips the impairment and arrives undelayed,
+# which makes an overloaded link look faster than it is instead of slower.
+# The validity check below is what catches it.
+MESSAGE_SIZE="${MESSAGE_SIZE:-4096}"
+TOTALBYTES="${TOTALBYTES:-4000000}"
+MAXBUNDLES="${MAXBUNDLES:-2000}"
+BENCH_MODES="${BENCH_MODES:-tls plaintext tcpv3}"
+TCPV4_PORT="${TCPV4_PORT:-4856}"
+TCPV3_PORT="${TCPV3_PORT:-4857}"
+NFQUEUE_NUM="${NFQUEUE_NUM:-17}"
+IPTABLES="${IPTABLES:-/usr/sbin/iptables}"
+STALL_SECS="${STALL_SECS:-30}"
+
+# Privilege is applied to iptables alone; everything else runs as the
+# invoking user.  "sudo -n" never prompts, so a missing grant fails at once
+# instead of hanging a benchmark nobody is watching.
+if [ "$(id -u)" -eq 0 ]; then
+	SUDO=""
+else
+	SUDO="sudo -n"
+fi
+
+CONFIGDIR="./config"
+CERT="$(pwd)/server.pem"
+KEY="$(pwd)/server.key"
+RESULTS="$(pwd)/results-impaired.csv"
+LINKIMPAIR="${LINKIMPAIR:-$(cd ../../../misc/linkimpair 2>/dev/null && pwd)/linkimpair}"
+
+IMPAIR_PID=""
+RULES_PORTS=""
+
+# ---------------------------------------------------------------- checks
+
+if [ "$BENCH_IMPAIRER" = linkimpair ] && [ ! -x "$LINKIMPAIR" ]; then
+	echo "SKIP: linkimpair not found or not executable at '$LINKIMPAIR'." >&2
+	echo "      Set LINKIMPAIR to its path, or BENCH_IMPAIRER=netem." >&2
+	exit 0
+fi
+
+if [ "$BENCH_IMPAIRER" = netem ] && [ ! -x "$TC" ]; then
+	echo "SKIP: tc not found at '$TC'; set TC." >&2
+	exit 0
+fi
+
+case "$BENCH_IMPAIRER" in
+linkimpair | netem) ;;
+*)
+	echo "ERROR: BENCH_IMPAIRER must be 'linkimpair' or 'netem'." >&2
+	exit 1
+	;;
+esac
+
+for tool in tcpv4cla tcpcli bpdriver bpcounter openssl ionadmin bpadmin; do
+	if ! command -v "$tool" >/dev/null 2>&1; then
+		echo "ERROR: '$tool' not found in PATH." >&2
+		exit 1
+	fi
+done
+
+if [ ! -x "$IPTABLES" ]; then
+	echo "ERROR: iptables not found at '$IPTABLES'; set IPTABLES." >&2
+	exit 1
+fi
+
+# ------------------------------------------------------- impairment layer
+
+# Put both directions of one TCP port into the NFQUEUE.  On loopback both
+# directions leave through OUTPUT, so one chain covers data and
+# acknowledgments; --queue-bypass keeps the link usable if linkimpair is
+# not there, which matters a great deal when the link is this machine's own
+# loopback.
+add_rules()
+{
+	port="$1"
+
+	if [ "$BENCH_IMPAIRER" = linkimpair ]; then
+		$SUDO "$IPTABLES" -I OUTPUT -o lo -p tcp --dport "$port" \
+			-j NFQUEUE --queue-num "$NFQUEUE_NUM" \
+			--queue-bypass || return 1
+		$SUDO "$IPTABLES" -I OUTPUT -o lo -p tcp --sport "$port" \
+			-j NFQUEUE --queue-num "$NFQUEUE_NUM" \
+			--queue-bypass || return 1
+	fi
+
+	if [ "$BENCH_MSS" -gt 0 ]; then
+		# Clamp the MSS both ends advertise in their SYN (and
+		# SYN-ACK), so each sends realistically sized segments
+		# even though loopback would carry 64 KiB ones.
+		$SUDO "$IPTABLES" -t mangle -I OUTPUT -o lo -p tcp \
+			--dport "$port" --tcp-flags SYN,RST SYN \
+			-j TCPMSS --set-mss "$BENCH_MSS" || return 1
+		$SUDO "$IPTABLES" -t mangle -I OUTPUT -o lo -p tcp \
+			--sport "$port" --tcp-flags SYN,RST SYN \
+			-j TCPMSS --set-mss "$BENCH_MSS" || return 1
+	fi
+
+	RULES_PORTS="$RULES_PORTS $port"
+	return 0
+}
+
+del_rules()
+{
+	for port in $RULES_PORTS; do
+		# Delete repeatedly: a rule added twice by an interrupted run
+		# would otherwise be left behind.
+		for dir in --dport --sport; do
+			while $SUDO "$IPTABLES" -D OUTPUT -o lo -p tcp \
+				"$dir" "$port" -j NFQUEUE \
+				--queue-num "$NFQUEUE_NUM" --queue-bypass \
+				2>/dev/null; do :; done
+		done
+
+		# Remove the clamp unconditionally, so that a run
+		# interrupted after BENCH_MSS changed still cleans up.
+		for mss in "$BENCH_MSS" 1460 1400 536; do
+			[ "$mss" -gt 0 ] || continue
+			while $SUDO "$IPTABLES" -t mangle -D OUTPUT -o lo \
+				-p tcp --dport "$port" \
+				--tcp-flags SYN,RST SYN -j TCPMSS \
+				--set-mss "$mss" 2>/dev/null; do :; done
+			while $SUDO "$IPTABLES" -t mangle -D OUTPUT -o lo \
+				-p tcp --sport "$port" \
+				--tcp-flags SYN,RST SYN -j TCPMSS \
+				--set-mss "$mss" 2>/dev/null; do :; done
+		done
+	done
+
+	RULES_PORTS=""
+}
+
+stop_impair()
+{
+	if [ "$BENCH_IMPAIRER" = netem ]; then
+		$SUDO "$TC" qdisc del dev lo root 2>/dev/null
+		return 0
+	fi
+
+	if [ -n "$IMPAIR_PID" ]; then
+		kill -TERM "$IMPAIR_PID" 2>/dev/null
+		wait "$IMPAIR_PID" 2>/dev/null
+		IMPAIR_PID=""
+	fi
+}
+
+# Start linkimpair on the queue, then confirm it is actually there: with
+# --queue-bypass a missing impairer is silent, and a silently unimpaired
+# run would look like a spectacular result rather than a broken one.
+start_impair()
+{
+	delay="$1"
+
+	if [ "$BENCH_IMPAIRER" = netem ]; then
+		# netem delays every packet on the device, in the kernel, so
+		# it carries a realistic packet rate without becoming the
+		# bottleneck the way a userspace handler does.
+		set -- delay "${delay}ms"
+		[ "$BENCH_JITTER" -gt 0 ] && set -- "$@" "${BENCH_JITTER}ms"
+		[ "$BENCH_LOSS" -gt 0 ] && set -- "$@" loss "${BENCH_LOSS}%"
+		if ! $SUDO "$TC" qdisc replace dev lo root netem "$@"; then
+			echo "ERROR: could not install netem on lo." >&2
+			return 1
+		fi
+
+		return 0
+	fi
+
+	"$LINKIMPAIR" -q "$NFQUEUE_NUM" -d "$delay" -j "$BENCH_JITTER" \
+		-l "$BENCH_LOSS" -v >>impair.log 2>&1 &
+	IMPAIR_PID=$!
+	sleep 1
+	if ! kill -0 "$IMPAIR_PID" 2>/dev/null; then
+		echo "ERROR: linkimpair did not start; see impair.log." >&2
+		tail -5 impair.log >&2
+		return 1
+	fi
+
+	return 0
+}
+
+# Print the sudoers record this benchmark needs, pinned to exactly the
+# commands it issues, so that granting it is a decision about eight fixed
+# rules rather than about iptables in general.
+print_sudoers()
+{
+	echo "  Add this with 'sudo visudo -f /etc/sudoers.d/tcpv4-bench'" >&2
+	echo "  (it grants exactly the rules this benchmark inserts and" >&2
+	echo "  removes, on loopback, for these two ports and this queue):" >&2
+	echo >&2
+	echo "Cmnd_Alias TCPV4_BENCH_IMPAIR = \\" >&2
+	for port in "$TCPV4_PORT" "$TCPV3_PORT"; do
+		for op in -I -D; do
+			for dir in --dport --sport; do
+				# The last command in the alias takes neither a
+				# comma nor a line continuation.
+				sep=", \\"
+				if [ "$port" = "$TCPV3_PORT" ] \
+						&& [ "$op" = "-D" ] \
+						&& [ "$dir" = "--sport" ]; then
+					sep=""
+				fi
+
+				echo "    $IPTABLES $op OUTPUT -o lo -p tcp" \
+					"$dir $port -j NFQUEUE" \
+					"--queue-num $NFQUEUE_NUM" \
+					"--queue-bypass$sep" >&2
+			done
+		done
+	done
+
+	echo >&2
+	echo "$(id -un) ALL=(root) NOPASSWD: TCPV4_BENCH_IMPAIR" >&2
+	echo >&2
+	if [ "$BENCH_IMPAIRER" = netem ]; then
+		echo "  BENCH_IMPAIRER=netem also needs tc:" >&2
+		echo >&2
+		echo "$(id -un) ALL=(root) NOPASSWD: $TC" >&2
+	else
+		echo "  And grant linkimpair the one capability it needs:" >&2
+		echo >&2
+		echo "    sudo setcap cap_net_admin+ep $LINKIMPAIR" >&2
+	fi
+}
+
+# Check the two privileges before ION is started, so that a missing grant
+# costs nothing and leaves nothing behind.
+preflight()
+{
+	if ! add_rules "$TCPV4_PORT"; then
+		del_rules
+		echo >&2
+		echo "SKIP: cannot insert the NFQUEUE rules." >&2
+		print_sudoers
+		return 1
+	fi
+
+	del_rules
+
+	if ! start_impair 0; then
+		echo >&2
+		echo "SKIP: linkimpair cannot bind NFQUEUE $NFQUEUE_NUM." >&2
+		print_sudoers
+		return 1
+	fi
+
+	stop_impair
+	return 0
+}
+
+# How many packets the kernel has matched into the NFQUEUE rules for a
+# port.  Comparing this with what linkimpair reports having handled is the
+# validity check for an impaired run: nfnetlink's queue is 1024 packets
+# deep by default, and once it overflows the kernel drops rather than
+# queues.  A run that lost packets that way is measuring TCP's recovery
+# from the measurement apparatus, not the convergence layer, and it is
+# silent - linkimpair's own counters cannot see it.
+rule_packets()
+{
+	port="$1"
+
+	$SUDO "$IPTABLES" -L OUTPUT -v -n -x 2>/dev/null \
+		| awk -v q="NFQUEUE num $NFQUEUE_NUM" -v p="$port" '
+			$0 ~ q && $0 ~ ("dpt:" p "|spt:" p) { n += $1 }
+			END { print n + 0 }'
+}
+
+# Compare what the kernel queued during one measurement against what
+# linkimpair reports having handled.  linkimpair writes its summary line as
+# it exits, so this must be called after stop_impair, and the rule counters
+# must be a delta across the measurement: the rules are reinstalled per
+# mode, while the log accumulates over the whole run.
+check_impairment()
+{
+	matched="$1"
+	handled=""
+
+	[ "$BENCH_IMPAIRER" = linkimpair ] || return 0
+	[ "$matched" -gt 0 ] || return 0
+
+	handled="$(grep -o 'delayed [0-9]*' impair.log 2>/dev/null | tail -1 \
+		| grep -o '[0-9]*')"
+	[ -n "$handled" ] || return 0
+
+	# Report what the impairer actually sustained.  A userspace NFQUEUE
+	# handler has a ceiling of its own, and it falls steeply as the
+	# delay (and so the number of packets it is holding at once) grows -
+	# around 6500 packets/s at 5 ms here, but only 150/s at 25 ms.  Once
+	# a row is running at that ceiling it is measuring the impairer, not
+	# the convergence layer, and every mode will look alike.  There is
+	# no threshold worth hard-coding, so print the rate and let the
+	# reader judge.
+	if [ -n "${secs:-}" ] && [ "$secs" != "n/a" ]; then
+		echo "  impairer: $handled packets, $(awk -v p="$handled" \
+			-v t="$secs" 'BEGIN{printf "%.0f", p/t}') pkt/s" >&2
+	fi
+
+	if [ "$handled" -lt "$((matched - matched / 50))" ]; then
+		echo "  WARNING: the kernel queued $matched packets during" \
+			"that run but linkimpair handled only $handled." \
+			"nfnetlink's queue overflowed, and --queue-bypass" \
+			"means the excess did not wait - it went through" \
+			"undelayed, which makes the link look faster than" \
+			"it is.  This row is not a measurement of the" \
+			"convergence layer.  Lower TOTALBYTES, or use" \
+			"BENCH_IMPAIRER=netem, which impairs in the kernel" \
+			"and has no such queue." >&2
+	fi
+}
+
+# ------------------------------------------------------------- node setup
+
+mode_proto()
+{
+	case "$1" in
+	tcpv3) echo "tcp" ;;
+	*) echo "tcpv4" ;;
+	esac
+}
+
+mode_port()
+{
+	case "$1" in
+	tcpv3) echo "$TCPV3_PORT" ;;
+	*) echo "$TCPV4_PORT" ;;
+	esac
+}
+
+mode_daemon()
+{
+	case "$1" in
+	tcpv3) echo "tcpcli" ;;
+	*) echo "tcpv4cla" ;;
+	esac
+}
+
+mode_clicmd()
+{
+	case "$1" in
+	tls) echo "tcpv4cla -c ${CERT} -k ${KEY} -n" ;;
+	plaintext) echo "tcpv4cla -T none" ;;
+	tcpv3) echo "tcpcli" ;;
+	*)
+		echo "ERROR: unknown mode '$1'." >&2
+		exit 1
+		;;
+	esac
+}
+
+bundles_for()
+{
+	n=$((TOTALBYTES / MESSAGE_SIZE))
+	[ "$n" -lt 1 ] && n=1
+	[ "$n" -gt "$MAXBUNDLES" ] && n="$MAXBUNDLES"
+	echo "$n"
+}
+
+cleanup_ion()
+{
+	pkill -TERM -x tcpv4cla 2>/dev/null
+	pkill -TERM -x tcpcli 2>/dev/null
+	pkill -TERM -x bpcounter 2>/dev/null
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		{ pgrep -x tcpv4cla || pgrep -x tcpcli; } >/dev/null 2>&1 \
+				|| break
+		sleep 1
+	done
+
+	pkill -9 -x tcpv4cla 2>/dev/null
+	pkill -9 -x tcpcli 2>/dev/null
+	pkill -9 -x bpcounter 2>/dev/null
+	ionstop >/dev/null 2>&1
+	killm >/dev/null 2>&1
+}
+
+cleanup_all()
+{
+	stop_impair
+	del_rules
+	cleanup_ion
+}
+
+start_node()
+{
+	mode="$1"
+	proto="$(mode_proto "$mode")"
+	duct="127.0.0.1:$(mode_port "$mode")"
+	daemon="$(mode_daemon "$mode")"
+	clicmd="$(mode_clicmd "$mode")"
+
+	sed -e "s|PROTO|${proto}|g" -e "s|DUCT|${duct}|g" \
+		-e "s|CLICMD|${clicmd}|g" \
+		-e "s|config/bench.ipnrc|config/bench_runtime.ipnrc|g" \
+		"${CONFIGDIR}/bench.bprc" > "${CONFIGDIR}/bench_runtime.bprc"
+	sed -e "s|PROTO|${proto}|g" -e "s|DUCT|${duct}|g" \
+		"${CONFIGDIR}/bench.ipnrc" > "${CONFIGDIR}/bench_runtime.ipnrc"
+
+	cleanup_ion
+	sleep 1
+	ionadmin "${CONFIGDIR}/bench.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/bench_runtime.bprc" >/dev/null 2>&1
+
+	for _ in $(seq 1 15); do
+		pgrep -x "$daemon" >/dev/null && break
+		sleep 1
+	done
+
+	if ! pgrep -x "$daemon" >/dev/null; then
+		echo "ERROR: $daemon did not start in mode '$mode'." >&2
+		grep -iE "$daemon|can't|error" ion.log 2>/dev/null | tail -10
+		exit 1
+	fi
+
+	sleep 2
+}
+
+received_so_far()
+{
+	grep -oiE "bundles received: [0-9]+" counter.out 2>/dev/null \
+		| tail -1 | grep -oE "[0-9]+"
+}
+
+measure()
+{
+	mode="$1"
+	delay="$2"
+	count="$(bundles_for)"
+
+	: > counter.out
+
+	bpcounter ipn:1.2 "$count" > counter.out 2>&1 &
+	cpid=$!
+	sleep 1
+
+	bpdriver "$count" ipn:1.1 ipn:1.2 "-$MESSAGE_SIZE" >/dev/null 2>&1
+
+	last=""
+	stalled=0
+	while kill -0 "$cpid" 2>/dev/null; do
+		sleep 1
+		now="$(received_so_far)"
+		if [ "$now" = "$last" ]; then
+			stalled=$((stalled + 1))
+			[ "$stalled" -ge "$STALL_SECS" ] && break
+		else
+			stalled=0
+			last="$now"
+		fi
+	done
+
+	if kill -0 "$cpid" 2>/dev/null; then
+		kill -INT "$cpid" 2>/dev/null
+		sleep 2
+	fi
+
+	wait "$cpid" 2>/dev/null
+	kill -9 "$cpid" 2>/dev/null
+
+	rcvd="$(received_so_far)"
+	[ -z "$rcvd" ] && rcvd=0
+
+	mbps=$(grep -h "Throughput (Mbps)" counter.out ion.log 2>/dev/null \
+		| tail -1 | sed -E 's/.*Throughput \(Mbps\)[: ]+([0-9.]+).*/\1/')
+	secs=$(grep -h "Time (seconds)" counter.out ion.log 2>/dev/null \
+		| tail -1 | sed -E 's/.*Time \(seconds\)[: ]+([0-9.]+).*/\1/')
+	[ -z "$mbps" ] && mbps="n/a"
+	[ -z "$secs" ] && secs="n/a"
+
+	if [ "$secs" != "n/a" ] && [ "$secs" != "0.000" ] && [ "$rcvd" -gt 0 ]
+	then
+		bps=$(awk -v c="$rcvd" -v s="$secs" 'BEGIN{printf "%.0f", c/s}')
+	else
+		bps="n/a"
+	fi
+
+	printf '%-11s %8s %9s %8s %9s %8s %11s %11s\n' \
+		"$mode" "$delay" "$count" "$rcvd" "$secs" "$mbps" "$bps" \
+		"$(awk -v d="$delay" 'BEGIN{printf "%d", d*2}')"
+	echo "${mode},${delay},${BENCH_JITTER},${BENCH_LOSS},${BENCH_MSS},${MESSAGE_SIZE},${count},${rcvd},${secs},${mbps},${bps}" \
+		>> "$RESULTS"
+
+	if [ "$rcvd" -lt "$count" ]; then
+		echo "  note: $mode at ${delay}ms delivered $rcvd of $count;" \
+			"the run was cut off after ${STALL_SECS}s without an" \
+			"arrival.  Raise STALL_SECS or lower TOTALBYTES." >&2
+	fi
+
+	sleep 2
+}
+
+# ------------------------------------------------------------------- main
+
+echo "TCPCLv4 CLA impaired benchmark: modes [$BENCH_MODES],"\
+	"${MESSAGE_SIZE} B bundles, $((TOTALBYTES / 1000000)) MB per delay"\
+	"(max $MAXBUNDLES bundles)"
+if [ "$BENCH_MSS" -gt 0 ]; then
+	mssnote="MSS clamped to ${BENCH_MSS}, impairer ${BENCH_IMPAIRER}"
+else
+	mssnote="MSS unclamped (loopback, 64 KiB segments), impairer ${BENCH_IMPAIRER}"
+fi
+
+echo "one-way delays [${BENCH_DELAYS}] ms; RTT is about twice that."\
+	"jitter ${BENCH_JITTER} ms, loss ${BENCH_LOSS}%, ${mssnote}"
+
+# During the preflight only the rules need undoing; ION is not running yet,
+# so the full cleanup must not be armed until it is.
+trap 'stop_impair; del_rules; exit 130' INT TERM
+trap 'stop_impair; del_rules' EXIT
+
+rm -f impair.log
+if ! preflight; then
+	exit 0
+fi
+
+trap 'cleanup_all; exit 130' INT TERM
+trap 'cleanup_all' EXIT
+
+cleanup_ion
+del_rules
+sleep 1
+rm -f ion.log impair.log server.pem server.key counter.out
+echo "mode,delay_ms,jitter_ms,loss_pct,mss,size_bytes,sent,received,seconds,mbps,bundles_per_s" \
+	> "$RESULTS"
+
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
+	>/dev/null 2>&1
+if [ ! -f "$CERT" ]; then
+	echo "ERROR: could not generate a certificate." >&2
+	exit 1
+fi
+
+printf '%-11s %8s %9s %8s %9s %8s %11s %11s\n' \
+	"mode" "delay ms" "sent" "received" "sec" "Mbps" "bundles/s" "rtt ms"
+
+for mode in $BENCH_MODES; do
+	# The rules go in before the node starts, not after.  tcpcli opens
+	# its connection as the daemon comes up, so a clamp installed later
+	# would never be seen by its SYN - it would keep negotiating
+	# loopback's 64 KiB MSS while tcpv4cla, which dials lazily on the
+	# first bundle, got the clamped one, and the modes would not be
+	# comparable.
+	port="$(mode_port "$mode")"
+	if ! add_rules "$port"; then
+		echo "ERROR: could not install iptables rules for port $port." >&2
+		exit 1
+	fi
+
+	start_node "$mode"
+
+	for delay in $BENCH_DELAYS; do
+		impaired=0
+		if [ "$delay" -gt 0 ] || [ "$BENCH_JITTER" -gt 0 ] \
+				|| [ "$BENCH_LOSS" -gt 0 ]; then
+			start_impair "$delay" || exit 1
+			impaired=1
+		fi
+
+		before="$(rule_packets "$port")"
+		measure "$mode" "$delay"
+		after="$(rule_packets "$port")"
+		stop_impair
+		if [ "$impaired" -eq 1 ]; then
+			check_impairment "$((after - before))"
+		fi
+	done
+
+	del_rules
+	cleanup_ion
+done
+
+echo "Results written to $RESULTS"

@@ -196,6 +196,7 @@ tests/loopback-tcpv4/       single-node loopback over TLS (.optional)
 tests/loopback-tcpv4-notls/ single-node plaintext loopback (.optional)
 tests/nodeid-tcpv4/         NODE-ID authentication policy (.optional)
 bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
+bench/bench-tcpv4-impaired  the same sweep over a delayed / lossy link
 ```
 
 ## Threading
@@ -238,6 +239,35 @@ limit while BP was congested.
 - `tests/loopback-tcpv4-notls` — `-T none`: Enable TLS negotiated to false,
   bundle transfer, idle session termination (`-t 8`), and re-establishment of
   the session afterwards.
+- `bench/bench-tcpv4-impaired` — the same measurement path over a delayed
+  link (`misc/linkimpair` behind an NFQUEUE), sweeping round-trip time at a
+  fixed bundle size. This is what shows the transmission window working:
+  loopback has no round-trip time, so `bench-tcpv4` cannot distinguish a CL
+  that keeps one bundle in flight from one that keeps a hundred. At 200 ms
+  RTT with 4 KiB bundles, over 16 MB, this CLA sustains about 300 bundles/s
+  against `tcpcli`'s 57. Note that ION sets `TCP_NODELAY` nowhere, and
+  `tcpcli` writes each segment's header and payload separately, so part of
+  that gap is Nagle rather than pipelining.
+
+  `BENCH_MSS=1460` clamps the MSS both ends advertise, giving realistically
+  sized segments without touching loopback's 64 KiB MTU. That multiplies the
+  packet count by about forty, which is more than `linkimpair` can carry: as
+  a userspace NFQUEUE handler it sustains roughly 6500 packets/s at a 5 ms
+  delay but only 150/s at 25 ms, and past that point it is the impairer
+  being measured rather than the convergence layer. Use
+  `BENCH_IMPAIRER=netem` for clamped runs at any real delay — it impairs in
+  the kernel, at the cost of applying to the whole loopback device rather
+  than to one port, and it needs `NOPASSWD: /usr/sbin/tc`.
+
+  Two traps in this measurement, both of which the script now guards
+  against. `--queue-bypass` means a *full* nfnetlink queue does not drop but
+  **bypasses**, so the excess arrives undelayed and an overloaded run looks
+  *faster* than it is; the script compares the rule's packet counter against
+  what `linkimpair` reports handling and warns when they disagree. And the
+  impairment must be installed *before* the node starts: `tcpcli` connects
+  as its daemon comes up, so a clamp added afterwards would never reach its
+  SYN, and it would keep using 64 KiB segments while `tcpv4cla` used
+  1460-byte ones.
 - `tests/nodeid-tcpv4` — RFC 9174 §4.4.4.3: with a certificate carrying no
   NODE-ID, `-E require` refuses the session with "Contact Failure" and no
   bundle gets through, while `-E prefer` keeps the session but marks the

@@ -12,7 +12,9 @@ tests/*/bpdriverAduFile
 
 # bench run artifacts
 bench/ion.log
+bench/impair.log
 bench/results.csv
+bench/results-impaired.csv
 bench/server.pem
 bench/server.key
 bench/counter.out
