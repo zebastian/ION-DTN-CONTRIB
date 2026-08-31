@@ -288,6 +288,17 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 			conn->peerNode = 0;
 		}
 	}
+	else if (e->cfg.eidPolicy == TCPV4_EIDPOL_NONE && peerNode != 0)
+	{
+		/*	The operator has explicitly given up on authenticating
+		 *	node IDs, so the session is associated with the node
+		 *	ID the peer claims.  That is what lets a pair of nodes
+		 *	share one connection instead of each dialling its own,
+		 *	and trusting the claim is exactly the trade that -E
+		 *	none names.					*/
+
+		conn->peerNode = peerNode;
+	}
 	else
 	{
 		/*	An accepted session whose node ID is unauthenticated
