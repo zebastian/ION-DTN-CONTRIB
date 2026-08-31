@@ -152,8 +152,14 @@ src/tcpv4cla.h          constants, config, duct/arg parsing
 src/tcpv4msg.{c,h}      RFC 9174 wire-message codec (dependency-free)
 src/tcpv4tls.h          TLS backend interface
 src/tcpv4tls_gnutls.c   GnuTLS backend (TLS 1.3)
-src/tcpv4session.{c,h}  session engine: accept and connect, per-session
-                        receiver thread, state machine, transfers, clock
+src/tcpv4session.h      session engine interface (engine start/send/stop)
+src/tcpv4sessint.h      session engine internals, shared by the units below
+src/tcpv4session.c      engine: listening socket, session list, reconnection
+                        backoff, accept and clock threads
+src/tcpv4io.c           message-level session I/O (framing, socket options)
+src/tcpv4negotiate.c    contact header, TLS handshake, SESS_INIT exchange
+src/tcpv4rx.c           receive path: transfer reassembly, message loop
+src/tcpv4tx.c           send path: one bundle as one segmented transfer
 src/tcpv4cla.c          daemon (accepts + opens sessions, drains outducts)
 doc/*.pod               man page sources
 tests/loopback-tcpv4/       single-node loopback over TLS (.optional)

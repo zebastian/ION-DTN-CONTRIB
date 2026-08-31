@@ -2,7 +2,7 @@
 	tcpv4tls.h:	TLS backend interface for the TCPCLv4 convergence
 			layer.
 
-	The session engine (tcpv4session.c) is backend-neutral; all
+	The session engine is backend-neutral; all
 	dependence on a specific TLS library is confined behind this
 	interface and implemented in one tcpv4tls_<backend>.c file.
 

@@ -1,0 +1,287 @@
+/*
+	tcpv4io.c:	message-level I/O for the TCPCLv4 session engine.
+
+			Everything that puts octets on a session, or takes
+			them off, without interpreting them: the framing
+			reads and writes (plain socket or TLS record), the
+			socket options a TCPCL connection wants, and the
+			encoders for the short session messages whose whole
+			content is known at the call site.
+
+			RFC 9174 5.2.4 makes a TCPCL message indivisible, so
+			every writer here takes the session's sendMutex for
+			the duration of one message.
+								*/
+
+#include "tcpv4sessint.h"
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include "ion_network.h"
+
+/*	Receive exactly len octets.  Returns len, 0 if the peer closed the
+ *	connection, or -1 on failure.  Only the receiver thread reads.	*/
+
+int tcpv4ConnRecv(Tcpv4Conn *conn, void *into, int len)
+{
+	char *cursor = (char *) into;
+	int   got = 0;
+
+	if (conn->tls != NULL)
+	{
+		while (got < len)
+		{
+			int n = tcpv4TlsRecv(conn->tls, cursor + got, len - got);
+
+			if (n <= 0)
+			{
+				return n;
+			}
+
+			got += n;
+		}
+
+		return got;
+	}
+
+	return itcp_recv(&conn->sock, cursor, len);
+}
+
+/*	Send len octets as one indivisible unit.  RFC 9174 5.2.4 notes that
+ *	a TCPCL message cannot be cut short or preempted by another, so
+ *	every writer takes sendMutex for the whole message.  Returns 0 on
+ *	success, -1 on failure.						*/
+
+static int connSendLocked(Tcpv4Conn *conn, const void *data, int len)
+{
+	if (conn->tls != NULL)
+	{
+		return tcpv4TlsSend(conn->tls, data, len) == len ? 0 : -1;
+	}
+
+	return itcp_send(&conn->sock, (char *) data, len) == len ? 0 : -1;
+}
+
+int tcpv4ConnSend(Tcpv4Conn *conn, const void *data, int len)
+{
+	int result;
+
+	pthread_mutex_lock(&conn->sendMutex);
+	result = connSendLocked(conn, data, len);
+	pthread_mutex_unlock(&conn->sendMutex);
+	if (result == 0)
+	{
+		conn->secSinceTx = 0;
+	}
+
+	return result;
+}
+
+/*	Send a message header and its payload as one unit.  Handing the two
+ *	to the kernel (or to TLS) separately is what makes a TCPCL sender
+ *	pay Nagle's small-write penalty on every segment: the header goes
+ *	out alone and the payload then waits for its acknowledgment.  A
+ *	single writev - or, under TLS, a single corked record - keeps the
+ *	segment in one segment-sized write.  Caller holds sendMutex.	*/
+
+int tcpv4ConnSendSegment(Tcpv4Conn *conn, const void *hdr, int hdrLen,
+		const void *data, int dataLen)
+{
+	struct iovec  iov[2];
+	int	      iovCount;
+	const char   *cursor;
+	size_t	      remaining;
+
+	if (conn->tls != NULL)
+	{
+		int result;
+
+		tcpv4TlsCork(conn->tls);
+		result = (tcpv4TlsSend(conn->tls, hdr, hdrLen) == hdrLen
+					&& (dataLen == 0
+							|| tcpv4TlsSend(conn->tls,
+									   data,
+									   dataLen)
+									== dataLen))
+				? 0
+				: -1;
+		if (tcpv4TlsUncork(conn->tls) < 0)
+		{
+			result = -1;
+		}
+
+		return result;
+	}
+
+	iov[0].iov_base = (void *) hdr;
+	iov[0].iov_len = hdrLen;
+	iov[1].iov_base = (void *) data;
+	iov[1].iov_len = dataLen;
+	iovCount = (dataLen > 0 ? 2 : 1);
+	remaining = (size_t) hdrLen + (size_t) dataLen;
+
+	for (;;)
+	{
+		ssize_t sent = writev(conn->sock, iov, iovCount);
+
+		if (sent < 0)
+		{
+			if (errno == EINTR)
+			{
+				continue;
+			}
+
+			return -1;
+		}
+
+		remaining -= (size_t) sent;
+		if (remaining == 0)
+		{
+			return 0;
+		}
+
+		/*	A partial write: drop the octets already sent and
+		 *	go round again.					*/
+
+		while (sent > 0 && (size_t) sent >= iov[0].iov_len)
+		{
+			sent -= iov[0].iov_len;
+			iov[0] = iov[1];
+			iovCount--;
+			if (iovCount == 0)
+			{
+				return 0;
+			}
+		}
+
+		cursor = (const char *) iov[0].iov_base;
+		iov[0].iov_base = (void *) (cursor + sent);
+		iov[0].iov_len -= (size_t) sent;
+	}
+}
+
+/*	Settings every TCPCL socket wants: TCP_NODELAY, because a TCPCL
+ *	sender alternates a small header with a large payload and Nagle
+ *	would hold each header until the previous write was acknowledged,
+ *	and the operator's socket buffer sizes when they asked for them.	*/
+
+void tcpv4TuneSocket(const Tcpv4ClaConfig *cfg, int sock)
+{
+	int on = 1;
+
+	oK(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *) &on, sizeof on));
+
+	if (cfg->rcvBufSize > 0)
+	{
+		int size = cfg->rcvBufSize;
+
+		oK(setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *) &size,
+				sizeof size));
+	}
+
+	if (cfg->sndBufSize > 0)
+	{
+		int size = cfg->sndBufSize;
+
+		oK(setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *) &size,
+				sizeof size));
+	}
+}
+
+/*	Mark a session dead and wake everybody waiting on it.  The socket is
+ *	shut down rather than closed so that a blocked reader returns while
+ *	the descriptor stays valid until the session is reaped.		*/
+
+void tcpv4ConnFail(Tcpv4Conn *conn)
+{
+	Tcpv4Engine *e = conn->owner;
+
+	pthread_mutex_lock(&e->mutex);
+	conn->failed = 1;
+	pthread_cond_broadcast(&e->cond);
+	pthread_mutex_unlock(&e->mutex);
+	if (conn->sock != -1)
+	{
+		oK(shutdown(conn->sock, SHUT_RDWR));
+	}
+}
+
+/*	*	*	Message transmission	*	*	*	*/
+
+int tcpv4SendKeepalive(Tcpv4Conn *conn)
+{
+	uint8_t buf[1];
+	int	len = tcpv4MsgEncodeKeepalive(buf, sizeof(buf));
+
+	return len < 0 ? -1 : tcpv4ConnSend(conn, buf, len);
+}
+
+int tcpv4SendSessTerm(Tcpv4Conn *conn, uint8_t reason, int reply)
+{
+	Tcpv4SessTerm term;
+	uint8_t	      buf[3];
+	int	      len;
+
+	memset(&term, 0, sizeof(term));
+	term.flags = reply ? TMSG_TERM_FLAG_REPLY : 0;
+	term.reason = reason;
+	len = tcpv4MsgEncodeSessTerm(buf, sizeof(buf), &term);
+	if (len < 0)
+	{
+		return -1;
+	}
+
+	writeMemoNote("[i] tcpv4cla sending SESS_TERM to", conn->peerName);
+	return tcpv4ConnSend(conn, buf, len);
+}
+
+int tcpv4SendMsgReject(Tcpv4Conn *conn, uint8_t reason, uint8_t rejectedType)
+{
+	Tcpv4MsgReject rej;
+	uint8_t	       buf[3];
+	int	       len;
+
+	memset(&rej, 0, sizeof(rej));
+	rej.reason = reason;
+	rej.rejectedType = rejectedType;
+	len = tcpv4MsgEncodeMsgReject(buf, sizeof(buf), &rej);
+	if (len < 0)
+	{
+		return -1;
+	}
+
+	writeMemoNote("[?] tcpv4cla sending MSG_REJECT to", conn->peerName);
+	return tcpv4ConnSend(conn, buf, len);
+}
+
+int tcpv4SendXferAck(Tcpv4Conn *conn, uint8_t flags, uint64_t transferId,
+		uint64_t ackLength)
+{
+	Tcpv4XferAck ack;
+	uint8_t	     buf[18];
+	int	     len;
+
+	memset(&ack, 0, sizeof(ack));
+	ack.flags = flags; /* RFC 9174 5.2.3: echo the segment's flags.	*/
+	ack.transferId = transferId;
+	ack.ackLength = ackLength;
+	len = tcpv4MsgEncodeXferAck(buf, sizeof(buf), &ack);
+	return len < 0 ? -1 : tcpv4ConnSend(conn, buf, len);
+}
+
+int tcpv4SendXferRefuse(Tcpv4Conn *conn, uint8_t reason, uint64_t transferId)
+{
+	Tcpv4XferRefuse refuse;
+	uint8_t		buf[10];
+	int		len;
+
+	memset(&refuse, 0, sizeof(refuse));
+	refuse.reason = reason;
+	refuse.transferId = transferId;
+	len = tcpv4MsgEncodeXferRefuse(buf, sizeof(buf), &refuse);
+	return len < 0 ? -1 : tcpv4ConnSend(conn, buf, len);
+}
