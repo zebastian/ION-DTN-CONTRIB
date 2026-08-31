@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+#
+# TCPCL certificate profile test (RFC 9174 4.4.2).
+#
+# A certificate authenticates a peer only for what it was issued to do.
+# 4.4.2 has the passive entity's certificate carry id-kp-serverAuth and
+# the active entity's id-kp-clientAuth, and RFC 5280 4.2.1.12 forbids
+# using a certificate for a purpose its Extended Key Usage leaves out.
+# Chain validation alone does not check this, so without the check a
+# certificate issued for something else entirely - a mail certificate
+# from the same CA, say - authenticates a TCPCL peer, and everything
+# resting on that certificate rests on it too: the NODE-ID of 4.4.4.3
+# above all, and with it which node's traffic the session may collect.
+#
+# Three phases, three certificates, identical in every other respect:
+#
+#   serverAuth,clientAuth  the profile 4.4.2 asks for.  Both purposes,
+#                          because every tcpv4cla is both entities: it
+#                          accepts sessions and opens them.
+#   emailProtection        restricted, and not to this.  The session
+#                          must be refused.
+#   (no EKU extension)     unrestricted, so usable (RFC 5280), but a
+#                          deviation from 4.4.2 worth logging.
+#
+# Requires openssl (1.1.1+ for -addext) plus the standard bp test tools.
+#
+
+TCP_PORT="${TCPV4_PORT:-4761}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+CONFIGDIR="./config"
+
+# Short path: ION caps an induct command at 255 characters and 11
+# arguments (see the loopback test).
+CERTDIR="${TMPDIR:-/tmp}/tcpv4cla-eku"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing RFC 9174 4.4.2, that a peer certificate is"
+echo "         accepted only for the role it was issued for."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+pass() { echo "  PASS: $1"; }
+
+for t in tcpv4cla openssl bpsendfile bprecvfile; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -x tcpv4cla 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log testfile* sendfile
+rm -rf "$CERTDIR"
+mkdir -p "$CERTDIR" || { echo "SKIP: cannot create $CERTDIR."; exit 2; }
+
+head -c 512 /dev/urandom | base64 | head -c 512 > sendfile
+
+# A self-signed, self-trusted certificate identifying this host and node,
+# differing between phases only in its extended key usage.  $1 names the
+# phase; $2, when given, is the extendedKeyUsage value.
+make_cert()
+{
+	local name="$1"
+	local eku="$2"
+	local args=()
+
+	if [ -n "$eku" ]; then
+		args=(-addext "extendedKeyUsage=$eku")
+	fi
+
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+		-keyout "$CERTDIR/$name.key" -out "$CERTDIR/$name.pem" \
+		-days 1 -nodes -subj "/CN=localhost" \
+		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1,\
+otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0" \
+		"${args[@]}" >/dev/null 2>&1
+
+	[ -f "$CERTDIR/$name.pem" ] && [ -f "$CERTDIR/$name.key" ]
+}
+
+# Bring the node up using the named certificate.  -E none keeps NODE-ID
+# policy out of the way, so the extended key usage is the only thing
+# that varies between the phases.
+start_node()
+{
+	local name="$1"
+	local cert="$CERTDIR/$name.pem"
+	local key="$CERTDIR/$name.key"
+
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+		-e "s|CLICMD|tcpv4cla -c $cert -k $key -C $cert -E none|g" \
+		-e "s|config/loopback.ipnrc|config/loopback_runtime.ipnrc|g" \
+		"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
+		"${CONFIGDIR}/loopback.ipnrc" > "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+	killm >/dev/null 2>&1
+	sleep 1
+	: > ion.log
+	ionadmin "${CONFIGDIR}/loopback.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/loopback_runtime.bprc" >/dev/null 2>&1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -x tcpv4cla >/dev/null && break
+		sleep 1
+	done
+	sleep 3
+	pgrep -x tcpv4cla >/dev/null
+}
+
+stop_node()
+{
+	pkill -9 -x tcpv4cla 2>/dev/null
+	sleep 1
+	ionstop >/dev/null 2>&1
+	sleep 1
+	killm >/dev/null 2>&1
+}
+
+# Send one bundle over the loopback session and say whether it arrived.
+send_bundle()
+{
+	rm -f testfile*
+	bprecvfile ipn:1.2 & RP=$!
+	sleep 1
+	bpsendfile ipn:1.1 ipn:1.2 sendfile >/dev/null 2>&1
+	sleep 6
+	kill $RP 2>/dev/null; wait $RP 2>/dev/null
+	[ -f testfile1 ] && cmp -s sendfile testfile1
+}
+
+# --- Phase 1: the profile RFC 9174 4.4.2 asks for ---------------------
+echo "Phase 1: serverAuth,clientAuth is accepted..."
+if ! make_cert conformant "serverAuth,clientAuth"; then
+	echo "SKIP: could not generate a certificate (openssl 1.1.1+ needed"
+	echo "      for -addext)."
+	exit 2
+fi
+
+if ! start_node conformant; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+# A session is opened on demand, so the traffic comes first and the log
+# is read afterwards.
+send_bundle && DELIVERED=1 || DELIVERED=0
+
+if grep -q "session established" ion.log; then
+	pass "a certificate carrying both purposes established a session."
+else
+	fail "a conformant certificate did not establish a session."
+fi
+if grep -q "not valid for this role" ion.log; then
+	fail "a conformant certificate was rejected."
+else
+	pass "no complaint about the certificate's key usage."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	pass "bundle delivered."
+else
+	fail "no bundle delivered over a conformant certificate."
+fi
+stop_node
+
+# --- Phase 2: a certificate issued for something else -----------------
+echo "Phase 2: emailProtection alone is refused..."
+if ! make_cert wrongpurpose "emailProtection"; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+if ! start_node wrongpurpose; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+send_bundle && DELIVERED=1 || DELIVERED=0
+
+if grep -q "not valid for this role" ion.log; then
+	pass "the certificate was refused for want of the right purpose."
+else
+	fail "a certificate restricted to emailProtection was not refused."
+fi
+if grep -q "session established" ion.log; then
+	fail "a session was established on a certificate issued for \
+another purpose."
+else
+	pass "no session established."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	fail "a bundle was delivered over a refused session."
+else
+	pass "no bundle delivered."
+fi
+stop_node
+
+# --- Phase 3: no extended key usage at all ----------------------------
+echo "Phase 3: a certificate with no extended key usage is usable..."
+if ! make_cert unrestricted ""; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+if ! start_node unrestricted; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+# RFC 5280 4.2.1.12: no extension means no restriction, so refusing here
+# would lock out most certificates in service.  It is still a deviation
+# from the profile 4.4.2 asks an issuer for, so it is logged.
+send_bundle && DELIVERED=1 || DELIVERED=0
+
+if grep -q "session established" ion.log; then
+	pass "an unrestricted certificate established a session."
+else
+	fail "an unrestricted certificate was refused."
+fi
+if grep -q "carries no extended key usage" ion.log; then
+	pass "the deviation from the profile was logged."
+else
+	fail "the missing extended key usage was not logged."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	pass "bundle delivered."
+else
+	fail "no bundle delivered over an unrestricted certificate."
+fi
+stop_node
+
+echo "Cleaning up..."
+rm -f testfile* sendfile bpacq.*
+rm -rf "$CERTDIR"
+rm -f "${CONFIGDIR}/loopback_runtime.bprc" "${CONFIGDIR}/loopback_runtime.ipnrc"
+
+exit $FAIL

@@ -75,7 +75,8 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | Peer node ID (§4.6) | any EID scheme; sessions are keyed on the node ID, not on an ipn node number |
 | NODE-ID authentication (§4.4.1, §4.4.4.3, §7.9) | implemented (`-E`); an unauthenticated node ID never attracts egress |
 | Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
-| OCSP checking, EKU policy (§4.4.4.1) | **not implemented** |
+| Certificate profile, extended key usage (§4.4.2) | implemented; a certificate restricted to other purposes is refused |
+| OCSP / CRL revocation checking (§4.4.4.1) | **not implemented** |
 | TCPCLv3 fallback after "Version mismatch" (§4.3) | **not implemented** (an implementation matter; use `tcpcli` for v3 peers) |
 | Emitting session extension items | **not implemented** (none defined) |
 
@@ -116,13 +117,30 @@ Because `-n` is a decision not to authenticate the peer at all, it implies
 `-E none` unless `-E` is given explicitly — a NODE-ID in an unvalidated
 certificate proves nothing.
 
-Generating a certificate that carries a NODE-ID, with OpenSSL 1.1.1+:
+### Certificate profile
+
+RFC 9174 §4.4.2 asks that a certificate be valid for the role its holder
+plays: `id-kp-serverAuth` for the passive entity, `id-kp-clientAuth` for the
+active one. Every `tcpv4cla` is both — it accepts sessions and opens them —
+so its certificate needs **both** purposes.
+
+A peer certificate whose Extended Key Usage leaves out the purpose this
+handshake needs is refused: it was issued for something else, and RFC 5280
+§4.2.1.12 forbids using it here. Refusing it matters because everything
+downstream rests on that certificate, the NODE-ID above all — without the
+check, a mail certificate from a shared CA authenticates a TCPCL peer. A
+certificate carrying *no* Extended Key Usage extension is unrestricted, so it
+is accepted, with a memo noting the deviation from the profile.
+
+Generating a certificate that carries a NODE-ID and both purposes, with
+OpenSSL 1.1.1+:
 
 ```
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout node.key -out node.pem -days 365 -nodes -subj "/CN=node1.example" \
     -addext "subjectAltName=DNS:node1.example,\
-otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0"
+otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0" \
+    -addext "extendedKeyUsage=serverAuth,clientAuth"
 ```
 
 The TLS code is isolated behind `tcpv4tls.h`, so an OpenSSL or wolfSSL backend
@@ -215,6 +233,7 @@ doc/*.pod               man page sources
 tests/loopback-tcpv4/       single-node loopback over TLS (.optional)
 tests/loopback-tcpv4-notls/ single-node plaintext loopback (.optional)
 tests/nodeid-tcpv4/         NODE-ID authentication policy (.optional)
+tests/certprofile-tcpv4/    certificate profile / key usage (.optional)
 tests/protocol-tcpv4/       error paths, against a synthetic peer (.optional)
 bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 bench/bench-tcpv4-impaired  the same sweep over a delayed / lossy link
@@ -303,6 +322,13 @@ limit while BP was congested.
   as its daemon comes up, so a clamp added afterwards would never reach its
   SYN, and it would keep using 64 KiB segments while `tcpv4cla` used
   1460-byte ones.
+- `tests/certprofile-tcpv4` — RFC 9174 §4.4.2, three certificates alike in
+  everything but their Extended Key Usage: `serverAuth,clientAuth` (the
+  profile the RFC asks for, and what a `tcpv4cla` needs, since it is both
+  entities) establishes a session and carries a bundle; `emailProtection`
+  alone is refused, and nothing gets through; no extension at all is
+  accepted, since RFC 5280 §4.2.1.12 makes that unrestricted, with the
+  deviation logged.
 - `tests/nodeid-tcpv4` — RFC 9174 §4.4.4.3: with a certificate carrying no
   NODE-ID, `-E require` refuses the session with "Contact Failure" and no
   bundle gets through, while `-E prefer` keeps the session but marks the
@@ -398,6 +424,8 @@ wording is deliberately stable:
 | `has more than one session to node` | two nodes dialled each other; senders settle on one and the other falls idle |
 | `no session took the bundle, will retry` | said once per run of refusals, not once per attempt |
 | `peer claims an unauthenticated node ID that is not the one dialled` | the session will not be used for egress (§7.9) |
+| `peer's certificate is not valid for this role` | its extended key usage leaves out the purpose this handshake needs (§4.4.2); the session is refused |
+| `peer's certificate carries no extended key usage` | unrestricted, so usable, but not the profile §4.4.2 asks for |
 
 ## Verified by inspection
 

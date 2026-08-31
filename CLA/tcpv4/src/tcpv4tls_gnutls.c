@@ -5,6 +5,7 @@
 
 #include "tcpv4tls.h"
 #include <errno.h>
+#include <string.h>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 
@@ -27,6 +28,7 @@ struct Tcpv4TlsConn
 {
 	gnutls_session_t session;
 	int		 peerAuthenticated;
+	int		 isServer;	/* We are the passive entity.	*/
 };
 
 Tcpv4TlsCreds *tcpv4TlsCredsNew(const Tcpv4ClaConfig *cfg, int isServer)
@@ -130,6 +132,7 @@ Tcpv4TlsConn *tcpv4TlsHandshake(const Tcpv4ClaConfig *cfg,
 	}
 
 	memset(conn, 0, sizeof(*conn));
+	conn->isServer = isServer;
 	if (gnutls_init(&conn->session,
 			    isServer ? GNUTLS_SERVER : GNUTLS_CLIENT)
 			!= 0)
@@ -301,6 +304,102 @@ int tcpv4TlsRecv(Tcpv4TlsConn *conn, void *into, int len)
 int tcpv4TlsPeerAuthenticated(Tcpv4TlsConn *conn)
 {
 	return conn == NULL ? 0 : conn->peerAuthenticated;
+}
+
+/*	*	*	Certificate profile	*	*	*	*/
+
+int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn)
+{
+	const gnutls_datum_t *certs;
+	gnutls_x509_crt_t     crt;
+	const char	     *wanted;
+	unsigned int	      count = 0;
+	unsigned int	      seq;
+	int		      restricted = 0;
+	int		      found = 0;
+
+	if (conn == NULL)
+	{
+		return TCPV4_EKU_ERROR;
+	}
+
+	/*	RFC 9174 4.4.2: the certificate has to be valid for the
+	 *	role its holder is playing, and the peer's role is the
+	 *	opposite of ours - we are the TLS server exactly when the
+	 *	peer is the active entity (4.4.3).			*/
+
+	wanted = conn->isServer ? GNUTLS_KP_TLS_WWW_CLIENT
+				: GNUTLS_KP_TLS_WWW_SERVER;
+
+	certs = gnutls_certificate_get_peers(conn->session, &count);
+	if (certs == NULL || count == 0)
+	{
+		return TCPV4_EKU_ERROR;
+	}
+
+	if (gnutls_x509_crt_init(&crt) < 0)
+	{
+		return TCPV4_EKU_ERROR;
+	}
+
+	/*	certs[0] is the peer's end-entity certificate, which is the
+	 *	one whose key usage governs this handshake.		*/
+
+	if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) < 0)
+	{
+		gnutls_x509_crt_deinit(crt);
+		return TCPV4_EKU_ERROR;
+	}
+
+	for (seq = 0; !found; seq++)
+	{
+		char	     oid[128];
+		size_t	     oidLen = sizeof(oid);
+		unsigned int critical;
+		int	     rc;
+
+		rc = gnutls_x509_crt_get_key_purpose_oid(crt, seq, oid,
+				&oidLen, &critical);
+		if (rc == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE)
+		{
+			break; /* End of the list, or no extension at all.	*/
+		}
+
+		if (rc == GNUTLS_E_SHORT_MEMORY_BUFFER)
+		{
+			/*	An OID too long to be one we are looking
+			 *	for, but still a restriction.		*/
+
+			restricted = 1;
+			continue;
+		}
+
+		if (rc < 0)
+		{
+			gnutls_x509_crt_deinit(crt);
+			return TCPV4_EKU_ERROR;
+		}
+
+		restricted = 1;
+
+		/*	anyExtendedKeyUsage leaves the certificate usable
+		 *	for every purpose (RFC 5280 4.2.1.12).		*/
+
+		if (strcmp(oid, wanted) == 0
+				|| strcmp(oid, GNUTLS_KP_ANY) == 0)
+		{
+			found = 1;
+		}
+	}
+
+	gnutls_x509_crt_deinit(crt);
+
+	if (found)
+	{
+		return TCPV4_EKU_PRESENT;
+	}
+
+	return restricted ? TCPV4_EKU_WRONG : TCPV4_EKU_ABSENT;
 }
 
 /*	*	*	NODE-ID authentication	*	*	*	*/

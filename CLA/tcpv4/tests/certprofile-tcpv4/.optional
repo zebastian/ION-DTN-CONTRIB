@@ -1,0 +1,1 @@
+Requires openssl with -addext; exercises the RFC 9174 4.4.2 certificate profile.

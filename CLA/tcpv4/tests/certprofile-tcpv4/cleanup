@@ -1,0 +1,8 @@
+#!/bin/bash
+pkill -9 -x tcpv4cla 2>/dev/null
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f ion.log testfile* sendfile bpacq.*
+rm -rf "${TMPDIR:-/tmp}/tcpv4cla-eku"
+rm -f config/loopback_runtime.bprc config/loopback_runtime.ipnrc
+exit 0

@@ -63,6 +63,27 @@ int tcpv4TlsRecv(Tcpv4TlsConn *conn, void *into, int len);
  *	unauthenticated peer node ID is not to be trusted for routing.	*/
 int tcpv4TlsPeerAuthenticated(Tcpv4TlsConn *conn);
 
+/*	Result of checking the peer's certificate against the TCPCL
+ *	certificate profile of RFC 9174 4.4.2.				*/
+#define TCPV4_EKU_PRESENT 1	/* Restricted, and to this purpose.	*/
+#define TCPV4_EKU_ABSENT  0	/* Unrestricted (RFC 5280 4.2.1.12).	*/
+#define TCPV4_EKU_WRONG	  (-1)	/* Restricted, and not to this purpose.	*/
+#define TCPV4_EKU_ERROR	  (-2)	/* No usable peer certificate.		*/
+
+/*	Check the peer's end-entity certificate for the extended key usage
+ *	its side of the handshake calls for: RFC 9174 4.4.2 has the passive
+ *	entity's certificate carry id-kp-serverAuth and the active entity's
+ *	id-kp-clientAuth, so which one is wanted follows from which role
+ *	this connection took.
+ *
+ *	A certificate with no Extended Key Usage extension is unrestricted
+ *	and so usable here (RFC 5280 4.2.1.12), even though 4.4.2 asks an
+ *	issuer for one; a certificate that carries the extension and
+ *	leaves this purpose out has been issued for something else, and
+ *	using it here is what RFC 5280 forbids.  Returns one of
+ *	TCPV4_EKU_*.							*/
+int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn);
+
 /*	Result of validating an identity against certificate claims, in the
  *	three-way form RFC 9174 4.4.4 defines.				*/
 #define TCPV4_NODEID_SUCCESS 1	/* A NODE-ID is present and matches.	*/

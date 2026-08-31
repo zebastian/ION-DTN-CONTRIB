@@ -16,7 +16,7 @@
 #               marked inbound only, so a peer that merely claims a node
 #               ID cannot be selected to carry bundles to it.  Egress
 #               still works over the session this node opened, whose node
-#               number came from the egress plan rather than the wire.
+#               ID came from the egress plan rather than the wire.
 #
 # Requires openssl (1.1.1+ for -addext) plus the standard bp test tools.
 #
@@ -65,6 +65,7 @@ echo "Generating a certificate with no NODE-ID..."
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 	-keyout "$KEY" -out "$CERT" -days 1 -nodes -subj "/CN=localhost" \
 	-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+	-addext "extendedKeyUsage=serverAuth,clientAuth" \
 	>/dev/null 2>&1
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
 	echo "SKIP: could not generate a certificate."
@@ -171,7 +172,7 @@ else
 fi
 
 # The accepted side must not be selectable for egress; the side this node
-# opened may be, because its node number came from the egress plan.
+# opened may be, because its node ID came from the egress plan.
 if grep "session established" ion.log | grep -q "inbound only"; then
 	echo "  PASS: accepted session marked inbound only."
 else

@@ -468,6 +468,47 @@ int tcpv4Establish(Tcpv4Conn *conn)
 		}
 
 		conn->peerAuthenticated = tcpv4TlsPeerAuthenticated(conn->tls);
+
+		/*	RFC 9174 4.4.2: the peer's certificate has to be
+		 *	valid for the role it is playing - id-kp-serverAuth
+		 *	for the passive entity, id-kp-clientAuth for the
+		 *	active one.  Chain validation does not cover this on
+		 *	its own, so a certificate issued for something else
+		 *	entirely would otherwise be taken as authenticating
+		 *	the peer, and everything built on that certificate -
+		 *	the NODE-ID of 4.4.4.3 above all - would rest on it.	*/
+
+		if (!e->cfg.noVerify)
+		{
+			switch (tcpv4TlsCheckKeyPurpose(conn->tls))
+			{
+			case TCPV4_EKU_WRONG:
+				writeMemoNote("[?] tcpv4cla: peer's certificate"
+					      " is not valid for this role"
+					      " (RFC 9174 4.4.2);",
+						conn->peerName);
+				oK(tcpv4SendSessTerm(conn,
+						TMSG_TERM_CONTACT_FAILURE, 0));
+				return -1;
+
+			case TCPV4_EKU_ABSENT:
+				/*	Unrestricted, so usable (RFC 5280
+				 *	4.2.1.12), but 4.4.2 asks an issuer
+				 *	for the extension; say so once, so
+				 *	that an operator can see the
+				 *	deviation without it being fatal to
+				 *	a working deployment.		*/
+
+				writeMemoNote("[i] tcpv4cla: peer's certificate"
+					      " carries no extended key usage"
+					      " (RFC 9174 4.4.2);",
+						conn->peerName);
+				break;
+
+			default:
+				break;
+			}
+		}
 	}
 
 	/*	RFC 9174 6.1 has a "Busy" reason for a node that cannot take
