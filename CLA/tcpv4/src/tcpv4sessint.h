@@ -112,6 +112,32 @@ typedef struct Tcpv4Conn
 	int	       rxActive;
 	int	       rxRefused; /* Draining a refused transfer.	*/
 
+	/*	Reception hand-off.  A reassembled transfer is left here for
+	 *	the delivery thread, so that BP's acquisition of one transfer
+	 *	overlaps with reading the next off the wire.  Exactly one
+	 *	transfer fits: a receiver that outruns BP has to block here,
+	 *	because the ZCO attendant's backpressure is meant to reach
+	 *	the peer rather than be absorbed by a growing queue.
+	 *
+	 *	The delivery thread sends the END segment's acknowledgment,
+	 *	once BP has the bundle (RFC 9174 5.2.3).  Acknowledgments
+	 *	must stay in order, so the receiver thread holds any of its
+	 *	own until the hand-off is idle again.			*/
+	pthread_mutex_t dlvMutex;
+	int		hasDlvMutex;
+	pthread_cond_t	dlvCond;
+	int		hasDlvCond;
+	pthread_t	dlv;
+	int		hasDlv;
+	unsigned char  *dlvBundle;    /* Swapped with rxBundle.		*/
+	int		dlvCap;
+	int		dlvLen;
+	uint64_t	dlvId;
+	uint8_t		dlvFlags;
+	int		dlvPending;
+	int		dlvStopped;
+	int		dlvFailed;
+
 	/*	Second counters maintained by the clock thread.		*/
 	int secSinceTx;	  /* Since any message was sent.		*/
 	int secSinceRx;	  /* Since any message was received.		*/
@@ -192,6 +218,13 @@ int tcpv4SendXferRefuse(Tcpv4Conn *conn, uint8_t reason, uint64_t transferId);
 int tcpv4Establish(Tcpv4Conn *conn);
 
 /*	*	*	tcpv4rx.c: reception	*	*	*	*/
+
+/*	The delivery thread of an established session: hands reassembled
+ *	transfers to BP and acknowledges them.				*/
+void *tcpv4DeliveryThread(void *parm);
+
+/*	Stop the delivery thread and wake it.				*/
+void tcpv4DeliveryStop(Tcpv4Conn *conn);
 
 /*	The message loop of an established session.  Returns 0 on a clean
  *	end of session, -1 when the session failed.			*/

@@ -183,7 +183,7 @@ src/tcpv4session.c      engine: listening socket, session list, reconnection
                         backoff, accept and clock threads
 src/tcpv4io.c           message-level session I/O (framing, socket options)
 src/tcpv4negotiate.c    contact header, TLS handshake, SESS_INIT exchange
-src/tcpv4rx.c           receive path: transfer reassembly, message loop
+src/tcpv4rx.c           receive path: reassembly, message loop, delivery
 src/tcpv4tx.c           send path: one bundle as one segmented transfer
 src/tcpv4cla.c          daemon (accepts + opens sessions, drains outducts)
 doc/*.pod               man page sources
@@ -195,13 +195,27 @@ bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 
 ## Threading
 
-One accept thread; one receiver thread per session, which runs the
-establishment sequence and then the message loop; one clock thread driving
-keepalives, timeouts and idle termination for every session; and one sender
-thread per `tcpv4` outduct, drained by `bpDequeue`. Every socket write is
-serialised per session, since RFC 9174 §5.2.4 forbids interleaving a message
-with another. Each session has its own acquisition work area and attendant, so
-one session blocking on ZCO space does not disturb another.
+One accept thread; one clock thread driving keepalives, timeouts and idle
+termination for every session; one sender thread per `tcpv4` outduct, drained
+by `bpDequeue`; and two threads per established session:
+
+- the **receiver** thread, which runs the establishment sequence, then the
+  message loop, and owns the other;
+- the **delivery** thread, which hands a reassembled transfer to BP and then
+  acknowledges it, so that acquisition overlaps with reading the next transfer
+  off the wire.
+
+Every socket write is serialised per session, since RFC 9174 §5.2.4 forbids
+interleaving a message with another. Each session has its own acquisition work
+area and attendant, so one session blocking on ZCO space does not disturb
+another.
+
+The hand-off to the delivery thread holds exactly one transfer. That bound is
+deliberate: `bpContinueAcq` is given the attendant so that it *blocks* when ZCO
+reception space is exhausted rather than dropping the bundle, and that
+backpressure is meant to reach the peer by way of a closing TCP window. A
+deeper queue here would absorb it instead, and the CLA would grow without
+limit while BP was congested.
 
 ## Testing
 

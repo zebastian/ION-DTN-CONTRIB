@@ -55,6 +55,82 @@ static int rxReserve(Tcpv4Conn *conn, int want)
 	return 0;
 }
 
+/*	Acknowledgments have to reach the peer in transfer order, and the
+ *	END segment's is sent by the delivery thread once BP has the
+ *	bundle.  So anything this thread sends about a transfer waits for
+ *	the hand-off to drain first.  For the common single-segment
+ *	transfer that costs nothing: this thread sends no acknowledgment
+ *	at all, and goes straight on to read the next transfer while BP
+ *	acquires the last one.						*/
+
+static int rxAwaitDelivery(Tcpv4Conn *conn)
+{
+	int bad;
+
+	pthread_mutex_lock(&conn->dlvMutex);
+	while (conn->dlvPending && !conn->dlvStopped && !conn->dlvFailed)
+	{
+		pthread_cond_wait(&conn->dlvCond, &conn->dlvMutex);
+	}
+
+	bad = conn->dlvStopped || conn->dlvFailed;
+	pthread_mutex_unlock(&conn->dlvMutex);
+	return bad ? -1 : 0;
+}
+
+static int rxSendAck(Tcpv4Conn *conn, uint8_t flags, uint64_t transferId,
+		uint64_t ackLength)
+{
+	return rxAwaitDelivery(conn) < 0
+			? -1
+			: tcpv4SendXferAck(conn, flags, transferId, ackLength);
+}
+
+static int rxSendRefuse(Tcpv4Conn *conn, uint8_t reason, uint64_t transferId)
+{
+	return rxAwaitDelivery(conn) < 0
+			? -1
+			: tcpv4SendXferRefuse(conn, reason, transferId);
+}
+
+/*	Hand a reassembled transfer to the delivery thread, which delivers
+ *	it to BP and then acknowledges it.  The buffers are swapped rather
+ *	than copied, so this thread goes on filling the one the delivery
+ *	thread has just emptied.					*/
+
+static int handOverTransfer(Tcpv4Conn *conn, const Tcpv4XferSegment *seg)
+{
+	unsigned char *buf;
+	int	       cap;
+
+	pthread_mutex_lock(&conn->dlvMutex);
+	while (conn->dlvPending && !conn->dlvStopped && !conn->dlvFailed)
+	{
+		pthread_cond_wait(&conn->dlvCond, &conn->dlvMutex);
+	}
+
+	if (conn->dlvStopped || conn->dlvFailed)
+	{
+		pthread_mutex_unlock(&conn->dlvMutex);
+		return -1;
+	}
+
+	buf = conn->dlvBundle;
+	cap = conn->dlvCap;
+	conn->dlvBundle = conn->rxBundle;
+	conn->dlvCap = conn->rxCap;
+	conn->rxBundle = buf;
+	conn->rxCap = cap;
+	conn->dlvLen = conn->rxLen;
+	conn->dlvId = seg->transferId;
+	conn->dlvFlags = seg->flags;
+	conn->dlvPending = 1;
+	conn->rxLen = 0;
+	pthread_cond_broadcast(&conn->dlvCond);
+	pthread_mutex_unlock(&conn->dlvMutex);
+	return 0;
+}
+
 /*	Read and discard len octets, to stay in sync with the message
  *	stream while a transfer is being refused.			*/
 
@@ -221,13 +297,13 @@ static int handleXferSegment(Tcpv4Conn *conn)
 			 *	accepted while the session is Ending.	*/
 
 			conn->rxRefused = 1;
-			oK(tcpv4SendXferRefuse(conn, TMSG_REFUSE_SESS_TERM,
+			oK(rxSendRefuse(conn, TMSG_REFUSE_SESS_TERM,
 					seg.transferId));
 		}
 		else if (segmentHasCriticalExt(&seg))
 		{
 			conn->rxRefused = 1;
-			oK(tcpv4SendXferRefuse(conn, TMSG_REFUSE_EXT_FAILURE,
+			oK(rxSendRefuse(conn, TMSG_REFUSE_EXT_FAILURE,
 					seg.transferId));
 		}
 	}
@@ -252,7 +328,7 @@ static int handleXferSegment(Tcpv4Conn *conn)
 					> (uint64_t) e->cfg.transferMru)
 	{
 		conn->rxRefused = 1;
-		oK(tcpv4SendXferRefuse(conn, TMSG_REFUSE_NO_RESOURCES,
+		oK(rxSendRefuse(conn, TMSG_REFUSE_NO_RESOURCES,
 				seg.transferId));
 	}
 
@@ -290,22 +366,24 @@ static int handleXferSegment(Tcpv4Conn *conn)
 
 		if (!conn->rxRefused)
 		{
-			/*	RFC 9174 5.2.3: acknowledge only once the
-			 *	segment has been fully processed, which for
-			 *	the last segment means delivered to BP.	*/
+			/*	RFC 9174 5.2.3 acknowledges a segment only
+			 *	once it has been processed, which for the
+			 *	last segment means BP has the bundle.  The
+			 *	delivery thread does both, so that the
+			 *	acquisition - an SDR transaction, and a wait
+			 *	for ZCO space when reception is congested -
+			 *	overlaps with reading whatever the peer
+			 *	sends next.				*/
 
-			if (e->rx.deliver(conn->rx, conn->rxBundle,
-					    conn->rxLen)
-					< 0)
-			{
-				return -1;
-			}
+			return handOverTransfer(conn, &seg);
 		}
+
+		return 0;
 	}
 
 	if (!conn->rxRefused)
 	{
-		if (tcpv4SendXferAck(conn, seg.flags, seg.transferId,
+		if (rxSendAck(conn, seg.flags, seg.transferId,
 				    (uint64_t) conn->rxLen)
 				< 0)
 		{
@@ -396,6 +474,79 @@ static int handleXferRefuse(Tcpv4Conn *conn)
 	}
 
 	return 0;
+}
+
+/*	*	*	Delivery thread	*	*	*	*	*/
+
+void *tcpv4DeliveryThread(void *parm)
+{
+	Tcpv4Conn   *conn = parm;
+	Tcpv4Engine *e = conn->owner;
+
+	for (;;)
+	{
+		int failed;
+
+		pthread_mutex_lock(&conn->dlvMutex);
+		while (!conn->dlvPending && !conn->dlvStopped)
+		{
+			pthread_cond_wait(&conn->dlvCond, &conn->dlvMutex);
+		}
+
+		if (!conn->dlvPending) /*	Stopped, nothing left.	*/
+		{
+			pthread_mutex_unlock(&conn->dlvMutex);
+			break;
+		}
+
+		pthread_mutex_unlock(&conn->dlvMutex);
+
+		/*	RFC 9174 5.2.3: the last segment is acknowledged
+		 *	only once it has been fully processed, which for a
+		 *	transfer means BP has taken the bundle.		*/
+
+		failed = (e->rx.deliver(conn->rx, conn->dlvBundle, conn->dlvLen)
+				< 0);
+		if (!failed)
+		{
+			failed = (tcpv4SendXferAck(conn, conn->dlvFlags,
+						  conn->dlvId,
+						  (uint64_t) conn->dlvLen)
+					< 0);
+		}
+
+		pthread_mutex_lock(&conn->dlvMutex);
+		conn->dlvPending = 0;
+		if (failed)
+		{
+			conn->dlvFailed = 1;
+		}
+
+		pthread_cond_broadcast(&conn->dlvCond);
+		pthread_mutex_unlock(&conn->dlvMutex);
+
+		if (failed)
+		{
+			tcpv4ConnFail(conn);
+			break;
+		}
+	}
+
+	writeErrmsgMemos();
+	return NULL;
+}
+
+void tcpv4DeliveryStop(Tcpv4Conn *conn)
+{
+	if (!conn->hasDlvMutex)
+	{
+		return;
+	}
+
+	pthread_mutex_lock(&conn->dlvMutex);
+	conn->dlvStopped = 1;
+	pthread_cond_broadcast(&conn->dlvCond);
+	pthread_mutex_unlock(&conn->dlvMutex);
 }
 
 /*	Returns 1 when the session is to be closed cleanly, 0 to keep

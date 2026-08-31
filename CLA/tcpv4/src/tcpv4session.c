@@ -47,9 +47,24 @@ static void freeConn(Tcpv4Conn *conn)
 		MRELEASE(conn->rxBundle);
 	}
 
+	if (conn->dlvBundle != NULL)
+	{
+		MRELEASE(conn->dlvBundle);
+	}
+
 	if (conn->hasSendMutex)
 	{
 		pthread_mutex_destroy(&conn->sendMutex);
+	}
+
+	if (conn->hasDlvMutex)
+	{
+		pthread_mutex_destroy(&conn->dlvMutex);
+	}
+
+	if (conn->hasDlvCond)
+	{
+		pthread_cond_destroy(&conn->dlvCond);
 	}
 
 	MRELEASE(conn);
@@ -71,7 +86,37 @@ static void *receiverThread(void *parm)
 		}
 		else
 		{
-			conn->cleanClose = (tcpv4MessageLoop(conn) == 0);
+			/*	The delivery thread lives exactly as long as
+			 *	the message loop, and is started and joined
+			 *	here so that it is gone before the session
+			 *	is declared finished.			*/
+
+			if (pthread_begin(&conn->dlv, NULL,
+					    tcpv4DeliveryThread, conn)
+					== 0)
+			{
+				conn->hasDlv = 1;
+			}
+			else
+			{
+				putSysErrmsg("tcpv4cla can't start delivery"
+					     " thread",
+						conn->peerName);
+			}
+
+			if (conn->hasDlv)
+			{
+				conn->cleanClose
+						= (tcpv4MessageLoop(conn) == 0);
+			}
+
+			tcpv4DeliveryStop(conn);
+			if (conn->hasDlv)
+			{
+				pthread_join(conn->dlv, NULL);
+				conn->hasDlv = 0;
+			}
+
 			e->rx.close(conn->rx);
 			conn->rx = NULL;
 		}
@@ -119,6 +164,10 @@ static Tcpv4Conn *startConn(Tcpv4Engine *e, int sock, int activeRole,
 	istrcpy(conn->peerName, peerName, sizeof(conn->peerName));
 	pthread_mutex_init(&conn->sendMutex, NULL);
 	conn->hasSendMutex = 1;
+	pthread_mutex_init(&conn->dlvMutex, NULL);
+	conn->hasDlvMutex = 1;
+	pthread_cond_init(&conn->dlvCond, NULL);
+	conn->hasDlvCond = 1;
 
 	pthread_mutex_lock(&e->mutex);
 	conn->next = e->conns;
@@ -672,6 +721,14 @@ void tcpv4EngineStop(Tcpv4Engine *e)
 	}
 
 	pthread_mutex_unlock(&e->mutex);
+
+	/*	Release the delivery threads, so that the sessions can be
+	 *	taken down.						*/
+
+	for (conn = e->conns; conn != NULL; conn = conn->next)
+	{
+		tcpv4DeliveryStop(conn);
+	}
 
 	for (conn = e->conns; conn != NULL; conn = conn->next)
 	{
