@@ -10,7 +10,10 @@
 
 			RFC 9174 5.2.4 makes a TCPCL message indivisible, so
 			every writer here takes the session's sendMutex for
-			the duration of one message.
+			the duration of one message.  Reads are the other
+			way round - a message is taken apart a field at a
+			time - so an established session reads through a
+			buffer that one stream read fills.
 								*/
 
 #include "tcpv4sessint.h"
@@ -23,10 +26,10 @@
 #include <sys/uio.h>
 #include "ion_network.h"
 
-/*	Receive exactly len octets.  Returns len, 0 if the peer closed the
- *	connection, or -1 on failure.  Only the receiver thread reads.	*/
+/*	Read exactly len octets off the stream itself, bypassing the
+ *	buffer.  Returns len, 0 at end of stream, or -1 on failure.	*/
 
-int tcpv4ConnRecv(Tcpv4Conn *conn, void *into, int len)
+static int connRecvExactly(Tcpv4Conn *conn, void *into, int len)
 {
 	char *cursor = (char *) into;
 	int   got = 0;
@@ -49,6 +52,144 @@ int tcpv4ConnRecv(Tcpv4Conn *conn, void *into, int len)
 	}
 
 	return itcp_recv(&conn->sock, cursor, len);
+}
+
+/*	One read on the stream, returning however much the peer has ready:
+ *	the count, 0 at end of stream, or -1 on failure.  The error mapping
+ *	follows itcp_recv, which reports an interrupted or reset socket as
+ *	an orderly end of stream rather than as a failure.		*/
+
+static int connRecvSome(Tcpv4Conn *conn, void *into, int cap)
+{
+	int n;
+
+	if (conn->tls != NULL)
+	{
+		return tcpv4TlsRecv(conn->tls, into, cap);
+	}
+
+	if (conn->sock == -1) /*	Socket has been closed.		*/
+	{
+		return 0;
+	}
+
+	n = irecv(conn->sock, into, cap, 0);
+	if (n < 0)
+	{
+		switch (errno)
+		{
+		case EINTR: /*	Shutdown.				*/
+		case EBADF:
+		case ECONNRESET:
+			return 0;
+
+		default:
+			putSysErrmsg("tcpv4cla: irecv() error on TCP socket",
+					NULL);
+			return -1;
+		}
+	}
+
+	return n;
+}
+
+/*	Turn on read-ahead for this session.  This is safe only once the
+ *	session is established: up to that point the stream may hand off to
+ *	the TLS layer immediately after the contact header, and an octet
+ *	read ahead into this buffer is an octet GnuTLS never sees.	*/
+
+void tcpv4ConnStartBuffering(Tcpv4Conn *conn)
+{
+	if (conn->rxBuf != NULL)
+	{
+		return;
+	}
+
+	conn->rxBuf = MTAKE(TCPV4_RXBUF_SIZE);
+	if (conn->rxBuf == NULL)
+	{
+		/*	Not fatal: the session goes on reading a protocol
+		 *	field at a time, just more expensively.		*/
+
+		writeMemoNote("[?] tcpv4cla: no memory for a receive buffer;"
+			      " reading unbuffered from",
+				conn->peerName);
+		return;
+	}
+
+	conn->rxBufLen = 0;
+	conn->rxBufOff = 0;
+}
+
+/*	Receive exactly len octets.  Returns len, 0 if the peer closed the
+ *	connection, or -1 on failure.  Only the receiver thread reads.
+ *
+ *	A TCPCL message is read out a field at a time - an XFER_SEGMENT
+ *	header alone costs five calls - so once the session is established
+ *	the reads are served from a buffer that one stream read fills.
+ *	That also picks up whatever followed the message in the same
+ *	segment, which is where pipelined acknowledgments arrive.	*/
+
+int tcpv4ConnRecv(Tcpv4Conn *conn, void *into, int len)
+{
+	char *cursor = (char *) into;
+	int   got = 0;
+	int   avail;
+
+	if (conn->rxBuf == NULL) /*	Not buffered (yet).		*/
+	{
+		return connRecvExactly(conn, into, len);
+	}
+
+	avail = conn->rxBufLen - conn->rxBufOff;
+	if (avail > 0)
+	{
+		got = (avail < len ? avail : len);
+		memcpy(cursor, conn->rxBuf + conn->rxBufOff, got);
+		conn->rxBufOff += got;
+		if (got == len)
+		{
+			return len;
+		}
+	}
+
+	/*	A bulk remainder - a segment payload - is read straight
+	 *	into the caller's memory instead of being copied twice.	*/
+
+	if (len - got >= TCPV4_RXBUF_DIRECT)
+	{
+		int n = connRecvExactly(conn, cursor + got, len - got);
+
+		if (n == len - got)
+		{
+			return len;
+		}
+
+		/*	A stream that ends part way through a message
+		 *	truncated it; that is a failure, not a clean
+		 *	close.						*/
+
+		return (got > 0 && n == 0) ? -1 : n;
+	}
+
+	while (got < len)
+	{
+		int want;
+		int n = connRecvSome(conn, conn->rxBuf, TCPV4_RXBUF_SIZE);
+
+		if (n <= 0)
+		{
+			return (got > 0 && n == 0) ? -1 : n;
+		}
+
+		conn->rxBufLen = n;
+		want = (len - got < n ? len - got : n);
+		memcpy(cursor + got, conn->rxBuf, want);
+		conn->rxBufOff = want;
+		got += want;
+	}
+
+	return len;
 }
 
 /*	Send len octets as one indivisible unit.  RFC 9174 5.2.4 notes that

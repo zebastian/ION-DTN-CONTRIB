@@ -37,6 +37,11 @@ static void freeConn(Tcpv4Conn *conn)
 		closesocket(conn->sock);
 	}
 
+	if (conn->rxBuf != NULL)
+	{
+		MRELEASE(conn->rxBuf);
+	}
+
 	if (conn->rxBundle != NULL)
 	{
 		MRELEASE(conn->rxBundle);

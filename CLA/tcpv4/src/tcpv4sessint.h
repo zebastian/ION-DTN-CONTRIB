@@ -39,6 +39,18 @@ extern "C" {
 /*	Accept-loop poll interval; bounds shutdown latency.		*/
 #define TCPV4_ACCEPT_POLL_MS	 500
 
+/*	Reception is buffered once a session is established: the message
+ *	stream is then read in bufferfuls rather than a read per protocol
+ *	field, which collapses the five reads an XFER_SEGMENT header costs
+ *	- together with any acknowledgments that arrived behind it - into
+ *	one.								*/
+#define TCPV4_RXBUF_SIZE	 (64 * 1024)
+
+/*	A read at least this large bypasses the buffer and lands directly
+ *	in the caller's memory, so a bulk segment payload is not copied
+ *	twice.								*/
+#define TCPV4_RXBUF_DIRECT	 4096
+
 /*	Ceiling on how long a sender waits for a transfer to be fully
  *	acknowledged.  The clock thread normally detects a dead peer much
  *	sooner, but a session with KEEPALIVEs disabled has no such timer,
@@ -90,6 +102,9 @@ typedef struct Tcpv4Conn
 	/*	Reception, touched only by this session's receiver thread
 	 *	(plus rxActive, which the clock thread reads).		*/
 	void	      *rx;	 /* Caller's per-session context.	*/
+	unsigned char *rxBuf;	 /* Read-ahead; NULL = unbuffered.	*/
+	int	       rxBufLen; /* Octets held.				*/
+	int	       rxBufOff; /* Octets of those already consumed.	*/
 	unsigned char *rxBundle;
 	int	       rxCap;
 	int	       rxLen;
@@ -142,6 +157,10 @@ struct Tcpv4Engine
 /*	Receive exactly len octets.  Returns len, 0 if the peer closed the
  *	connection, or -1 on failure.  Only the receiver thread reads.	*/
 int tcpv4ConnRecv(Tcpv4Conn *conn, void *into, int len);
+
+/*	Turn on read-ahead for this session, which is safe only once the
+ *	session is established (see the definition).			*/
+void tcpv4ConnStartBuffering(Tcpv4Conn *conn);
 
 /*	Send len octets as one indivisible unit, taking sendMutex for the
  *	whole message.  Returns 0 on success, -1 on failure.		*/

@@ -452,6 +452,12 @@ int tcpv4MessageLoop(Tcpv4Conn *conn)
 	uint8_t	     type;
 	int	     result;
 
+	/*	Now that negotiation is over - and, with it, any handing
+	 *	off of the stream to the TLS layer - reads can run ahead
+	 *	of the field being parsed.				*/
+
+	tcpv4ConnStartBuffering(conn);
+
 	for (;;)
 	{
 		result = tcpv4ConnRecv(conn, &type, 1);
