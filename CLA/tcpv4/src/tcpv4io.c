@@ -365,6 +365,121 @@ void tcpv4ConnFail(Tcpv4Conn *conn)
 	}
 }
 
+/*	*	*	Message reception	*	*	*	*/
+
+/*	Names for the log, so that a rejection or a refusal says what it
+ *	was rather than a bare number.					*/
+
+static const char *rejectReasonName(uint8_t reason)
+{
+	switch (reason)
+	{
+	case TMSG_REJECT_TYPE_UNKNOWN:
+		return "message type unknown";
+
+	case TMSG_REJECT_UNSUPPORTED:
+		return "message unsupported";
+
+	case TMSG_REJECT_UNEXPECTED:
+		return "message unexpected";
+
+	default:
+		return "unknown reason";
+	}
+}
+
+const char *tcpv4RefuseReasonName(uint8_t reason)
+{
+	switch (reason)
+	{
+	case TMSG_REFUSE_COMPLETED:
+		return "already completed";
+
+	case TMSG_REFUSE_NO_RESOURCES:
+		return "no resources";
+
+	case TMSG_REFUSE_RETRANSMIT:
+		return "retransmit";
+
+	case TMSG_REFUSE_NOT_ACCEPTABLE:
+		return "not acceptable";
+
+	case TMSG_REFUSE_EXT_FAILURE:
+		return "extension failure";
+
+	case TMSG_REFUSE_SESS_TERM:
+		return "session terminating";
+
+	default:
+		return "unknown reason";
+	}
+}
+
+const char *tcpv4MsgTypeName(uint8_t type)
+{
+	switch (type)
+	{
+	case TMSG_XFER_SEGMENT:
+		return "XFER_SEGMENT";
+
+	case TMSG_XFER_ACK:
+		return "XFER_ACK";
+
+	case TMSG_XFER_REFUSE:
+		return "XFER_REFUSE";
+
+	case TMSG_KEEPALIVE:
+		return "KEEPALIVE";
+
+	case TMSG_SESS_TERM:
+		return "SESS_TERM";
+
+	case TMSG_MSG_REJECT:
+		return "MSG_REJECT";
+
+	case TMSG_SESS_INIT:
+		return "SESS_INIT";
+
+	default:
+		return "an unknown message";
+	}
+}
+
+/*	Read the rest of an inbound MSG_REJECT, whose type octet the caller
+ *	has already taken off the stream, and say what it was.
+ *
+ *	RFC 9174 5.1.2 forbids answering a MSG_REJECT with a MSG_REJECT -
+ *	two implementations that did so would reject each other for as
+ *	long as the connection lasted - so this only reports.  Returns 0
+ *	with *rejectedType set, or -1 when the message could not be read.	*/
+
+int tcpv4RecvMsgReject(Tcpv4Conn *conn, uint8_t *rejectedType)
+{
+	Tcpv4MsgReject rej;
+	uint8_t	       buf[3];
+	char	       txt[512];
+
+	buf[0] = TMSG_MSG_REJECT;
+	if (tcpv4ConnRecv(conn, buf + 1, 2) != 2)
+	{
+		return -1;
+	}
+
+	if (tcpv4MsgDecodeMsgReject(buf, 3, &rej) != 3)
+	{
+		return -1;
+	}
+
+	*rejectedType = rej.rejectedType;
+	isprintf(txt, sizeof(txt),
+			"[?] tcpv4cla got MSG_REJECT from '%s': %s, rejecting"
+			" our %s.",
+			conn->peerName, rejectReasonName(rej.reason),
+			tcpv4MsgTypeName(rej.rejectedType));
+	writeMemo(txt);
+	return 0;
+}
+
 /*	*	*	Message transmission	*	*	*	*/
 
 int tcpv4SendKeepalive(Tcpv4Conn *conn)

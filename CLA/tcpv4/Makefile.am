@@ -9,7 +9,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/include $(ION_CFLAGS) $(TCPV4_CFLAGS)
 bin_PROGRAMS = tcpv4cla
 
 noinst_HEADERS = src/tcpv4cla.h src/tcpv4session.h src/tcpv4sessint.h \
-	src/tcpv4tls.h src/tcpv4msg.h
+	src/tcpv4tls.h src/tcpv4msg.h src/tcpv4nodeid.h
 
 # TLS backend.  RFC 9174 4.4.3 mandates TLS 1.3; GnuTLS is the backend that
 # ships here, and an OpenSSL tcpv4tls_*.c can be swapped in behind the same
@@ -22,17 +22,19 @@ TCPV4_SESSION_SOURCES = src/tcpv4session.c src/tcpv4io.c \
 	src/tcpv4negotiate.c src/tcpv4rx.c src/tcpv4tx.c
 
 tcpv4cla_SOURCES = src/tcpv4cla.c src/tcpv4cfg.c $(TCPV4_SESSION_SOURCES) \
-	src/tcpv4msg.c $(TCPV4_TLS_SOURCES)
+	src/tcpv4msg.c src/tcpv4nodeid.c $(TCPV4_TLS_SOURCES)
 tcpv4cla_LDADD = $(ION_LIBS) $(TCPV4_LIBS) -lpthread
 
 # --- unit tests (make check) --- #
-# tcpv4msg is dependency-free (no ION/GnuTLS), so the test overrides the
-# ION include path with the source dir only.
+# tcpv4msg and tcpv4nodeid are dependency-free (no ION/GnuTLS), so their
+# tests override the ION include path with the source dir only.
 
-check_PROGRAMS = tcpv4msg_test
-TESTS = tcpv4msg_test
+check_PROGRAMS = tcpv4msg_test tcpv4nodeid_test
+TESTS = tcpv4msg_test tcpv4nodeid_test
 tcpv4msg_test_SOURCES = tests/tcpv4msg_test.c src/tcpv4msg.c
 tcpv4msg_test_CPPFLAGS = -I$(srcdir)/src
+tcpv4nodeid_test_SOURCES = tests/tcpv4nodeid_test.c src/tcpv4nodeid.c
+tcpv4nodeid_test_CPPFLAGS = -I$(srcdir)/src
 
 # --- man pages (generated from POD when pod2man is available) --- #
 

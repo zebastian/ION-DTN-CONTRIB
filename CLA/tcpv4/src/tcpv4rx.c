@@ -483,7 +483,7 @@ static int handleXferAck(Tcpv4Conn *conn)
 	if (done != NULL)
 	{
 		e->tx.done(e->tx.user, done->bundle,
-				done->acked && !done->refused);
+				TCPV4_XFER_SUCCEEDED(done));
 		MRELEASE(done);
 	}
 
@@ -531,6 +531,19 @@ static int handleXferRefuse(Tcpv4Conn *conn)
 		 *	the two lets go of it last retires it.		*/
 
 		x->refused = 1;
+
+		/*	RFC 9174 5.2.4: "Completed" says the receiver
+		 *	already has the whole bundle, and lets the sender
+		 *	consider the transfer done.  Reporting it as a
+		 *	failure instead would have BP offer the bundle
+		 *	again, and be refused again, for as long as the
+		 *	bundle lived.					*/
+
+		if (refuse.reason == TMSG_REFUSE_COMPLETED)
+		{
+			x->completed = 1;
+		}
+
 		done = tcpv4TxFinished(conn, x);
 		pthread_cond_broadcast(&conn->txCond);
 	}
@@ -539,14 +552,25 @@ static int handleXferRefuse(Tcpv4Conn *conn)
 
 	if (done != NULL)
 	{
-		e->tx.done(e->tx.user, done->bundle, 0);
+		e->tx.done(e->tx.user, done->bundle,
+				TCPV4_XFER_SUCCEEDED(done));
 		MRELEASE(done);
 	}
 
 	if (x != NULL)
 	{
-		writeMemoNote("[i] tcpv4cla transfer refused by",
-				conn->peerName);
+		char txt[512];
+
+		isprintf(txt, sizeof(txt),
+				"[i] tcpv4cla transfer refused by '%s': %s;"
+				" the bundle is %s.",
+				conn->peerName,
+				tcpv4RefuseReasonName(refuse.reason),
+				refuse.reason == TMSG_REFUSE_COMPLETED
+						? "already there, so it counts"
+						  " as sent"
+						: "left to BP to offer again");
+		writeMemo(txt);
 	}
 	else
 	{
@@ -630,6 +654,29 @@ void tcpv4DeliveryStop(Tcpv4Conn *conn)
 	pthread_mutex_unlock(&conn->dlvMutex);
 }
 
+/*	Begin ending the session (RFC 9174 6.1).  Once a SESS_TERM has been
+ *	sent, no new transfer may begin, so the transmit thread is stopped
+ *	here: a transfer already under way finishes, and anything still
+ *	queued is reported to BP as unsent, to be offered again over the
+ *	next session rather than started on this one.  Returns 0, or -1
+ *	when the SESS_TERM could not be sent.				*/
+
+static int startTermination(Tcpv4Conn *conn, uint8_t reason)
+{
+	Tcpv4Engine *e = conn->owner;
+	int	     already;
+
+	pthread_mutex_lock(&e->mutex);
+	already = conn->termSent;
+	conn->termSent = 1;
+	conn->state = TCS_ENDING;
+	pthread_cond_broadcast(&e->cond);
+	pthread_mutex_unlock(&e->mutex);
+
+	tcpv4TxStop(conn);
+	return already ? 0 : tcpv4SendSessTerm(conn, reason, 0);
+}
+
 /*	Returns 1 when the session is to be closed cleanly, 0 to keep
  *	reading, -1 on failure.						*/
 
@@ -657,6 +704,13 @@ static int handleSessTerm(Tcpv4Conn *conn)
 	conn->termSent = 1;
 	pthread_cond_broadcast(&e->cond);
 	pthread_mutex_unlock(&e->mutex);
+
+	/*	RFC 9174 6.1: no new transfer may begin once either end has
+	 *	sent a SESS_TERM, so whatever is still queued goes back to
+	 *	BP for the next session rather than being started on this
+	 *	one.  A transfer already under way is allowed to finish.	*/
+
+	tcpv4TxStop(conn);
 
 	if (replyNeeded)
 	{
@@ -741,6 +795,48 @@ int tcpv4MessageLoop(Tcpv4Conn *conn)
 
 		case TMSG_KEEPALIVE:
 			break;
+
+		case TMSG_MSG_REJECT:
+		{
+			uint8_t rejectedType;
+
+			/*	RFC 9174 5.1.2: a MSG_REJECT is never
+			 *	answered with a MSG_REJECT - two ends that
+			 *	did so would reject one another for as long
+			 *	as the connection lasted - so this reports
+			 *	it and decides what the session can still
+			 *	do.					*/
+
+			if (tcpv4RecvMsgReject(conn, &rejectedType) < 0)
+			{
+				return -1;
+			}
+
+			if (rejectedType == TMSG_XFER_SEGMENT
+					|| rejectedType == TMSG_XFER_ACK
+					|| rejectedType == TMSG_SESS_INIT)
+			{
+				/*	The peer has rejected the machinery
+				 *	transfers run on, so the two ends no
+				 *	longer agree about the state of this
+				 *	session and no message will bring them
+				 *	back into step.  End it cleanly: the
+				 *	outstanding transfers are reported to
+				 *	BP as unsent and offered again on the
+				 *	next session.			*/
+
+				writeMemoNote("[?] tcpv4cla ending a session"
+					      " whose transfers were rejected"
+					      " by",
+						conn->peerName);
+				if (startTermination(conn, TMSG_TERM_UNKNOWN) < 0)
+				{
+					return -1;
+				}
+			}
+
+			break;
+		}
 
 		case TMSG_SESS_TERM:
 			result = handleSessTerm(conn);

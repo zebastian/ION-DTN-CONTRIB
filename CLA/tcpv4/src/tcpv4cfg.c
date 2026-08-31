@@ -95,6 +95,8 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port)
  *   -M <bytes>     advertised Transfer MRU (default 262144)
  *   -r <bytes>     socket receive buffer (SO_RCVBUF; 0 = OS default)
  *   -w <bytes>     socket send buffer (SO_SNDBUF; 0 = OS default)
+ *   -L <count>     concurrently open sessions (default 64)
+ *   -P <string>    TLS priority string (GnuTLS syntax)
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
  * the final argument (the host), which the caller consumes.
@@ -112,6 +114,7 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 	cfg->keepalive = TCPV4_DEFAULT_KEEPALIVE;
 	cfg->segmentMru = TCPV4_DEFAULT_SEGMENT_MRU;
 	cfg->transferMru = TCPV4CLA_BUFSZ;
+	cfg->maxSessions = TCPV4_DEFAULT_MAX_SESSIONS;
 
 	for (i = 1; i < argc - 1; i++)
 	{
@@ -223,6 +226,23 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 		else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc)
 		{
 			cfg->sndBufSize = atoi(argv[++i]);
+		}
+		else if (strcmp(argv[i], "-L") == 0 && i + 1 < argc)
+		{
+			cfg->maxSessions = atoi(argv[++i]);
+			if (cfg->maxSessions < 1
+					|| cfg->maxSessions
+							> TCPV4_MAX_SESSIONS_LIMIT)
+			{
+				putErrmsg("tcpv4cla: bad -L session limit.",
+						argv[i]);
+				return -1;
+			}
+		}
+		else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc)
+		{
+			istrcpy(cfg->tlsPriority, argv[++i],
+					TCPV4_MAX_PRIORITY_LEN);
 		}
 		else
 		{

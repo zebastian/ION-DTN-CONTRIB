@@ -1,0 +1,3 @@
+# Node 2 is the synthetic peer: bundles for it egress via a tcpv4 outduct
+# naming the port that peer.py listens on (or does not).
+a plan 2 tcpv4/PEERDUCT

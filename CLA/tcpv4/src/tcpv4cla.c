@@ -24,12 +24,18 @@ typedef struct Tcpv4Rx
 
 /*	One egress neighbour: a node reachable via a tcpv4 outduct.  A
  *	sender thread drains the outduct and transmits over the session to
- *	nodeNbr, opening one to the outduct's host:port if none exists.	*/
+ *	nodeId, opening one to the outduct's host:port if none exists.
+ *
+ *	The neighbour is named by the plan's neighbour EID rather than by a
+ *	node number, so a peer named in any EID scheme is reachable: it is
+ *	that EID which the peer's own SESS_INIT node ID is matched against
+ *	(RFC 9174 4.6) and which its certificate has to authenticate
+ *	(4.4.4.3), and neither of those is an ipn-only question.		*/
 
 typedef struct Tcpv4Neighbor
 {
 	struct Tcpv4Neighbor *next;
-	uvast		      nodeNbr;
+	char		      nodeId[MAX_EID_LEN];
 	char		      outductName[MAX_CL_DUCT_NAME_LEN + 1];
 	VOutduct	     *vduct;
 	pthread_t	      sender;
@@ -196,21 +202,6 @@ static void checkAcqHeapMax(int transferMru)
 
 /*	*	*	Transmission	*	*	*	*	*/
 
-/*	Parse the node number from an "ipn:<node>[.<service>]" EID.  Returns
- *	0 (an invalid node) when the EID is not an ipn EID.		*/
-
-static uvast nodeNbrFromEid(const char *eid)
-{
-	uvast node = 0;
-
-	if (eid != NULL && strncmp(eid, "ipn:", 4) == 0)
-	{
-		oK(sscanf(eid + 4, UVAST_FIELDSPEC, &node));
-	}
-
-	return node;
-}
-
 /*	The engine reads a bundle's octets through these, so that it needs
  *	to know nothing of ZCOs or of BP.  A bundle is streamed out a
  *	bufferful at a time rather than copied whole into memory, which
@@ -311,6 +302,7 @@ static void *senderThread(void *parm)
 	Object		bundleZco;
 	BpAncillaryData ancillaryData;
 	vast		bundleLength;
+	int		refusals = 0;
 
 	/*	Adopt the outduct: mark it serviced by this thread and make
 	 *	sure its semaphore is live so bpDequeue can be woken.	*/
@@ -345,17 +337,42 @@ static void *senderThread(void *parm)
 		 *	outcome through txDone - unless it declines it, in
 		 *	which case it is still ours to requeue.		*/
 
-		if (tcpv4EngineSendTo(Engine, nb->nodeNbr, nb->outductName,
+		if (tcpv4EngineSendTo(Engine, nb->nodeId, nb->outductName,
 				    bundleZco, bundleLength)
-				< 0)
+				== 0)
 		{
-			writeMemo("[?] tcpv4cla: no session took the bundle;"
-				  " will retry.");
-			if (bpHandleXmitFailure(bundleZco) < 0)
-			{
-				break;
-			}
+			refusals = 0;
+			continue;
 		}
+
+		/*	No session took the bundle, so it goes back to BP to
+		 *	be offered again.  BP offers it again at once, and
+		 *	the reason the engine declined is usually one that
+		 *	has not gone away a microsecond later - a
+		 *	reconnection backoff that has seconds to run, a peer
+		 *	that is down, a bundle larger than the peer's
+		 *	Transfer MRU, which will be refused for as long as
+		 *	the bundle lives.  Without a pause here the two of
+		 *	us spin: dequeue, decline, requeue, dequeue.  So
+		 *	wait, a little longer for each successive refusal,
+		 *	and say so once rather than once per turn round the
+		 *	loop.							*/
+
+		if (refusals == 0)
+		{
+			writeMemoNote("[?] tcpv4cla: no session took the"
+				      " bundle, will retry;",
+					nb->outductName);
+		}
+
+		if (bpHandleXmitFailure(bundleZco) < 0)
+		{
+			break;
+		}
+
+		refusals++;
+		snooze(refusals < TCPV4_RETRY_MAX_SEC ? refusals
+						      : TCPV4_RETRY_MAX_SEC);
 	}
 
 	nb->vduct->hasThread = 0;
@@ -367,7 +384,7 @@ static void *senderThread(void *parm)
  *	insert; the NeighborsMutex only guards traversal from the shutdown
  *	path.								*/
 
-static int ensureNeighbor(uvast nodeNbr, const char *outductName,
+static int ensureNeighbor(const char *nodeId, const char *outductName,
 		VOutduct *vduct)
 {
 	Tcpv4Neighbor *nb;
@@ -397,7 +414,7 @@ static int ensureNeighbor(uvast nodeNbr, const char *outductName,
 	}
 
 	memset(nb, 0, sizeof(*nb));
-	nb->nodeNbr = nodeNbr;
+	istrcpy(nb->nodeId, nodeId, sizeof(nb->nodeId));
 	istrcpy(nb->outductName, outductName, sizeof(nb->outductName));
 	nb->vduct = vduct;
 
@@ -434,7 +451,6 @@ static int scanPlans(void)
 	Object ductElt;
 	Object outductElt;
 	OBJ_POINTER(Outduct, outduct);
-	uvast	   nodeNbr;
 	char	   outductName[MAX_CL_DUCT_NAME_LEN + 1];
 	VOutduct  *vduct;
 	PsmAddress vductElt;
@@ -453,10 +469,9 @@ static int scanPlans(void)
 			vplanElt = sm_list_next(wm, vplanElt))
 	{
 		vplan = (VPlan *) psp(wm, sm_list_data(wm, vplanElt));
-		nodeNbr = nodeNbrFromEid(vplan->neighborEid);
-		if (nodeNbr == 0)
+		if (!tcpv4NodeIdIsSet(vplan->neighborEid))
 		{
-			continue; /* Not an ipn neighbour.		*/
+			continue; /* A plan with no neighbour to name.	*/
 		}
 
 		planObj = sdr_list_data(sdr, vplan->planElt);
@@ -481,7 +496,9 @@ static int scanPlans(void)
 				continue;
 			}
 
-			if (ensureNeighbor(nodeNbr, outductName, vduct) < 0)
+			if (ensureNeighbor(vplan->neighborEid, outductName,
+					    vduct)
+					< 0)
 			{
 				result = -1;
 				break;
@@ -529,7 +546,7 @@ int main(int argc, char *argv[])
 		     "[-T require|prefer|none] [-E require|prefer|none] "
 		     "[-K keepalive] [-t idlesec] [-S segmentmru] "
 		     "[-M transfermru] [-r rcvbuf] [-w sndbuf] "
-		     "<host[:port]>");
+		     "[-L maxsessions] [-P tlspriority] <host[:port]>");
 		PUTS("  -r/-w set SO_RCVBUF/SO_SNDBUF; leaving them at 0 "
 		     "keeps the kernel's socket buffer autotuning, which "
 		     "is usually the better choice.");

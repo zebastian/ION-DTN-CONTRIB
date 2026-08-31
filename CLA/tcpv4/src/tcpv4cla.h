@@ -11,6 +11,7 @@
 
 #include <pthread.h>
 #include "bpP.h"
+#include "tcpv4nodeid.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,34 @@ extern "C" {
 #define TCPV4_MAX_HOST_LEN	256
 #define TCPV4_MAX_PATH_LEN	1024
 #define TCPV4_MAX_NODEID_LEN	256
+#define TCPV4_MAX_PRIORITY_LEN	256
+
+/*	Default bound on concurrently open sessions (RFC 9174 7.10,
+ *	denial of service); -L overrides it.  A connection arriving past
+ *	the bound is not simply dropped: RFC 9174 6.1 has a "Busy" reason
+ *	for exactly this, so a few sessions beyond the bound are still
+ *	negotiated far enough to say so.  Those slack slots are what
+ *	stops the courtesy from being unbounded in its turn.		*/
+#define TCPV4_DEFAULT_MAX_SESSIONS 64
+#define TCPV4_MAX_SESSIONS_LIMIT   1024
+#define TCPV4_BUSY_SLACK	   8
+
+/*	Bound on connections from one peer address that may be part way
+ *	through negotiation at the same time.  Negotiation is the phase
+ *	an unauthenticated peer can drive - up to the contact timeout,
+ *	and through a TLS handshake - so this is the phase that has to be
+ *	rationed per peer rather than globally, lest one address hold
+ *	every session slot on the node.  Established sessions are not
+ *	capped per peer, so a legitimate peer reconnecting is unaffected.	*/
+#define TCPV4_MAX_PEER_NEGOTIATING 4
+
+/*	Ceiling on the pause a sender takes after the engine declines a
+ *	bundle.  BP offers a declined bundle again immediately, and the
+ *	reasons the engine declines - a reconnection backoff with seconds
+ *	to run, an unreachable peer, a bundle too large for the peer's
+ *	Transfer MRU - do not clear in the time that takes, so without a
+ *	pause the two spin against each other.				*/
+#define TCPV4_RETRY_MAX_SEC	   5
 
 /*	Local policy applied to the negotiated Enable TLS parameter
  *	(RFC 9174 4.3).  REQUIRE terminates the session with "Contact
@@ -67,6 +96,9 @@ typedef struct
 	int  transferMru;  /* advertised Transfer MRU.			*/
 	int  rcvBufSize;   /* SO_RCVBUF, bytes; 0 = OS default.		*/
 	int  sndBufSize;   /* SO_SNDBUF, bytes; 0 = OS default.		*/
+	int  maxSessions;  /* Concurrently open sessions.		*/
+	char tlsPriority[TCPV4_MAX_PRIORITY_LEN]; /* GnuTLS priority
+					string; empty = the default.	*/
 } Tcpv4ClaConfig;
 
 /*
@@ -93,6 +125,9 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port);
  *   -M <bytes>     advertised Transfer MRU (default 262144)
  *   -r <bytes>     socket receive buffer (SO_RCVBUF; 0 = OS default)
  *   -w <bytes>     socket send buffer (SO_SNDBUF; 0 = OS default)
+ *   -L <count>     concurrently open sessions (default 64)
+ *   -P <string>    TLS priority string (GnuTLS syntax); TLS 1.3 is
+ *                  imposed on top of it, per RFC 9174 4.4.3
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
  * the final argument (the host), which the caller consumes.

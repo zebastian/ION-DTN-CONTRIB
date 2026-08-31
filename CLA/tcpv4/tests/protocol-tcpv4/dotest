@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+#
+# Protocol-behaviour tests for the TCPCLv4 CLA, driven by a synthetic
+# peer (peer.py) that speaks RFC 9174 directly.
+#
+# The bp test tools can drive a convergence layer's happy path and no
+# more: they cannot send a MSG_REJECT, refuse a transfer, stall part way
+# through negotiation or leave a connection unanswered.  Those paths were
+# "verified by inspection" until now, which is how a MSG_REJECT that was
+# decoded but never handled went unnoticed.  So the peer here speaks the
+# protocol itself, over a plaintext session (-T none), and each phase
+# asserts both what went over the wire and what tcpv4cla said in ion.log.
+#
+# Phases:
+#
+#   1  RFC 9174 5.1.2  an inbound MSG_REJECT is reported and never
+#                      answered with a MSG_REJECT; one naming the
+#                      transfer machinery ends the session cleanly.
+#   2  RFC 9174 5.2.4  a transfer refused as "Completed" counts as sent,
+#                      while any other refusal leaves it to be offered
+#                      again.
+#   3  RFC 9174 4.6    a peer that names itself with a dtn node ID is as
+#                      routable as an ipn one.
+#   4  RFC 9174 7.10   connections left part way through negotiation are
+#                      rationed per peer address.
+#   5  RFC 9174 6.1    a session past the limit is refused with
+#                      SESS_TERM "Busy", not a bare close.
+#   6  RFC 9174 4.1    the reconnection delay grows after a session that
+#                      failed to establish, not only after a connection
+#                      that was refused.
+#
+
+TCP_PORT="${TCPV4_PORT:-4759}"
+PEER_PORT="${TCPV4_PEER_PORT:-4760}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+PEERDUCT="127.0.0.1:${PEER_PORT}"
+CONFIGDIR="./config"
+PEER="./peer.py"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the TCPCLv4 CLA's protocol behaviour against a"
+echo "         synthetic RFC 9174 peer: message rejection, transfer"
+echo "         refusal, node ID keying, session limits and backoff."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+pass() { echo "  PASS: $1"; }
+
+for t in tcpv4cla bpsendfile python3; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -x tcpv4cla 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+rm -f ion.log peer.out sendfile testfile*
+
+head -c 1024 /dev/urandom | base64 | head -c 1024 > sendfile
+
+# Bring the node up with the given tcpv4cla command line.  ION caps an
+# induct command at 255 characters and 11 arguments, so the command lines
+# here stay short (see the loopback test, which checks those limits).
+start_node()
+{
+	sed -e "s|TCPDUCT|${TCPDUCT}|g" -e "s|PEERDUCT|${PEERDUCT}|g" \
+		-e "s|CLICMD|$1|g" \
+		"${CONFIGDIR}/proto.bprc" > "${CONFIGDIR}/proto_runtime.bprc"
+	sed -e "s|PEERDUCT|${PEERDUCT}|g" \
+		"${CONFIGDIR}/proto.ipnrc" > "${CONFIGDIR}/proto_runtime.ipnrc"
+
+	killm >/dev/null 2>&1
+	sleep 1
+	: > ion.log
+	ionadmin "${CONFIGDIR}/proto.ionrc" >/dev/null 2>&1
+	sleep 1
+	bpadmin "${CONFIGDIR}/proto_runtime.bprc" >/dev/null 2>&1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -x tcpv4cla >/dev/null && break
+		sleep 1
+	done
+	sleep 2
+	if ! pgrep -x tcpv4cla >/dev/null; then
+		echo "ERROR: daemon did not start."
+		tail -20 ion.log 2>/dev/null
+		return 1
+	fi
+	return 0
+}
+
+stop_node()
+{
+	pkill -9 -x tcpv4cla 2>/dev/null
+	sleep 1
+	ionstop >/dev/null 2>&1
+	sleep 1
+	killm >/dev/null 2>&1
+}
+
+# Run the peer, keeping its output for the assertions below.
+peer_run()
+{
+	python3 "$PEER" "$@" > peer.out 2>peer.err
+	PEER_RC=$?
+	sed 's/^/    peer: /' peer.out
+	if [ -s peer.err ]; then
+		sed 's/^/    peer: /' peer.err
+	fi
+}
+
+peer_said() { grep -q "^RESULT: $1$" peer.out; }
+peer_value() { sed -n "s/^RESULT: $1=//p" peer.out | tail -1; }
+
+# --- Phase 1: MSG_REJECT ----------------------------------------------
+echo "Phase 1: an inbound MSG_REJECT is reported, never reflected..."
+start_node "tcpv4cla -T none -E none -L 2" || { stop_node; exit 1; }
+peer_run msgreject 127.0.0.1 "$TCP_PORT"
+
+if [ "$PEER_RC" != 0 ]; then
+	fail "the peer could not complete the MSG_REJECT exchange."
+fi
+if grep -q "got MSG_REJECT" ion.log; then
+	pass "the rejection was reported in the log."
+else
+	fail "no MSG_REJECT was reported in the log."
+fi
+# RFC 9174 5.1.2: never answer a MSG_REJECT with a MSG_REJECT.
+if [ "$(peer_value harmless_reject_answer)" = "MSG_REJECT" ]; then
+	fail "a MSG_REJECT was answered with a MSG_REJECT."
+else
+	pass "no MSG_REJECT came back ($(peer_value harmless_reject_answer))."
+fi
+if [ "$(peer_value harmless_reject_answer)" = "none" ]; then
+	pass "a rejection of an unrelated message left the session up."
+else
+	fail "the session did not survive a harmless MSG_REJECT \
+($(peer_value harmless_reject_answer))."
+fi
+if [ "$(peer_value transfer_reject_answer)" = "SESS_TERM" ]; then
+	pass "a rejection of XFER_SEGMENT ended the session cleanly."
+else
+	fail "a rejected XFER_SEGMENT did not end the session \
+($(peer_value transfer_reject_answer))."
+fi
+stop_node
+
+# --- Phase 2: XFER_REFUSE "Completed" ---------------------------------
+echo "Phase 2: a transfer refused as Completed counts as sent..."
+start_node "tcpv4cla -T none -E none -L 2" || { stop_node; exit 1; }
+
+# The peer opens the session and claims to be node 2, which -E none lets
+# it be believed about; the egress plan for node 2 then finds that
+# session rather than dialling the (dead) outduct address.
+peer_run refuse 127.0.0.1 "$TCP_PORT" ipn:2.0 &
+PEER_JOB=$!
+sleep 2
+bpsendfile ipn:1.1 ipn:2.1 sendfile >/dev/null 2>&1
+wait $PEER_JOB
+
+if peer_said "first_transfer=yes"; then
+	pass "the bundle reached the peer as a transfer."
+else
+	fail "no transfer reached the peer."
+fi
+if peer_said "retried_after_plain_refusal=yes"; then
+	pass "an ordinary refusal left the bundle to be offered again."
+else
+	fail "a refused bundle was not offered again."
+fi
+if peer_said "retried_after_completed=no"; then
+	pass "a Completed refusal ended the bundle's retransmission."
+else
+	fail "a bundle refused as Completed was offered again."
+fi
+if grep -q "already completed" ion.log; then
+	pass "the Completed refusal was reported in the log."
+else
+	fail "the Completed refusal was not reported in the log."
+fi
+stop_node
+
+# --- Phase 3: a dtn node ID -------------------------------------------
+echo "Phase 3: a peer named with a dtn node ID is routable..."
+start_node "tcpv4cla -T none -E none -L 2" || { stop_node; exit 1; }
+peer_run nodeid 127.0.0.1 "$TCP_PORT" dtn://peer-b/ 4
+
+if peer_said "established=yes"; then
+	pass "the session with a dtn node ID was established."
+else
+	fail "a session with a dtn node ID could not be established."
+fi
+if grep "session established" ion.log | grep -q "dtn://peer-b/"; then
+	pass "the dtn node ID was recorded for the session."
+else
+	fail "the dtn node ID was not recorded ($(grep -o \
+		'session established.*' ion.log | tail -1))."
+fi
+# The point of keying on the node ID rather than on an ipn node number:
+# without it a dtn peer can never be selected to carry bundles out.
+if grep "session established" ion.log | grep "dtn://peer-b/" \
+		| grep -q "bidirectional"; then
+	pass "a dtn peer can carry bundles outward."
+else
+	fail "a dtn peer was marked inbound only."
+fi
+stop_node
+
+# --- Phase 4: half-open connections are rationed ----------------------
+echo "Phase 4: negotiation is rationed per peer address..."
+start_node "tcpv4cla -T none -E none -L 8" || { stop_node; exit 1; }
+peer_run stall 127.0.0.1 "$TCP_PORT" 7
+
+if [ "$(peer_value refused)" -gt 0 ] 2>/dev/null; then
+	pass "connections past the cap were closed ($(peer_value refused) \
+of 7)."
+else
+	fail "no connection was refused; one address held \
+$(peer_value held) negotiating sessions."
+fi
+if grep -q "too many sessions being negotiated" ion.log; then
+	pass "the refusal was reported in the log."
+else
+	fail "the refusal was not reported in the log."
+fi
+stop_node
+
+# --- Phase 5: SESS_TERM "Busy" ----------------------------------------
+echo "Phase 5: a session past the limit is refused with Busy..."
+start_node "tcpv4cla -T none -E none -L 2" || { stop_node; exit 1; }
+peer_run busy 127.0.0.1 "$TCP_PORT" 2
+
+if [ "$(peer_value established)" = "2" ]; then
+	pass "the node took its two sessions."
+else
+	fail "the node did not establish two sessions."
+fi
+if [ "$(peer_value over_limit)" = "busy" ]; then
+	pass "the session past the limit got SESS_TERM 'Busy'."
+else
+	fail "the session past the limit got '$(peer_value over_limit)' \
+rather than SESS_TERM 'Busy'."
+fi
+if grep -q "too many sessions open" ion.log; then
+	pass "the refusal was reported in the log."
+else
+	fail "the refusal was not reported in the log."
+fi
+stop_node
+
+# --- Phase 6: reconnection backoff ------------------------------------
+echo "Phase 6: the reconnection delay grows after a failed session..."
+echo "         (this phase watches a 40 s window)"
+start_node "tcpv4cla -T none -E none -L 2" || { stop_node; exit 1; }
+
+# A peer that accepts the connection and then goes no further.  The
+# backoff has to grow on that, not only on a refused connection: this is
+# the ordinary misconfiguration (a certificate the peer will not trust, a
+# node ID it cannot authenticate), and a node that reset its delay on
+# connect would hammer such a peer for as long as it lasted.
+python3 "$PEER" listen "$PEER_PORT" 40 > peer.out 2>peer.err &
+PEER_JOB=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:2.1 sendfile >/dev/null 2>&1
+wait $PEER_JOB
+sed 's/^/    peer: /' peer.out
+
+ATTEMPTS=$(peer_value attempts)
+GAP=$(peer_value largest_gap)
+if [ "${ATTEMPTS:-0}" -gt 0 ] 2>/dev/null; then
+	pass "the node dialled the peer ($ATTEMPTS times in 40 s)."
+else
+	fail "the node never dialled the peer."
+fi
+# Exponential backoff reaches gaps no fixed retry interval produces.
+if awk "BEGIN {exit !(${GAP:-0} >= 8)}"; then
+	pass "the delay grew between attempts (largest gap ${GAP}s)."
+else
+	fail "the delay did not grow (largest gap ${GAP}s in $ATTEMPTS \
+attempts); the backoff is being reset by a connection that never \
+became a session."
+fi
+if [ "${ATTEMPTS:-99}" -le 10 ] 2>/dev/null; then
+	pass "the node did not spin on the unreachable peer."
+else
+	fail "the node made $ATTEMPTS attempts in 40 s."
+fi
+stop_node
+
+echo "Cleaning up..."
+rm -f sendfile testfile* bpacq.* peer.out peer.err
+rm -f "${CONFIGDIR}/proto_runtime.bprc" "${CONFIGDIR}/proto_runtime.ipnrc"
+
+exit $FAIL

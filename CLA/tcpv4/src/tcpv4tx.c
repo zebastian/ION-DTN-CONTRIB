@@ -155,7 +155,11 @@ void tcpv4TxDrain(Tcpv4Conn *conn)
 	{
 		x = dead;
 		dead = x->next;
-		e->tx.done(e->tx.user, x->bundle, 0);
+
+		/*	A transfer the peer had already completed counts as
+		 *	sent even though the session did not outlive it.	*/
+
+		e->tx.done(e->tx.user, x->bundle, TCPV4_XFER_SUCCEEDED(x));
 		MRELEASE(x);
 	}
 }
@@ -391,7 +395,7 @@ void *tcpv4XmitThread(void *parm)
 		if (done != NULL)
 		{
 			e->tx.done(e->tx.user, done->bundle,
-					done->acked && !done->refused);
+					TCPV4_XFER_SUCCEEDED(done));
 			MRELEASE(done);
 		}
 
@@ -409,29 +413,34 @@ void *tcpv4XmitThread(void *parm)
 
 /*	*	*	Handing a bundle to a session	*	*	*/
 
-/*	Find an established session to nodeNbr.  *exists reports whether any
- *	session to that node is alive, so the caller can wait for one that
- *	is still negotiating instead of opening a second connection.
- *	Called with e->mutex held.					*/
+/*	Find an established session that may carry bundles to the node
+ *	named by nodeId.  *exists reports whether any session to that node
+ *	is alive, so the caller can wait for one that is still negotiating
+ *	instead of opening a second connection.  Called with e->mutex held.
+ *
+ *	Two nodes that dial each other at the same time end up with two
+ *	established sessions between them, which RFC 9174 neither forbids
+ *	nor tells either end how to resolve.  Rather than tear one down -
+ *	a decision the peer has no way to agree to - the choice here is
+ *	made deterministic: the oldest session wins, and an authenticated
+ *	node ID beats an unauthenticated one.  Traffic then concentrates
+ *	on one session and the other falls idle, where the idle timer of
+ *	RFC 9174 6.2 (-t) can retire it.				*/
 
-static Tcpv4Conn *findConn(Tcpv4Engine *e, uvast nodeNbr, int *exists)
+static Tcpv4Conn *findConn(Tcpv4Engine *e, const char *nodeId, int *exists)
 {
 	Tcpv4Conn *conn;
+	Tcpv4Conn *best = NULL;
 
 	*exists = 0;
-	if (nodeNbr == 0)
+	if (!tcpv4NodeIdIsSet(nodeId))
 	{
 		return NULL;
 	}
 
 	for (conn = e->conns; conn != NULL; conn = conn->next)
 	{
-		/*	peerNode is left 0 for any session whose peer identity
-		 *	is not established well enough to route on, so such a
-		 *	session is never selected here (see applySessInit).	*/
-
-		if (conn->failed || conn->receiverDone || conn->peerNode == 0
-				|| conn->peerNode != nodeNbr)
+		if (conn->failed || conn->receiverDone)
 		{
 			continue;
 		}
@@ -441,21 +450,52 @@ static Tcpv4Conn *findConn(Tcpv4Engine *e, uvast nodeNbr, int *exists)
 			continue; /* RFC 9174 6.1: no new transfers.	*/
 		}
 
-		*exists = 1;
 		if (conn->state != TCS_ESTABLISHED)
+		{
+			/*	Still negotiating: it knows only the node it
+			 *	was dialled for, which is enough to keep the
+			 *	caller from opening a second connection.	*/
+
+			if (tcpv4NodeIdMatches(conn->dialNodeId, nodeId))
+			{
+				*exists = 1;
+			}
+
+			continue;
+		}
+
+		/*	routeNodeId is left empty for any session whose peer
+		 *	identity is not established well enough to route on,
+		 *	and matches nothing (see applySessInit).	*/
+
+		if (!tcpv4NodeIdMatches(conn->routeNodeId, nodeId))
 		{
 			continue;
 		}
 
+		*exists = 1;
+
+		/*	The list runs newest first, so an equally good later
+		 *	match is the older session.			*/
+
+		if (best == NULL
+				|| conn->nodeIdAuthenticated
+						>= best->nodeIdAuthenticated)
+		{
+			best = conn;
+		}
+	}
+
+	if (best != NULL)
+	{
 		/*	Hold the session for as long as this sender is
 		 *	using it, so that the clock thread cannot reap it
 		 *	out from under the queue insertion below.	*/
 
-		conn->txSenders++;
-		return conn;
+		best->txSenders++;
 	}
 
-	return NULL;
+	return best;
 }
 
 static void releaseConn(Tcpv4Engine *e, Tcpv4Conn *conn)
@@ -542,8 +582,8 @@ static int queueXfer(Tcpv4Conn *conn, Object bundle, vast length)
 	return result;
 }
 
-int tcpv4EngineSendTo(Tcpv4Engine *e, uvast nodeNbr, const char *ductName,
-		Object bundle, vast length)
+int tcpv4EngineSendTo(Tcpv4Engine *e, const char *nodeId,
+		const char *ductName, Object bundle, vast length)
 {
 	Tcpv4Conn      *conn;
 	struct timespec deadline;
@@ -562,7 +602,7 @@ int tcpv4EngineSendTo(Tcpv4Engine *e, uvast nodeNbr, const char *ductName,
 			return -1;
 		}
 
-		conn = findConn(e, nodeNbr, &exists);
+		conn = findConn(e, nodeId, &exists);
 		if (conn != NULL)
 		{
 			break;
@@ -601,7 +641,7 @@ int tcpv4EngineSendTo(Tcpv4Engine *e, uvast nodeNbr, const char *ductName,
 		 *	sees it and waits for it to establish.		*/
 
 		pthread_mutex_unlock(&e->mutex);
-		if (tcpv4OpenSession(e, nodeNbr, ductName) < 0)
+		if (tcpv4OpenSession(e, nodeId, ductName) < 0)
 		{
 			return -1;
 		}

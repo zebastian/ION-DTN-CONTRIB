@@ -7,7 +7,7 @@ tcpv4cla - DTN TCPCLv4 convergence layer task
 B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-n>]
 [B<-T> I<policy>] [B<-E> I<policy>] [B<-K> I<keepalive>] [B<-t> I<idlesec>]
 [B<-S> I<segmentmru>] [B<-M> I<transfermru>] [B<-r> I<bytes>]
-[B<-w> I<bytes>] I<host>[:I<port>]
+[B<-w> I<bytes>] [B<-L> I<sessions>] [B<-P> I<priority>] I<host>[:I<port>]
 
 =head1 DESCRIPTION
 
@@ -127,6 +127,23 @@ operating-system default.
 
 Socket send buffer (B<SO_SNDBUF>), in bytes; 0 (default) leaves the
 operating-system default.
+
+=item B<-L> I<sessions>
+
+Maximum number of concurrently open sessions (default 64), which RFC 9174
+section 7.10 asks an implementation to bound.  A connection arriving past the
+limit is still negotiated far enough to be told B<SESS_TERM> "Busy" (RFC 9174
+section 6.1), so that the peer knows to come back rather than reading a bare
+close as a network fault; only a few such connections are entertained at once.
+Independently of this limit, at most four connections from any one peer
+address may be part way through negotiation at the same time, so that a single
+address cannot hold every session slot on the node.
+
+=item B<-P> I<priority>
+
+GnuTLS priority string selecting the cipher policy (default C<SECURE128>).
+The protocol version is not the operator's to choose: TLS 1.3 is appended to
+whatever is given here, because RFC 9174 section 4.4.3 requires it.
 
 =back
 

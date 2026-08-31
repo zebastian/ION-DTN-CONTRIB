@@ -33,10 +33,6 @@ extern "C" {
  *	generous cap here is also a defence against a hostile peer.	*/
 #define TCPV4_MAX_EXT_LEN	 1024
 
-/*	Bound on concurrently open sessions (RFC 9174 7.10, denial of
- *	service): further inbound connections are closed immediately.	*/
-#define TCPV4_MAX_SESSIONS	 64
-
 /*	Accept-loop poll interval; bounds shutdown latency.		*/
 #define TCPV4_ACCEPT_POLL_MS	 500
 
@@ -106,7 +102,15 @@ typedef struct Tcpv4Xfer
 	int		  inFlight;   /* Transmit thread still holds it.	*/
 	int		  acked;      /* Peer acknowledged all of it.	*/
 	int		  refused;    /* Peer refused it, or it failed.	*/
+	int		  completed;  /* Peer already had the bundle.	*/
 } Tcpv4Xfer;
+
+/*	How a finished transfer is reported to BP.  Acknowledgment of the
+ *	whole length is the ordinary success; RFC 9174 5.2.4 gives one
+ *	other, the "Completed" refusal, which says the receiver already
+ *	has the bundle and lets the sender consider the transfer done
+ *	rather than offering it again for as long as the bundle lives.	*/
+#define TCPV4_XFER_SUCCEEDED(x) ((x)->completed || ((x)->acked && !(x)->refused))
 
 typedef struct Tcpv4Conn
 {
@@ -123,10 +127,17 @@ typedef struct Tcpv4Conn
 	pthread_t	  receiver;
 
 	char  peerName[TCPV4_MAX_HOST_LEN]; /* Duct name / peer address.	*/
-	uvast peerNode;			    /* From the peer's node ID.	*/
-	char  peerNodeId[TCPV4_MAX_NODEID_LEN];
+	char  peerAddr[TCPV4_MAX_HOST_LEN]; /* Numeric address, accepted
+					       sessions only.		*/
+	char  peerNodeId[TCPV4_MAX_NODEID_LEN];	  /* What the peer claims.	*/
+	char  dialNodeId[TCPV4_MAX_NODEID_LEN];	  /* From the egress plan;
+					       empty when we accepted.	*/
+	char  routeNodeId[TCPV4_MAX_NODEID_LEN];  /* Node this session may
+					       carry bundles to; empty
+					       means inbound only.	*/
 	int   peerAuthenticated;   /* Certificate chain validated.	*/
 	int   nodeIdAuthenticated; /* NODE-ID matched (RFC 9174 4.4.4.3).*/
+	int   busy;		   /* Refuse: too many sessions open.	*/
 
 	/*	Negotiated session parameters (RFC 9174 4.7).		*/
 	int	 keepalive;   /* min of the two proposals, seconds.	*/
@@ -212,14 +223,30 @@ typedef struct Tcpv4Conn
 	int termSent;
 } Tcpv4Conn;
 
-/*	Per-neighbour reconnection backoff (RFC 9174 4.1).		*/
+/*	Per-neighbour reconnection backoff (RFC 9174 4.1).  The backoff
+ *	is advanced by anything that stops a session from being reached -
+ *	a refused connection, but equally a contact header, TLS handshake
+ *	or SESS_INIT that fails - and reset only once a session has
+ *	actually been established.  A peer that accepts TCP and then
+ *	rejects the session is the common misconfiguration, and it is
+ *	exactly the case that a connect-only backoff never slows down.	*/
 typedef struct Tcpv4Dial
 {
 	struct Tcpv4Dial *next;
-	uvast		  nodeNbr;
+	char		  nodeId[TCPV4_MAX_NODEID_LEN];
 	int		  interval;	/* Current backoff, seconds.	*/
 	int		  secUntilRetry;
 } Tcpv4Dial;
+
+/*	Per-session state the clock thread collects under the engine lock
+ *	and acts on outside it.						*/
+typedef struct
+{
+	Tcpv4Conn *conn;
+	int	   sendKa;
+	int	   sendTerm;
+	int	   timedOut;
+} Tcpv4Tick;
 
 struct Tcpv4Engine
 {
@@ -242,7 +269,11 @@ struct Tcpv4Engine
 
 	Tcpv4Conn *conns;
 	int	   connCount;
+	int	   maxSessions;	 /* cfg.maxSessions, for brevity.	*/
 	Tcpv4Dial *dials;
+	Tcpv4Tick *ticks;	 /* Clock thread scratch, maxSessions
+				    + TCPV4_BUSY_SLACK entries.		*/
+	unsigned int randState;	 /* Backoff randomization (4.1).	*/
 };
 
 /*	*	*	tcpv4io.c: session I/O	*	*	*	*/
@@ -264,6 +295,17 @@ void tcpv4TuneSocket(const Tcpv4ClaConfig *cfg, int sock);
 
 /*	Mark a session dead and wake everybody waiting on it.		*/
 void tcpv4ConnFail(Tcpv4Conn *conn);
+
+/*	Names for the log, so that a rejection or a refusal reads as what
+ *	it is rather than as a number.					*/
+const char *tcpv4MsgTypeName(uint8_t type);
+const char *tcpv4RefuseReasonName(uint8_t reason);
+
+/*	Read and report the rest of an inbound MSG_REJECT (RFC 9174 5.1.2),
+ *	whose type octet the caller has already read.  Never answers with a
+ *	MSG_REJECT of its own, which 5.1.2 forbids.  Returns 0 with
+ *	*rejectedType set, -1 when the message could not be read.	*/
+int tcpv4RecvMsgReject(Tcpv4Conn *conn, uint8_t *rejectedType);
 
 int tcpv4SendKeepalive(Tcpv4Conn *conn);
 int tcpv4SendSessTerm(Tcpv4Conn *conn, uint8_t reason, int reply);
@@ -325,7 +367,18 @@ int tcpv4MessageLoop(Tcpv4Conn *conn);
  *	RFC 9174 4.1.  Returns 0 when a session is opening or open, -1 when
  *	no attempt was made.  Takes e->mutex itself, so the caller must
  *	not hold it.							*/
-int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName);
+int tcpv4OpenSession(Tcpv4Engine *e, const char *nodeId, const char *ductName);
+
+/*	Report the outcome of a session this node opened, so that the
+ *	reconnection backoff of RFC 9174 4.1 advances on anything that
+ *	kept the session from being established and resets only on a
+ *	session that was.  A no-op for a session this node accepted.	*/
+void tcpv4DialOutcome(Tcpv4Conn *conn, int established);
+
+/*	Non-zero when this session is one more than the node is prepared
+ *	to carry, so that negotiation ends it with SESS_TERM "Busy"
+ *	(RFC 9174 6.1) rather than a bare close.			*/
+int tcpv4ConnIsBusy(Tcpv4Conn *conn);
 
 #ifdef __cplusplus
 }

@@ -11,7 +11,12 @@
 /*	RFC 9174 4.4.3 requires the handshake to be TLS 1.3 ([RFC8446]) and
  *	to follow BCP 195, so no earlier version is offered.		*/
 
-#define TCPV4_TLS_PRIORITY "SECURE128:-VERS-ALL:+VERS-TLS1.3"
+#define TCPV4_TLS_PRIORITY "SECURE128"
+
+/*	RFC 9174 4.4.3 requires TLS 1.3, so the version restriction is
+ *	appended to whatever the operator asked for rather than left to
+ *	them: -P chooses the cipher policy, not the protocol version.	*/
+#define TCPV4_TLS_VERSIONS "-VERS-ALL:+VERS-TLS1.3"
 
 struct Tcpv4TlsCreds
 {
@@ -108,7 +113,14 @@ Tcpv4TlsConn *tcpv4TlsHandshake(const Tcpv4ClaConfig *cfg,
 {
 	Tcpv4TlsConn *conn;
 	const char   *errPos = NULL;
+	char	      priority[TCPV4_MAX_PRIORITY_LEN + sizeof(TCPV4_TLS_VERSIONS)
+			      + 1];
 	int	      rc;
+
+	isprintf(priority, sizeof(priority), "%s:%s",
+			cfg->tlsPriority[0] == '\0' ? TCPV4_TLS_PRIORITY
+						    : cfg->tlsPriority,
+			TCPV4_TLS_VERSIONS);
 
 	conn = MTAKE(sizeof(Tcpv4TlsConn));
 	if (conn == NULL)
@@ -127,8 +139,7 @@ Tcpv4TlsConn *tcpv4TlsHandshake(const Tcpv4ClaConfig *cfg,
 		return NULL;
 	}
 
-	if (gnutls_priority_set_direct(conn->session, TCPV4_TLS_PRIORITY,
-			    &errPos)
+	if (gnutls_priority_set_direct(conn->session, priority, &errPos)
 			!= 0)
 	{
 		putErrmsg("tcpv4cla: bad TLS priority string.",

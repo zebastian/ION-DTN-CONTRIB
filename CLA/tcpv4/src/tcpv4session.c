@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -87,13 +88,64 @@ static void freeConn(Tcpv4Conn *conn)
 	MRELEASE(conn);
 }
 
+/*	Say so when a second established session to the same node appears.
+ *	Two nodes that dial each other at the same time get two sessions,
+ *	which RFC 9174 neither forbids nor resolves; sender selection
+ *	settles on one of them (see findConn) and the other falls idle, but
+ *	an operator who is paying for the second connection should be able
+ *	to see that it is there.					*/
+
+static void noteDuplicateSession(Tcpv4Conn *conn)
+{
+	Tcpv4Engine *e = conn->owner;
+	Tcpv4Conn   *other;
+	int	     duplicate = 0;
+
+	if (!tcpv4NodeIdIsSet(conn->routeNodeId))
+	{
+		return;
+	}
+
+	pthread_mutex_lock(&e->mutex);
+	for (other = e->conns; other != NULL; other = other->next)
+	{
+		if (other == conn || other->failed || other->receiverDone
+				|| other->state != TCS_ESTABLISHED)
+		{
+			continue;
+		}
+
+		if (tcpv4NodeIdMatches(other->routeNodeId, conn->routeNodeId))
+		{
+			duplicate = 1;
+			break;
+		}
+	}
+
+	pthread_mutex_unlock(&e->mutex);
+
+	if (duplicate)
+	{
+		writeMemoNote("[i] tcpv4cla has more than one session to node",
+				conn->routeNodeId);
+	}
+}
+
 static void *receiverThread(void *parm)
 {
 	Tcpv4Conn   *conn = parm;
 	Tcpv4Engine *e = conn->owner;
+	int	     established = (tcpv4Establish(conn) == 0);
 
-	if (tcpv4Establish(conn) == 0)
+	/*	RFC 9174 4.1: the reconnection backoff advances on anything
+	 *	that kept a session from being established, and resets only
+	 *	on one that was.					*/
+
+	tcpv4DialOutcome(conn, established);
+
+	if (established)
 	{
+		noteDuplicateSession(conn);
 		conn->rx = e->rx.open(e->rx.user);
 		if (conn->rx == NULL)
 		{
@@ -184,7 +236,8 @@ static void *receiverThread(void *parm)
  *	with e->mutex NOT held.						*/
 
 static Tcpv4Conn *startConn(Tcpv4Engine *e, int sock, int activeRole,
-		uvast nodeNbr, const char *peerName)
+		const char *nodeId, const char *peerName, const char *peerAddr,
+		int busy)
 {
 	Tcpv4Conn *conn;
 
@@ -200,10 +253,26 @@ static Tcpv4Conn *startConn(Tcpv4Engine *e, int sock, int activeRole,
 	conn->sock = sock;
 	conn->activeRole = activeRole;
 	conn->state = TCS_NEGOTIATING;
-	conn->peerNode = nodeNbr;
+	conn->busy = busy;
 	conn->segmentMtu = TCPV4_DEFAULT_SEGMENT_MRU;
 	conn->transferMtu = TCPV4CLA_BUFSZ;
 	istrcpy(conn->peerName, peerName, sizeof(conn->peerName));
+	if (peerAddr != NULL)
+	{
+		istrcpy(conn->peerAddr, peerAddr, sizeof(conn->peerAddr));
+	}
+
+	if (nodeId != NULL)
+	{
+		/*	We dialled this one, so the node it is meant to
+		 *	reach comes from the egress plan rather than from
+		 *	the wire; until SESS_INIT says otherwise, that is
+		 *	also the node it may carry bundles to.		*/
+
+		istrcpy(conn->dialNodeId, nodeId, sizeof(conn->dialNodeId));
+		istrcpy(conn->routeNodeId, nodeId, sizeof(conn->routeNodeId));
+	}
+
 	pthread_mutex_init(&conn->sendMutex, NULL);
 	conn->hasSendMutex = 1;
 	pthread_mutex_init(&conn->txMutex, NULL);
@@ -282,6 +351,36 @@ static void reapConns(Tcpv4Engine *e)
 
 /*	*	*	Accept thread	*	*	*	*	*/
 
+/*	How many sessions with this peer address are part way through
+ *	negotiation.  Called with e->mutex held.			*/
+
+static int countNegotiating(Tcpv4Engine *e, const char *peerHost)
+{
+	Tcpv4Conn *conn;
+	int	   count = 0;
+
+	if (peerHost == NULL || peerHost[0] == '\0')
+	{
+		return 0;
+	}
+
+	for (conn = e->conns; conn != NULL; conn = conn->next)
+	{
+		if (conn->failed || conn->receiverDone
+				|| conn->state != TCS_NEGOTIATING)
+		{
+			continue;
+		}
+
+		if (strcmp(conn->peerAddr, peerHost) == 0)
+		{
+			count++;
+		}
+	}
+
+	return count;
+}
+
 static void *acceptThread(void *parm)
 {
 	Tcpv4Engine	       *e = parm;
@@ -289,6 +388,10 @@ static void *acceptThread(void *parm)
 	struct sockaddr_storage peerAddr;
 	socklen_t		peerLen;
 	char			peerName[TCPV4_MAX_HOST_LEN];
+	char			peerHost[TCPV4_MAX_HOST_LEN];
+	int			negotiating;
+	int			connCount;
+	int			busy;
 	int			newSock;
 
 	while (e->running)
@@ -326,10 +429,63 @@ static void *acceptThread(void *parm)
 			break;
 		}
 
-		if (e->connCount >= TCPV4_MAX_SESSIONS)
 		{
-			writeMemo("[?] tcpv4cla refusing a connection: session"
-				  " limit reached.");
+			char host[NI_MAXHOST];
+			char serv[NI_MAXSERV];
+
+			if (getnameinfo((struct sockaddr *) &peerAddr, peerLen,
+					    host, sizeof host, serv,
+					    sizeof serv,
+					    NI_NUMERICHOST | NI_NUMERICSERV)
+					== 0)
+			{
+				isprintf(peerName, sizeof(peerName), "%s:%s",
+						host, serv);
+				istrcpy(peerHost, host, sizeof(peerHost));
+			}
+			else
+			{
+				istrcpy(peerName, "(unknown peer)",
+						sizeof(peerName));
+				peerHost[0] = '\0';
+			}
+		}
+
+		/*	RFC 9174 7.10 (denial of service): negotiation is the
+		 *	phase an unauthenticated peer can drive, and it can
+		 *	be made to last the whole contact timeout, so it is
+		 *	rationed per peer address rather than only globally -
+		 *	otherwise one address holds every session slot on the
+		 *	node and no other peer can get in.  Established
+		 *	sessions are not rationed this way, so a legitimate
+		 *	peer reconnecting is unaffected.		*/
+
+		pthread_mutex_lock(&e->mutex);
+		negotiating = countNegotiating(e, peerHost);
+		connCount = e->connCount;
+		pthread_mutex_unlock(&e->mutex);
+
+		if (peerHost[0] != '\0'
+				&& negotiating >= TCPV4_MAX_PEER_NEGOTIATING)
+		{
+			writeMemoNote("[?] tcpv4cla refusing a connection,"
+				      " too many sessions being negotiated"
+				      " with", peerName);
+			closesocket(newSock);
+			continue;
+		}
+
+		/*	Past the session limit the connection is still worth
+		 *	a SESS_TERM "Busy" (RFC 9174 6.1), which tells the
+		 *	peer to come back rather than leaving it to read a
+		 *	bare close as a network fault.  That courtesy costs a
+		 *	handshake, so only a bounded few get it.	*/
+
+		busy = (connCount >= e->maxSessions);
+		if (connCount >= e->maxSessions + TCPV4_BUSY_SLACK)
+		{
+			writeMemoNote("[?] tcpv4cla refusing a connection,"
+				      " session limit reached:", peerName);
 			closesocket(newSock);
 			continue;
 		}
@@ -343,27 +499,8 @@ static void *acceptThread(void *parm)
 
 		tcpv4TuneSocket(&e->cfg, newSock);
 
-		{
-			char host[NI_MAXHOST];
-			char serv[NI_MAXSERV];
-
-			if (getnameinfo((struct sockaddr *) &peerAddr, peerLen,
-					    host, sizeof host, serv,
-					    sizeof serv,
-					    NI_NUMERICHOST | NI_NUMERICSERV)
-					== 0)
-			{
-				isprintf(peerName, sizeof(peerName), "%s:%s",
-						host, serv);
-			}
-			else
-			{
-				istrcpy(peerName, "(unknown peer)",
-						sizeof(peerName));
-			}
-		}
-
-		if (startConn(e, newSock, 0, 0, peerName) == NULL)
+		if (startConn(e, newSock, 0, NULL, peerName, peerHost, busy)
+				== NULL)
 		{
 			closesocket(newSock);
 		}
@@ -384,12 +521,10 @@ static void *acceptThread(void *parm)
 
 static void clockTick(Tcpv4Engine *e)
 {
-	Tcpv4Conn *snapshot[TCPV4_MAX_SESSIONS];
+	Tcpv4Tick *tick = e->ticks;
 	Tcpv4Conn *conn;
 	Tcpv4Dial *dial;
-	int	   sendKa[TCPV4_MAX_SESSIONS];
-	int	   sendTerm[TCPV4_MAX_SESSIONS];
-	int	   timedOut[TCPV4_MAX_SESSIONS];
+	int	   room = e->maxSessions + TCPV4_BUSY_SLACK;
 	int	   count = 0;
 	int	   i;
 
@@ -402,17 +537,17 @@ static void clockTick(Tcpv4Engine *e)
 		}
 	}
 
-	for (conn = e->conns; conn != NULL && count < TCPV4_MAX_SESSIONS;
-			conn = conn->next)
+	for (conn = e->conns; conn != NULL && count < room; conn = conn->next)
 	{
 		if (conn->failed || conn->receiverDone)
 		{
 			continue;
 		}
 
-		sendKa[count] = 0;
-		sendTerm[count] = 0;
-		timedOut[count] = 0;
+		tick[count].conn = conn;
+		tick[count].sendKa = 0;
+		tick[count].sendTerm = 0;
+		tick[count].timedOut = 0;
 		conn->secSinceTx++;
 		conn->secSinceRx++;
 		conn->secSinceData++;
@@ -422,10 +557,10 @@ static void clockTick(Tcpv4Engine *e)
 			conn->secNegotiating++;
 			if (conn->secNegotiating > TCPV4_CONTACT_TIMEOUT)
 			{
-				timedOut[count] = 1;
+				tick[count].timedOut = 1;
 			}
 
-			snapshot[count++] = conn;
+			count++;
 			continue;
 		}
 
@@ -433,7 +568,7 @@ static void clockTick(Tcpv4Engine *e)
 		{
 			if (conn->secSinceTx >= conn->keepalive)
 			{
-				sendKa[count] = 1;
+				tick[count].sendKa = 1;
 			}
 
 			/*	RFC 9174 5.1.1: silence for longer than the
@@ -442,7 +577,7 @@ static void clockTick(Tcpv4Engine *e)
 
 			if (conn->secSinceRx > 2 * conn->keepalive)
 			{
-				timedOut[count] = 1;
+				tick[count].timedOut = 1;
 			}
 		}
 
@@ -453,10 +588,10 @@ static void clockTick(Tcpv4Engine *e)
 		{
 			conn->termSent = 1;
 			conn->state = TCS_ENDING;
-			sendTerm[count] = 1;
+			tick[count].sendTerm = 1;
 		}
 
-		snapshot[count++] = conn;
+		count++;
 	}
 
 	pthread_mutex_unlock(&e->mutex);
@@ -466,8 +601,8 @@ static void clockTick(Tcpv4Engine *e)
 
 	for (i = 0; i < count; i++)
 	{
-		conn = snapshot[i];
-		if (timedOut[i])
+		conn = tick[i].conn;
+		if (tick[i].timedOut)
 		{
 			writeMemoNote("[?] tcpv4cla session timed out with",
 					conn->peerName);
@@ -475,11 +610,16 @@ static void clockTick(Tcpv4Engine *e)
 			continue;
 		}
 
-		if (sendTerm[i])
+		if (tick[i].sendTerm)
 		{
 			writeMemoNote("[i] tcpv4cla terminating idle session"
 				      " with",
 					conn->peerName);
+
+			/*	RFC 9174 6.1: no new transfer may begin once
+			 *	a SESS_TERM has gone out.		*/
+
+			tcpv4TxStop(conn);
 			if (tcpv4SendSessTerm(conn, TMSG_TERM_IDLE_TIMEOUT, 0) < 0)
 			{
 				tcpv4ConnFail(conn);
@@ -488,7 +628,7 @@ static void clockTick(Tcpv4Engine *e)
 			continue;
 		}
 
-		if (sendKa[i] && tcpv4SendKeepalive(conn) < 0)
+		if (tick[i].sendKa && tcpv4SendKeepalive(conn) < 0)
 		{
 			tcpv4ConnFail(conn);
 		}
@@ -514,13 +654,13 @@ static void *clockThread(void *parm)
 
 /*	*	*	Reconnection backoff	*	*	*	*/
 
-static Tcpv4Dial *findDial(Tcpv4Engine *e, uvast nodeNbr)
+static Tcpv4Dial *findDial(Tcpv4Engine *e, const char *nodeId)
 {
 	Tcpv4Dial *dial;
 
 	for (dial = e->dials; dial != NULL; dial = dial->next)
 	{
-		if (dial->nodeNbr == nodeNbr)
+		if (tcpv4NodeIdMatches(dial->nodeId, nodeId))
 		{
 			return dial;
 		}
@@ -533,11 +673,75 @@ static Tcpv4Dial *findDial(Tcpv4Engine *e, uvast nodeNbr)
 	}
 
 	memset(dial, 0, sizeof(*dial));
-	dial->nodeNbr = nodeNbr;
+	istrcpy(dial->nodeId, nodeId, sizeof(dial->nodeId));
 	dial->interval = 1;
 	dial->next = e->dials;
 	e->dials = dial;
 	return dial;
+}
+
+/*	Set the wait before the next attempt on this neighbour and double
+ *	the interval for the attempt after that, to the cap of RFC 9174
+ *	4.1.  The wait is drawn from the upper half of the interval rather
+ *	than being the interval itself: 4.1 asks for randomization, so
+ *	that a set of nodes knocked off the air together does not come
+ *	back in lockstep and collide again.  Called with e->mutex held.	*/
+
+static void backOff(Tcpv4Engine *e, Tcpv4Dial *dial)
+{
+	int half = dial->interval / 2;
+
+	dial->secUntilRetry = dial->interval - half
+			+ (int) (rand_r(&e->randState) % (unsigned) (half + 1));
+	dial->interval <<= 1;
+	if (dial->interval > TCPV4_MAX_RECONNECT)
+	{
+		dial->interval = TCPV4_MAX_RECONNECT;
+	}
+}
+
+void tcpv4DialOutcome(Tcpv4Conn *conn, int established)
+{
+	Tcpv4Engine *e = conn->owner;
+	Tcpv4Dial   *dial;
+
+	if (!conn->activeRole || !tcpv4NodeIdIsSet(conn->dialNodeId))
+	{
+		return; /* Not a session this node dialled.		*/
+	}
+
+	pthread_mutex_lock(&e->mutex);
+	dial = findDial(e, conn->dialNodeId);
+	if (dial != NULL)
+	{
+		if (established)
+		{
+			/*	RFC 9174 4.1: the delay is reset once a
+			 *	session has been established - which is not
+			 *	the same as the TCP connection having been
+			 *	accepted.  A peer that accepts the connection
+			 *	and then rejects the session (a certificate
+			 *	it will not trust, a NODE-ID it cannot
+			 *	authenticate, a TLS policy it cannot meet) is
+			 *	the ordinary misconfiguration, and resetting
+			 *	on connect would have this node retry it at
+			 *	full speed for as long as it lasted.	*/
+
+			dial->interval = 1;
+			dial->secUntilRetry = 0;
+		}
+		else
+		{
+			backOff(e, dial);
+		}
+	}
+
+	pthread_mutex_unlock(&e->mutex);
+}
+
+int tcpv4ConnIsBusy(Tcpv4Conn *conn)
+{
+	return conn->busy;
 }
 
 /*	*	*	Engine	*	*	*	*	*	*/
@@ -564,8 +768,29 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
 	e->cfg = *cfg;
 	e->rx = *rx;
 	e->tx = *tx;
+	e->maxSessions = (cfg->maxSessions > 0 ? cfg->maxSessions
+					       : TCPV4_DEFAULT_MAX_SESSIONS);
+	e->randState = (unsigned int) (getpid() ^ (int) time(NULL));
 	pthread_mutex_init(&e->mutex, NULL);
 	pthread_cond_init(&e->cond, NULL);
+
+	/*	The clock thread collects what it has to do under the engine
+	 *	lock and does it outside, so it needs somewhere to put a
+	 *	session's worth of decisions.  It is allocated once here
+	 *	rather than taken off that thread's stack, since -L makes
+	 *	the session limit an operator's choice.			*/
+
+	e->ticks = MTAKE(sizeof(Tcpv4Tick)
+			* (e->maxSessions + TCPV4_BUSY_SLACK));
+	if (e->ticks == NULL)
+	{
+		putErrmsg("tcpv4cla: no memory for session upkeep.", NULL);
+		tcpv4EngineStop(e);
+		return NULL;
+	}
+
+	memset(e->ticks, 0, sizeof(Tcpv4Tick)
+			* (e->maxSessions + TCPV4_BUSY_SLACK));
 
 	{
 		char nbrBuf[FQN_MAX_LENGTH];
@@ -640,9 +865,10 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
  *	RFC 9174 4.1.  Returns 0 when a session attempt was started, -1
  *	otherwise.							*/
 
-int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName)
+int tcpv4OpenSession(Tcpv4Engine *e, const char *nodeId, const char *ductName)
 {
 	Tcpv4Dial *dial;
+	Tcpv4Conn *conn;
 	char	   spec[TCPV4_MAX_HOST_LEN + 16];
 	char	   host[TCPV4_MAX_HOST_LEN];
 	int	   port = e->cfg.port;
@@ -650,7 +876,32 @@ int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName)
 	int	   result;
 
 	pthread_mutex_lock(&e->mutex);
-	dial = findDial(e, nodeNbr);
+
+	/*	A session to this node may have appeared since the caller
+	 *	looked - one this node accepted, or one another sender
+	 *	dialled.  Two nodes that dial each other at the same time
+	 *	will still end up with two sessions, which is legal but
+	 *	wasteful; this at least keeps one node from doing it to
+	 *	itself.							*/
+
+	for (conn = e->conns; conn != NULL; conn = conn->next)
+	{
+		if (conn->failed || conn->receiverDone
+				|| conn->state == TCS_ENDING)
+		{
+			continue;
+		}
+
+		if (tcpv4NodeIdMatches(conn->dialNodeId, nodeId)
+				|| tcpv4NodeIdMatches(conn->routeNodeId,
+						  nodeId))
+		{
+			pthread_mutex_unlock(&e->mutex);
+			return 0; /* One is already open or opening.	*/
+		}
+	}
+
+	dial = findDial(e, nodeId);
 	if (dial == NULL)
 	{
 		pthread_mutex_unlock(&e->mutex);
@@ -663,7 +914,7 @@ int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName)
 		return -1; /* Must not retry yet.			*/
 	}
 
-	if (e->connCount >= TCPV4_MAX_SESSIONS)
+	if (e->connCount >= e->maxSessions)
 	{
 		pthread_mutex_unlock(&e->mutex);
 		writeMemo("[?] tcpv4cla not dialling: session limit reached.");
@@ -685,13 +936,7 @@ int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName)
 	if (result < 1)
 	{
 		pthread_mutex_lock(&e->mutex);
-		dial->secUntilRetry = dial->interval;
-		dial->interval <<= 1;
-		if (dial->interval > TCPV4_MAX_RECONNECT)
-		{
-			dial->interval = TCPV4_MAX_RECONNECT;
-		}
-
+		backOff(e, dial);
 		pthread_mutex_unlock(&e->mutex);
 		if (result == 0)
 		{
@@ -711,15 +956,15 @@ int tcpv4OpenSession(Tcpv4Engine *e, uvast nodeNbr, const char *ductName)
 
 	tcpv4TuneSocket(&e->cfg, sock);
 
-	pthread_mutex_lock(&e->mutex);
-	dial->interval = 1;
-	dial->secUntilRetry = 0;
-	pthread_mutex_unlock(&e->mutex);
+	/*	The backoff is not reset here.  A connection that is
+	 *	accepted and then goes no further has not reached a session,
+	 *	and it is the receiver thread - which knows how the
+	 *	negotiation ended - that reports the outcome.		*/
 
 	/*	The peer name doubles as the TLS server_name, so it is the
 	 *	host part of the duct name, not the whole spec.		*/
 
-	if (startConn(e, sock, 1, nodeNbr, host) == NULL)
+	if (startConn(e, sock, 1, nodeId, host, NULL, 0) == NULL)
 	{
 		closesocket(sock);
 		return -1;
@@ -813,6 +1058,11 @@ void tcpv4EngineStop(Tcpv4Engine *e)
 	if (e->listenSock != -1)
 	{
 		closesocket(e->listenSock);
+	}
+
+	if (e->ticks != NULL)
+	{
+		MRELEASE(e->ticks);
 	}
 
 	tcpv4TlsCredsFree(e->serverCreds);

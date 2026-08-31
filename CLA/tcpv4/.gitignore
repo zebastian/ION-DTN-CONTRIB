@@ -9,6 +9,8 @@ tests/*/bigfile
 tests/*/counter.out
 tests/*/bpacq.*
 tests/*/bpdriverAduFile
+tests/*/peer.out
+tests/*/peer.err
 
 # bench run artifacts
 bench/ion.log
@@ -32,4 +34,7 @@ tcpv4cla
 tcpv4msg_test
 tcpv4msg_test.log
 tcpv4msg_test.trs
+tcpv4nodeid_test
+tcpv4nodeid_test.log
+tcpv4nodeid_test.trs
 test-suite.log

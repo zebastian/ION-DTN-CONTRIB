@@ -136,20 +136,6 @@ static int exchangeContact(Tcpv4Conn *conn, int *enableTls)
 	return 0;
 }
 
-/*	Parse "ipn:<node>[.<service>]" into a node number, or 0.		*/
-
-static uvast nodeNbrFromNodeId(const char *nodeId)
-{
-	uvast node = 0;
-
-	if (nodeId != NULL && strncmp(nodeId, "ipn:", 4) == 0)
-	{
-		oK(sscanf(nodeId + 4, UVAST_FIELDSPEC, &node));
-	}
-
-	return node;
-}
-
 /*	Apply the peer's SESS_INIT: negotiate the session parameters
  *	(RFC 9174 4.7) and adopt the peer's node ID (RFC 9174 4.6).
  *	Returns 0 on success, -1 when the session is unacceptable.	*/
@@ -157,7 +143,6 @@ static uvast nodeNbrFromNodeId(const char *nodeId)
 static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 {
 	Tcpv4Engine *e = conn->owner;
-	uvast	     peerNode;
 	size_t	     off = 0;
 	Tcpv4ExtItem item;
 	char	     claimed[TCPV4_MAX_NODEID_LEN] = {0};
@@ -251,8 +236,6 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 		}
 	}
 
-	peerNode = nodeNbrFromNodeId(claimed);
-
 	pthread_mutex_lock(&e->mutex);
 	conn->segmentMtu = peer->segmentMru;
 	conn->transferMtu = peer->transferMru;
@@ -262,6 +245,12 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 	istrcpy(conn->peerNodeId, claimed, sizeof(conn->peerNodeId));
 	conn->nodeIdAuthenticated = authenticated;
 
+	/*	Which node, if any, this session may carry bundles to.  The
+	 *	node ID is kept as the peer spelled it rather than reduced
+	 *	to a node number, so a peer named by any EID scheme is
+	 *	routable; tcpv4NodeIdMatches knows the one scheme whose
+	 *	spelling is not its identity.				*/
+
 	if (authenticated)
 	{
 		/*	RFC 9174 4.6: the session is associated with the node
@@ -269,26 +258,34 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 		 *	one we dialled - now that the certificate says the
 		 *	peer is entitled to it.				*/
 
-		conn->peerNode = peerNode;
+		istrcpy(conn->routeNodeId, claimed, sizeof(conn->routeNodeId));
 	}
 	else if (conn->activeRole)
 	{
-		/*	We opened this session, so its node number came from
-		 *	the egress plan and not from the wire.  Keep it -
-		 *	unless the peer answers with a different node ID,
-		 *	which nothing here can check and so nothing here
-		 *	will route on.					*/
+		/*	We opened this session, so its node ID came from the
+		 *	egress plan and not from the wire.  Keep it - unless
+		 *	the peer answers with a different node ID, which
+		 *	nothing here can check and so nothing here will
+		 *	route on.					*/
 
-		if (peerNode != 0 && peerNode != conn->peerNode)
+		if (tcpv4NodeIdIsSet(claimed)
+				&& !tcpv4NodeIdMatches(claimed,
+						  conn->dialNodeId))
 		{
 			writeMemoNote("[?] tcpv4cla: peer claims an"
 				      " unauthenticated node ID that is not"
 				      " the one dialled; not routing to it;",
 					conn->peerName);
-			conn->peerNode = 0;
+			conn->routeNodeId[0] = '\0';
+		}
+		else
+		{
+			istrcpy(conn->routeNodeId, conn->dialNodeId,
+					sizeof(conn->routeNodeId));
 		}
 	}
-	else if (e->cfg.eidPolicy == TCPV4_EIDPOL_NONE && peerNode != 0)
+	else if (e->cfg.eidPolicy == TCPV4_EIDPOL_NONE
+			&& tcpv4NodeIdIsSet(claimed))
 	{
 		/*	The operator has explicitly given up on authenticating
 		 *	node IDs, so the session is associated with the node
@@ -297,7 +294,7 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 		 *	and trusting the claim is exactly the trade that -E
 		 *	none names.					*/
 
-		conn->peerNode = peerNode;
+		istrcpy(conn->routeNodeId, claimed, sizeof(conn->routeNodeId));
 	}
 	else
 	{
@@ -307,7 +304,7 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 		 *	name itself as some node and collect that node's
 		 *	traffic.  It can still deliver bundles inward.	*/
 
-		conn->peerNode = 0;
+		conn->routeNodeId[0] = '\0';
 	}
 
 	pthread_mutex_unlock(&e->mutex);
@@ -336,6 +333,19 @@ static int recvSessInit(Tcpv4Conn *conn)
 	{
 		writeMemoNote("[i] tcpv4cla peer refused the session",
 				conn->peerName);
+		return -1;
+	}
+
+	if (fixed[0] == TMSG_MSG_REJECT)
+	{
+		/*	The peer rejected something we sent, so there is no
+		 *	SESS_INIT coming.  RFC 9174 5.1.2 forbids answering
+		 *	a MSG_REJECT with another, so this only reports it
+		 *	and closes.					*/
+
+		uint8_t rejectedType;
+
+		oK(tcpv4RecvMsgReject(conn, &rejectedType));
 		return -1;
 	}
 
@@ -460,6 +470,28 @@ int tcpv4Establish(Tcpv4Conn *conn)
 		conn->peerAuthenticated = tcpv4TlsPeerAuthenticated(conn->tls);
 	}
 
+	/*	RFC 9174 6.1 has a "Busy" reason for a node that cannot take
+	 *	on the session, and 4.3 already establishes that SESS_TERM
+	 *	before SESS_INIT is how the passive entity declines one (it
+	 *	is what a version mismatch sends).  Saying so is worth more
+	 *	to the peer than a bare close, which it can only read as a
+	 *	network fault: told "Busy", it backs off and comes back.
+	 *
+	 *	This is deliberately after the handshake, since a message
+	 *	cannot be sent in the clear once Enable TLS was negotiated.
+	 *	The handshake is not free, which is why only a bounded few
+	 *	sessions past the limit are accepted this far (the accept
+	 *	thread closes the rest outright).			*/
+
+	if (tcpv4ConnIsBusy(conn))
+	{
+		writeMemoNote("[?] tcpv4cla refusing a session, too many"
+			      " sessions open:",
+				conn->peerName);
+		oK(tcpv4SendSessTerm(conn, TMSG_TERM_BUSY, 0));
+		return -1;
+	}
+
 	/*	RFC 9174 4.4.3 has the active entity send SESS_INIT first;
 	 *	both directions are independent, so send ours right away and
 	 *	then read the peer's.					*/
@@ -506,8 +538,8 @@ int tcpv4Establish(Tcpv4Conn *conn)
 				conn->peerNodeId[0] ? conn->peerNodeId
 						   : "unknown",
 				security,
-				conn->peerNode == 0 ? "inbound only"
-						    : "bidirectional",
+				conn->routeNodeId[0] == '\0' ? "inbound only"
+							     : "bidirectional",
 				conn->keepalive, (uvast) conn->segmentMtu);
 		writeMemo(txt);
 	}

@@ -1,0 +1,8 @@
+#!/bin/bash
+pkill -9 -x tcpv4cla 2>/dev/null
+pkill -9 -f "peer.py" 2>/dev/null
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f ion.log sendfile testfile* bpacq.* peer.out peer.err
+rm -f config/proto_runtime.bprc config/proto_runtime.ipnrc
+exit 0

@@ -70,11 +70,16 @@ typedef struct
 Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
 		const Tcpv4Receiver *rx, const Tcpv4Transmitter *tx);
 
-/*	Hand one bundle, of the stated length, to the session to node
- *	nodeNbr, whose TCPCLv4 induct is named by ductName ("host[:port]").
- *	If an established session to that node already exists - whether this
- *	node accepted it or opened it - it is reused; otherwise a new session
- *	is opened, subject to the reconnection backoff of RFC 9174 4.1.
+/*	Hand one bundle, of the stated length, to the session to the node
+ *	named by nodeId, whose TCPCLv4 induct is named by ductName
+ *	("host[:port]").  nodeId is the node ID of the peer as the local
+ *	configuration knows it - the neighbour EID of the egress plan -
+ *	and it is what the peer's own SESS_INIT node ID is matched
+ *	against, so any EID scheme works and no session is tied to the
+ *	ipn scheme.  If an established session to that node already exists
+ *	- whether this node accepted it or opened it - it is reused;
+ *	otherwise a new session is opened, subject to the reconnection
+ *	backoff of RFC 9174 4.1.
  *
  *	The bundle is queued, not sent: the call returns as soon as the
  *	session has accepted it, and the session's transmit thread writes it
@@ -86,8 +91,8 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
  *	Returns 0 when the bundle has been accepted - the engine is then
  *	responsible for reporting its outcome - and -1 when it has not, in
  *	which case the caller still owns it and done is never called.	*/
-int tcpv4EngineSendTo(Tcpv4Engine *e, uvast nodeNbr, const char *ductName,
-		Object bundle, vast length);
+int tcpv4EngineSendTo(Tcpv4Engine *e, const char *nodeId,
+		const char *ductName, Object bundle, vast length);
 
 /*	Stop the engine: terminate every session with SESS_TERM, close the
  *	listening socket, and join the internal threads.  Callers must stop

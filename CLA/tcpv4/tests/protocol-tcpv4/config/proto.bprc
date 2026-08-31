@@ -1,0 +1,11 @@
+# bprc for the TCPCLv4 protocol-behaviour test. Substituted by dotest.
+1
+m heapmax 262144
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+a protocol tcpv4 1400 100
+a induct  tcpv4 TCPDUCT 'CLICMD'
+a outduct tcpv4 PEERDUCT ''
+r 'ipnadmin config/proto_runtime.ipnrc'
+s

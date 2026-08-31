@@ -45,9 +45,14 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
   drained.
 - **Upkeep** (§5.1): `KEEPALIVE` at the negotiated interval, `MSG_REJECT` for
   unknown / unexpected messages, and session failure when nothing has been
-  received for twice the keepalive interval.
+  received for twice the keepalive interval.  An inbound `MSG_REJECT` is
+  reported and never answered with another, which §5.1.2 forbids; one that
+  names the transfer machinery ends the session, since the two ends no longer
+  agree about its state.
 - **Termination** (§6): `SESS_TERM` with the REPLY flag exchanged on shutdown,
-  and optional idle session termination (`-t`).
+  no new transfer begun once one has been sent, and optional idle session
+  termination (`-t`).  A connection arriving past the session limit (`-L`) is
+  told `SESS_TERM` "Busy" rather than simply dropped.
 
 ## Conformance to RFC 9174
 
@@ -59,12 +64,15 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | Session extension items (§4.8) | parsed; unknown CRITICAL ends the session |
 | `KEEPALIVE`, `MSG_REJECT` (§5.1) | implemented |
 | `XFER_SEGMENT` / `XFER_ACK`, segment pipelining (§5.2.2, §5.2.3) | implemented |
-| `XFER_REFUSE` (§5.2.4) | originated and decoded |
+| `XFER_REFUSE` (§5.2.4) | originated and honoured; "Completed" counts the transfer as sent |
+| `MSG_REJECT` (§5.1.2) | originated and honoured; never sent in answer to one |
 | Transfer extension items (§5.2.5) | parsed; unknown CRITICAL refuses the transfer |
 | Transfer Length extension item (§5.2.5.1) | emitted and honoured |
 | `SESS_TERM`, REPLY flag, Ending state (§6.1) | implemented |
 | Idle session termination (§6.2) | implemented (`-t`) |
-| Reconnection backoff, contact timeout (§4.1) | implemented (binary backoff, capped at 60 s) |
+| Reconnection backoff, contact timeout (§4.1) | implemented (randomized binary backoff, capped at 60 s, reset only by an established session) |
+| Session limit and "Busy" refusal (§6.1, §7.10) | implemented (`-L`, plus a per-address cap on concurrent negotiations) |
+| Peer node ID (§4.6) | any EID scheme; sessions are keyed on the node ID, not on an ipn node number |
 | NODE-ID authentication (§4.4.1, §4.4.4.3, §7.9) | implemented (`-E`); an unauthenticated node ID never attracts egress |
 | Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
 | OCSP checking, EKU policy (§4.4.4.1) | **not implemented** |
@@ -81,7 +89,9 @@ while still using TLS, and the session is then reported as unauthenticated.
 
 `-T` sets the policy applied to the negotiated Enable TLS value: `require`
 (default), `prefer` (opportunistic security, RFC 7435), or `none` (plaintext).
-Only TLS 1.3 is offered, per §4.4.3.
+Only TLS 1.3 is offered, per §4.4.3: `-P` chooses the cipher policy (a GnuTLS
+priority string, `SECURE128` by default) but not the protocol version, which
+is appended to whatever it names.
 
 ### Node ID authentication
 
@@ -96,7 +106,7 @@ can name itself as some other node and collect that node's traffic.
 `prefer`, or `none`. Independently of the policy, **a node ID that was not
 authenticated is never used to route bundles to the peer**: a session this
 node accepted is marked *inbound only* and will not be selected to carry
-bundles outward. A session this node opened keeps the node number from its
+bundles outward. A session this node opened keeps the node ID from its
 egress plan, which came from configuration rather than from the wire, so
 egress works even in plaintext — but if such a peer answers claiming a
 *different* node ID that cannot be authenticated, that session is dropped from
@@ -135,7 +145,16 @@ Flags (on the `tcpv4cla` induct command): `-c`/`-k` cert/key, `-C` CA file,
 policy (`require`/`prefer`/`none`), `-K` keepalive
 interval to propose, `-t` idle session timeout, `-S`/`-M` advertised Segment
 and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
-(`SO_RCVBUF`/`SO_SNDBUF`; 0 = OS default).
+(`SO_RCVBUF`/`SO_SNDBUF`; 0 = OS default), `-L` concurrent session limit,
+`-P` GnuTLS priority string.
+
+A peer is named by the neighbour EID of its egress plan, in whatever scheme
+that EID uses. RFC 9174 §4.6 identifies a peer by a node ID rather than by a
+node number, and that node ID is what the peer's `SESS_INIT` claim is matched
+against and what its certificate has to authenticate, so a `dtn:` neighbour is
+as reachable as an `ipn:` one. Two spellings of the same `ipn` node ID
+(`ipn:5`, `ipn:5.0`, `ipn:0.5.0`) name the same node; anything else is
+compared literally.
 
 Note that ION's own `tcp` protocol (TCPCLv3, `tcpcli`) also defaults to port
 4556; give one of them a different port if both run on the same node.
@@ -179,6 +198,7 @@ these limits before starting ION so the failure is legible.
 ```
 src/tcpv4cla.h          constants and configuration struct
 src/tcpv4cfg.c          duct-name and command-line argument parsing
+src/tcpv4nodeid.{c,h}   node ID comparison (dependency-free)
 src/tcpv4msg.{c,h}      RFC 9174 wire-message codec (dependency-free)
 src/tcpv4tls.h          TLS backend interface
 src/tcpv4tls_gnutls.c   GnuTLS backend (TLS 1.3)
@@ -195,6 +215,7 @@ doc/*.pod               man page sources
 tests/loopback-tcpv4/       single-node loopback over TLS (.optional)
 tests/loopback-tcpv4-notls/ single-node plaintext loopback (.optional)
 tests/nodeid-tcpv4/         NODE-ID authentication policy (.optional)
+tests/protocol-tcpv4/       error paths, against a synthetic peer (.optional)
 bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 bench/bench-tcpv4-impaired  the same sweep over a delayed / lossy link
 ```
@@ -231,7 +252,21 @@ limit while BP was congested.
 ## Testing
 
 - `make check` — codec round-trip unit tests for the contact header, every
-  message type, and the extension-item TLV walker.
+  message type, and the extension-item TLV walker; and node ID comparison,
+  which decides which session may carry a node's traffic.
+- `tests/protocol-tcpv4` — the error paths, driven by a synthetic RFC 9174
+  peer (`peer.py`) that speaks the protocol on a plaintext socket. The bp
+  test tools can drive the happy path and no more: they cannot send a
+  `MSG_REJECT`, refuse a transfer, stall part way through negotiation or
+  leave a connection unanswered. Six phases, each asserting both what went
+  over the wire and what `tcpv4cla` wrote to `ion.log`: an inbound
+  `MSG_REJECT` is reported and never reflected (§5.1.2) while one naming
+  `XFER_SEGMENT` ends the session; a transfer refused as "Completed" counts
+  as sent while one refused otherwise comes back (§5.2.4); a peer that names
+  itself `dtn://peer-b/` is routable (§4.6); connections left half-negotiated
+  are rationed per address (§7.10); a session past `-L` is refused with
+  `SESS_TERM` "Busy" (§6.1); and the reconnection delay grows after a peer
+  that accepts the connection but never establishes a session (§4.1).
 - `tests/loopback-tcpv4` — over TLS: session establishment, a single-segment
   transfer, a multi-segment transfer (Segment MRU forced to 2000 with `-S`),
   50 streamed bundles, an idle period survived on KEEPALIVEs, and a graceful
@@ -307,12 +342,14 @@ delivering 100% (Mbps as reported by `bpcounter`):
 |  64 KiB |    488  |    494.8  |          530.0  |             551.6  |
 
 Reading it: TCPCLv4 is at parity with ION's TCPCLv3 up to 8 KiB and about
-10% behind it from 16 KiB up, where `tcpcli`'s transmission pipeline (it
-keeps up to 100 bundles awaiting acknowledgment) starts to pay off against
-this implementation's one-transfer-at-a-time sender, which RFC 9174 5.2.2
-requires within a single session but which a v4 implementation may overlap
-across several sessions. TLS costs nothing measurable below 16 KiB and
+10% behind it from 16 KiB up. TLS costs nothing measurable below 16 KiB and
 about 5-7% at 64 KiB, where the AEAD work scales with the payload.
+
+These figures predate the transmission window, and loopback cannot show
+what the window is for: with no round-trip time to hide, a sender that
+keeps one transfer in flight and one that keeps a hundred measure the
+same. The impaired-link sweep below is the measurement that separates
+them.
 
 Throughput at small sizes is dominated by ION's per-bundle cost, not by
 the convergence layer: all three modes land within 3% of each other at
@@ -342,15 +379,34 @@ dumpcap -i lo -f 'tcp port 4556' -w /tmp/tcpv4.pcap
 tshark -o tls.keylog_file:/tmp/tcpv4.keys -r /tmp/tcpv4.pcap
 ```
 
+## Diagnostics
+
+ION has no log levels, so the daemon says what happened in `ion.log` memos —
+`[i]` for the ordinary course of a session, `[?]` for anything an operator
+would want to look into. These are also what the tests assert on, so the
+wording is deliberately stable:
+
+| Memo | Means |
+|------|-------|
+| `session established with '...'` | with the peer's node ID, whether TLS and the NODE-ID authenticated, and whether the session is `bidirectional` or `inbound only` |
+| `got MSG_REJECT from '...'` | the peer rejected a message of ours, with the reason and the message type |
+| `ending a session whose transfers were rejected by` | that rejection named the transfer machinery, so the session is being ended (§5.1.2) |
+| `transfer refused by '...'` | with the reason, and whether the bundle counts as sent (`already completed`) or goes back to BP |
+| `refusing a connection, too many sessions being negotiated with` | the per-address cap on concurrent negotiations (§7.10) |
+| `refusing a session, too many sessions open` | past `-L`; the peer is being told `SESS_TERM` "Busy" (§6.1) |
+| `refusing a connection, session limit reached` | past `-L` plus the slack, so not even that far |
+| `has more than one session to node` | two nodes dialled each other; senders settle on one and the other falls idle |
+| `no session took the bundle, will retry` | said once per run of refusals, not once per attempt |
+| `peer claims an unauthenticated node ID that is not the one dialled` | the session will not be used for egress (§7.9) |
+
 ## Verified by inspection
 
-Some behaviours are verified by inspection rather than by the automated suite,
-as they are awkward to drive with the standard BP tools: `MSG_REJECT`
-generation, `XFER_REFUSE` on an oversized transfer or an unknown CRITICAL
-extension item, the "Version mismatch" termination path, and the reconnection
-backoff.  A NODE-ID that is present but names a *different* node (the
-`Failure` case of RFC 9174 §4.4.4, as against the `Absent` case the test
-covers) is likewise verified by inspection.
+Some behaviours are still verified by inspection rather than by the automated
+suite: `XFER_REFUSE` on an oversized transfer or an unknown CRITICAL extension
+item, and the "Version mismatch" termination path.  A NODE-ID that is present
+but names a *different* node (the `Failure` case of RFC 9174 §4.4.4, as
+against the `Absent` case the test covers) is likewise verified by
+inspection.
 
 ## License
 
