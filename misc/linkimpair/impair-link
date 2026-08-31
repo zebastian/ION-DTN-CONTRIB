@@ -1,0 +1,44 @@
+#!/bin/sh
+# impair-link - feed one UDP port's traffic to linkimpair, and stop doing so.
+#
+#   impair-link start <port> [queue]
+#   impair-link stop  <port> [queue]
+#
+# Both directions of the link are queued (a rule on the port as source and as
+# destination), so a one-way delay of D gives a round-trip time of 2D.
+#
+# Needs root: it installs iptables rules.  While the rules are in place, the
+# port's traffic goes nowhere unless linkimpair is bound to the queue - that is
+# deliberate, so that a benchmark cannot silently report unimpaired numbers
+# because the daemon died.
+
+set -eu
+
+ACTION="${1:?usage: impair-link start|stop <port> [queue]}"
+PORT="${2:?usage: impair-link start|stop <port> [queue]}"
+QUEUE="${3:-1}"
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "impair-link: must run as root (iptables)." >&2
+	exit 1
+fi
+
+case "$ACTION" in
+start)
+	iptables -I OUTPUT -p udp --dport "$PORT" -j NFQUEUE --queue-num "$QUEUE"
+	iptables -I OUTPUT -p udp --sport "$PORT" -j NFQUEUE --queue-num "$QUEUE"
+	echo "impair-link: UDP port $PORT queued to NFQUEUE $QUEUE."
+	;;
+stop)
+	# Delete once per rule; ignore failures so a partial set-up still clears.
+	iptables -D OUTPUT -p udp --dport "$PORT" -j NFQUEUE --queue-num "$QUEUE" \
+		2>/dev/null || true
+	iptables -D OUTPUT -p udp --sport "$PORT" -j NFQUEUE --queue-num "$QUEUE" \
+		2>/dev/null || true
+	echo "impair-link: UDP port $PORT released."
+	;;
+*)
+	echo "usage: impair-link start|stop <port> [queue]" >&2
+	exit 1
+	;;
+esac
