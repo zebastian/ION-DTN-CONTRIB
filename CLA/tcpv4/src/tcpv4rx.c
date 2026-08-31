@@ -306,6 +306,37 @@ static int handleXferSegment(Tcpv4Conn *conn)
 			oK(rxSendRefuse(conn, TMSG_REFUSE_EXT_FAILURE,
 					seg.transferId));
 		}
+
+		if (!conn->rxRefused)
+		{
+			/*	RFC 9174 5.2.5.1: when the peer says how long
+			 *	the whole transfer is, an over-large one can
+			 *	be refused here instead of part way through
+			 *	reassembling it, and the reassembly buffer
+			 *	can be sized once instead of doubled.	*/
+
+			uint64_t total = 0;
+
+			if (tcpv4MsgFindXferLength(seg.xferExt, seg.xferExtLen,
+					    &total)
+					== 1)
+			{
+				if (total > (uint64_t) e->cfg.transferMru)
+				{
+					conn->rxRefused = 1;
+					oK(rxSendRefuse(conn,
+							TMSG_REFUSE_NO_RESOURCES,
+							seg.transferId));
+				}
+				else if (rxReserve(conn, (int) total) < 0)
+				{
+					oK(tcpv4SendSessTerm(conn,
+							TMSG_TERM_RESOURCE_EXHAUSTION,
+							0));
+					return -1;
+				}
+			}
+		}
 	}
 	else
 	{

@@ -229,6 +229,60 @@ static void test_msg_reject(void)
 	assert(tcpv4MsgDecodeMsgReject(buf, n - 1, &out) == 0);
 }
 
+/*	The Transfer Length extension item (RFC 9174 5.2.5.1): a round trip
+ *	through the encoder and the finder, and the cases the finder has to
+ *	tell apart - absent, malformed, and present behind another item.	*/
+
+static void test_xfer_length_ext(void)
+{
+	uint8_t	 buf[64];
+	uint8_t	 other[TMSG_EXT_HDR_LEN + 2];
+	uint8_t	 list[128];
+	uint64_t length = 0;
+	int	 n;
+
+	n = tcpv4MsgEncodeXferLengthExt(buf, sizeof(buf), 0x0102030405060708ULL);
+	assert(n == TMSG_XFEREXT_LENGTH_LEN);
+	assert(buf[0] == 0); /* Not CRITICAL.				*/
+	assert(buf[1] == 0 && buf[2] == TMSG_XFEREXT_LENGTH);
+	assert(buf[3] == 0 && buf[4] == 8);
+
+	assert(tcpv4MsgFindXferLength(buf, n, &length) == 1);
+	assert(length == 0x0102030405060708ULL);
+
+	/*	An empty list simply has no item.			*/
+
+	assert(tcpv4MsgFindXferLength(buf, 0, &length) == 0);
+
+	/*	A list whose item runs past its declared length is a
+	 *	reception failure, not an absent item.			*/
+
+	assert(tcpv4MsgFindXferLength(buf, n - 1, &length) == -1);
+
+	/*	The item is found behind an item of another type.	*/
+
+	other[0] = 0;
+	other[1] = 0;
+	other[2] = 0x42; /* Some other, unknown, type.			*/
+	other[3] = 0;
+	other[4] = 2;
+	other[5] = 0xAA;
+	other[6] = 0xBB;
+	memcpy(list, other, sizeof(other));
+	memcpy(list + sizeof(other), buf, n);
+	length = 0;
+	assert(tcpv4MsgFindXferLength(list, sizeof(other) + n, &length) == 1);
+	assert(length == 0x0102030405060708ULL);
+
+	/*	A Transfer Length item of the wrong size is ignored rather
+	 *	than believed.						*/
+
+	buf[4] = 4;
+	assert(tcpv4MsgFindXferLength(buf, n, &length) == -1);
+
+	assert(tcpv4MsgEncodeXferLengthExt(buf, 4, 1) == -1);
+}
+
 static void test_encode_overflow(void)
 {
 	Tcpv4XferAck ack;
@@ -250,6 +304,7 @@ int main(void)
 	test_keepalive();
 	test_sess_term();
 	test_msg_reject();
+	test_xfer_length_ext();
 	test_encode_overflow();
 	return 0;
 }

@@ -75,6 +75,16 @@ extern "C" {
  *	transfer extension items).					*/
 #define TMSG_EXT_CRITICAL	  0x01
 
+/*	Transfer extension item types (RFC 9174 Table 7).  Transfer Length
+ *	carries the total length of the transfer, which lets the receiver
+ *	size its reassembly buffer once and refuse an over-large transfer
+ *	at its first segment instead of part way through.		*/
+#define TMSG_XFEREXT_LENGTH	  0x0001
+
+/*	One encoded extension item: flags, type, length, value.		*/
+#define TMSG_EXT_HDR_LEN	  5
+#define TMSG_XFEREXT_LENGTH_LEN	  (TMSG_EXT_HDR_LEN + 8)
+
 typedef struct
 {
 	uint8_t version;
@@ -167,6 +177,17 @@ int tcpv4MsgDecodeSessTerm(const uint8_t *buf, size_t len, Tcpv4SessTerm *m);
 
 int tcpv4MsgEncodeMsgReject(uint8_t *buf, size_t cap, const Tcpv4MsgReject *m);
 int tcpv4MsgDecodeMsgReject(const uint8_t *buf, size_t len, Tcpv4MsgReject *m);
+
+/*	Encode a Transfer Length transfer extension item (RFC 9174 5.2.5.1)
+ *	into buf, for use as the xferExt of a START segment.  The item is
+ *	not marked CRITICAL: a peer that does not implement it loses only
+ *	the hint.  Returns the number of octets written, or -1.		*/
+int tcpv4MsgEncodeXferLengthExt(uint8_t *buf, size_t cap, uint64_t length);
+
+/*	Find the Transfer Length item in a START segment's extension list.
+ *	Returns 1 and sets *length when present, 0 when absent, -1 when the
+ *	list is malformed.						*/
+int tcpv4MsgFindXferLength(const uint8_t *buf, size_t len, uint64_t *length);
 
 /*	Walk an extension item list.  *off is the offset of the next item
  *	within buf and is advanced past the item that is returned.

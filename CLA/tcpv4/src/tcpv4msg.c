@@ -397,6 +397,50 @@ int tcpv4MsgDecodeMsgReject(const uint8_t *buf, size_t len, Tcpv4MsgReject *m)
 
 /*	*	*	Extension items	*	*	*	*	*/
 
+int tcpv4MsgEncodeXferLengthExt(uint8_t *buf, size_t cap, uint64_t length)
+{
+	Writer w;
+
+	wInit(&w, buf, cap);
+	wU8(&w, 0); /* Not CRITICAL: the item is only a hint.		*/
+	wU16(&w, TMSG_XFEREXT_LENGTH);
+	wU16(&w, 8);
+	wU64(&w, length);
+	return w.ok ? (int) w.len : -1;
+}
+
+int tcpv4MsgFindXferLength(const uint8_t *buf, size_t len, uint64_t *length)
+{
+	Tcpv4ExtItem item;
+	size_t	     off = 0;
+	int	     rc;
+
+	while ((rc = tcpv4MsgNextExtItem(buf, len, &off, &item)) == 1)
+	{
+		if (item.type != TMSG_XFEREXT_LENGTH || item.length != 8)
+		{
+			continue;
+		}
+
+		{
+			const uint8_t *v = item.value;
+			int	       i;
+			uint64_t       n = 0;
+
+			for (i = 0; i < 8; i++)
+			{
+				n = (n << 8) | v[i];
+			}
+
+			*length = n;
+		}
+
+		return 1;
+	}
+
+	return rc; /* 0 at the end of the list, -1 when malformed.	*/
+}
+
 int tcpv4MsgNextExtItem(const uint8_t *buf, size_t len, size_t *off,
 		Tcpv4ExtItem *item)
 {
