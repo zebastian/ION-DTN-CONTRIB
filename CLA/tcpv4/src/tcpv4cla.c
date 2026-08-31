@@ -545,6 +545,7 @@ int main(int argc, char *argv[])
 		PUTS("Usage: tcpv4cla -c cert -k key [-C cafile] "
 		     "[-R crlfile] [-n] "
 		     "[-T require|prefer|none] [-E require|prefer|none] "
+		     "[-B require|prefer|none] "
 		     "[-K keepalive] [-t idlesec] [-S segmentmru] "
 		     "[-M transfermru] [-r rcvbuf] [-w sndbuf] "
 		     "[-L maxsessions] [-P tlspriority] <host[:port]>");

@@ -435,6 +435,90 @@ static int recvSessInit(Tcpv4Conn *conn)
 	return result;
 }
 
+/*	Apply the certificate profile of RFC 9174 4.4.2 to the peer's
+ *	end-entity certificate, as 4.4.4.1 requires.  Returns 0 when the
+ *	certificate may be used for this session, -1 when it may not - in
+ *	which case the session has been terminated.			*/
+
+static int checkCertProfile(Tcpv4Conn *conn)
+{
+	Tcpv4Engine *e = conn->owner;
+
+	/*	RFC 5280 4.2.1.3: a key usage extension that withholds
+	 *	digitalSignature says the key is not for signing, and a
+	 *	TLS 1.3 handshake authenticates the peer by a signature.
+	 *	Such a certificate cannot have authenticated this one.	*/
+
+	if (tcpv4TlsCheckKeyUsage(conn->tls) == TCPV4_KU_WRONG)
+	{
+		writeMemoNote("[?] tcpv4cla: peer's certificate key usage"
+			      " does not allow the signature that"
+			      " authenticated it (RFC 9174 4.4.4.1);",
+				conn->peerName);
+		oK(tcpv4SendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
+		return -1;
+	}
+
+	switch (tcpv4TlsCheckKeyPurpose(conn->tls))
+	{
+	case TCPV4_EKU_WRONG:
+		/*	The extension is there and names neither the TLS
+		 *	purpose this role needs nor id-kp-bundleSecurity,
+		 *	so the certificate was issued for something else.	*/
+
+		writeMemoNote("[?] tcpv4cla: peer's certificate is not valid"
+			      " for this role (RFC 9174 4.4.2);",
+				conn->peerName);
+		oK(tcpv4SendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
+		return -1;
+
+	case TCPV4_EKU_NO_BUNDLE:
+		/*	Usable for the TLS role, but it does not say it is
+		 *	for TCPCL.  RFC 9174 4.4.5 recommends requiring
+		 *	that it does; 4.4.2 only says a certificate SHOULD
+		 *	carry id-kp-bundleSecurity, so refusing is a policy
+		 *	rather than a conformance matter.		*/
+
+		if (e->cfg.ekuPolicy == TCPV4_EKUPOL_REQUIRE)
+		{
+			writeMemoNote("[?] tcpv4cla: peer's certificate"
+				      " carries no id-kp-bundleSecurity and"
+				      " policy requires one;",
+					conn->peerName);
+			oK(tcpv4SendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE,
+					0));
+			return -1;
+		}
+
+		if (e->cfg.ekuPolicy == TCPV4_EKUPOL_PREFER)
+		{
+			writeMemoNote("[i] tcpv4cla: peer's certificate"
+				      " carries no id-kp-bundleSecurity"
+				      " (RFC 9174 4.4.5);",
+					conn->peerName);
+		}
+
+		break;
+
+	case TCPV4_EKU_ABSENT:
+		/*	No extension, so no restriction (RFC 5280
+		 *	4.2.1.12) - usable, though not the profile 4.4.2
+		 *	asks an issuer for.  Say so once, so that the
+		 *	deviation is visible without being fatal to a
+		 *	working deployment.				*/
+
+		writeMemoNote("[i] tcpv4cla: peer's certificate carries no"
+			      " extended key usage (RFC 9174 4.4.2);",
+				conn->peerName);
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
 /*	Run the whole session establishment sequence on a fresh socket.
  *	Returns 0 once the session is established, -1 otherwise.	*/
 
@@ -469,45 +553,18 @@ int tcpv4Establish(Tcpv4Conn *conn)
 
 		conn->peerAuthenticated = tcpv4TlsPeerAuthenticated(conn->tls);
 
-		/*	RFC 9174 4.4.2: the peer's certificate has to be
-		 *	valid for the role it is playing - id-kp-serverAuth
-		 *	for the passive entity, id-kp-clientAuth for the
-		 *	active one.  Chain validation does not cover this on
-		 *	its own, so a certificate issued for something else
-		 *	entirely would otherwise be taken as authenticating
-		 *	the peer, and everything built on that certificate -
-		 *	the NODE-ID of 4.4.4.3 above all - would rest on it.	*/
+		/*	RFC 9174 4.4.4.1: apply security policy to the key
+		 *	usage and extended key usage extensions, in
+		 *	accordance with RFC 5280 and the profile of 4.4.2.
+		 *	Chain validation covers neither on its own, so a
+		 *	certificate issued for something else entirely
+		 *	would otherwise be taken as authenticating the peer,
+		 *	and everything resting on that certificate - the
+		 *	NODE-ID of 4.4.4.3 above all - would rest on it.	*/
 
-		if (!e->cfg.noVerify)
+		if (!e->cfg.noVerify && checkCertProfile(conn) < 0)
 		{
-			switch (tcpv4TlsCheckKeyPurpose(conn->tls))
-			{
-			case TCPV4_EKU_WRONG:
-				writeMemoNote("[?] tcpv4cla: peer's certificate"
-					      " is not valid for this role"
-					      " (RFC 9174 4.4.2);",
-						conn->peerName);
-				oK(tcpv4SendSessTerm(conn,
-						TMSG_TERM_CONTACT_FAILURE, 0));
-				return -1;
-
-			case TCPV4_EKU_ABSENT:
-				/*	Unrestricted, so usable (RFC 5280
-				 *	4.2.1.12), but 4.4.2 asks an issuer
-				 *	for the extension; say so once, so
-				 *	that an operator can see the
-				 *	deviation without it being fatal to
-				 *	a working deployment.		*/
-
-				writeMemoNote("[i] tcpv4cla: peer's certificate"
-					      " carries no extended key usage"
-					      " (RFC 9174 4.4.2);",
-						conn->peerName);
-				break;
-
-			default:
-				break;
-			}
+			return -1;
 		}
 	}
 

@@ -5,7 +5,8 @@ tcpv4cla - DTN TCPCLv4 convergence layer task
 =head1 SYNOPSIS
 
 B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-R> I<crlfile>] [B<-n>]
-[B<-T> I<policy>] [B<-E> I<policy>] [B<-K> I<keepalive>] [B<-t> I<idlesec>]
+[B<-T> I<policy>] [B<-E> I<policy>] [B<-B> I<policy>] [B<-K> I<keepalive>]
+[B<-t> I<idlesec>]
 [B<-S> I<segmentmru>] [B<-M> I<transfermru>] [B<-r> I<bytes>]
 [B<-w> I<bytes>] [B<-L> I<sessions>] [B<-P> I<priority>] I<host>[:I<port>]
 
@@ -109,6 +110,22 @@ default, and the policy section 4.4.5 recommends) terminates the session with
 allows such a session but leaves the node ID unauthenticated, and C<none>
 skips the check.  A NODE-ID that is present but does not match the node ID the
 peer claims terminates the session under every policy.
+
+=item B<-B> I<policy>
+
+Certificate profile policy (RFC 9174 section 4.4.2): C<require>, C<prefer>
+(default) or C<none>.  Section 4.4.5 recommends requiring that a certificate
+carrying an Extended Key Usage extension name id-kp-bundleSecurity
+(1.3.6.1.5.5.7.3.35) in it; C<require> refuses one that does not, C<prefer>
+accepts it and says so, and C<none> asks only what RFC 5280 section 4.2.1.12
+asks, that the extension not exclude this use.  None of the three refuses a
+certificate carrying no such extension, since section 4.4.2 does not require
+one.  The default is C<prefer> rather than the recommended C<require> because
+requiring it would refuse certificates that work today.
+
+Independently of this policy, a certificate whose Extended Key Usage names
+neither the TLS purpose this role needs nor id-kp-bundleSecurity is refused,
+and so is one whose key usage withholds digitalSignature.
 
 =item B<-K> I<keepalive>
 

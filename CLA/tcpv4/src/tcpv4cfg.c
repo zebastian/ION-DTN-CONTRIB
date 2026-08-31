@@ -90,6 +90,7 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port)
  *   -n             do not verify the peer certificate
  *   -T <policy>    TLS policy: require (default), prefer, none
  *   -E <policy>    NODE-ID authentication: require (default), prefer, none
+ *   -B <policy>    id-kp-bundleSecurity: require, prefer (default), none
  *   -K <seconds>   Keepalive Interval to propose (default 30, 0 disables)
  *   -t <seconds>   idle session termination timeout (default 0 = never)
  *   -S <bytes>     advertised Segment MRU (default 65536)
@@ -112,6 +113,7 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 	cfg->port = TCPV4_DEFAULT_PORT;
 	cfg->tlsPolicy = TCPV4_TLS_REQUIRE;
 	cfg->eidPolicy = TCPV4_EIDPOL_REQUIRE;
+	cfg->ekuPolicy = TCPV4_EKUPOL_PREFER;
 	cfg->keepalive = TCPV4_DEFAULT_KEEPALIVE;
 	cfg->segmentMru = TCPV4_DEFAULT_SEGMENT_MRU;
 	cfg->transferMru = TCPV4CLA_BUFSZ;
@@ -166,6 +168,7 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 			if (strcmp(argv[i], "require") == 0)
 			{
 				cfg->eidPolicy = TCPV4_EIDPOL_REQUIRE;
+	cfg->ekuPolicy = TCPV4_EKUPOL_PREFER;
 			}
 			else if (strcmp(argv[i], "prefer") == 0)
 			{
@@ -182,6 +185,27 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 			}
 
 			eidGiven = 1;
+		}
+		else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc)
+		{
+			i++;
+			if (strcmp(argv[i], "require") == 0)
+			{
+				cfg->ekuPolicy = TCPV4_EKUPOL_REQUIRE;
+			}
+			else if (strcmp(argv[i], "prefer") == 0)
+			{
+				cfg->ekuPolicy = TCPV4_EKUPOL_PREFER;
+			}
+			else if (strcmp(argv[i], "none") == 0)
+			{
+				cfg->ekuPolicy = TCPV4_EKUPOL_NONE;
+			}
+			else
+			{
+				putErrmsg("tcpv4cla: bad -B policy.", argv[i]);
+				return -1;
+			}
 		}
 		else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc)
 		{

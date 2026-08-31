@@ -27,6 +27,50 @@ echo "########################################"
 FAIL=0
 fail() { echo "FAILURE: $1"; FAIL=1; }
 
+# Wait for a delivered copy of $1 rather than sleeping a fixed span:
+# loopback delivery takes a fraction of a second, where the fixed waits
+# this replaces were five to eight of them.  $2 caps the wait in seconds
+# (default 6).  $3, when given, is a marker in ion.log meaning the bundle
+# is not coming, so a phase that expects a refusal need not wait the cap
+# out.
+await_file()
+{
+	local src="$1"
+	local cap="${2:-6}"
+	local marker="$3"
+	local i
+
+	for i in $(seq 1 $((cap * 10))); do
+		if [ -f testfile1 ] && cmp -s "$src" testfile1; then
+			return 0
+		fi
+
+		if [ -n "$marker" ] && grep -q "$marker" ion.log 2>/dev/null
+		then
+			return 1
+		fi
+
+		sleep 0.1
+	done
+
+	return 1
+}
+
+# The daemon is ready when it says so in the log, rather than after a
+# fixed wait.  Returns 1 if it never said so, which start_node's own
+# check then reports.
+await_running()
+{
+	local i
+
+	for i in $(seq 1 50); do
+		grep -q "tcpv4cla is running" ion.log 2>/dev/null && return 0
+		sleep 0.1
+	done
+
+	return 1
+}
+
 for t in tcpv4cla bpsendfile bprecvfile bpdriver bpcounter; do
 	if ! command -v "$t" >/dev/null 2>&1; then
 		echo "SKIP: '$t' not found."
@@ -75,7 +119,7 @@ rm -f testfile*
 bprecvfile ipn:1.2 & RP=$!
 sleep 1
 bpsendfile ipn:1.1 ipn:1.2 sendfile
-sleep 5
+await_file sendfile 6
 if [ -f testfile1 ] && cmp -s sendfile testfile1; then
 	echo "  PASS: bundle delivered over a plaintext session."
 else

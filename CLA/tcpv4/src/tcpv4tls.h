@@ -65,24 +65,50 @@ int tcpv4TlsPeerAuthenticated(Tcpv4TlsConn *conn);
 
 /*	Result of checking the peer's certificate against the TCPCL
  *	certificate profile of RFC 9174 4.4.2.				*/
-#define TCPV4_EKU_PRESENT 1	/* Restricted, and to this purpose.	*/
-#define TCPV4_EKU_ABSENT  0	/* Unrestricted (RFC 5280 4.2.1.12).	*/
-#define TCPV4_EKU_WRONG	  (-1)	/* Restricted, and not to this purpose.	*/
-#define TCPV4_EKU_ERROR	  (-2)	/* No usable peer certificate.		*/
+#define TCPV4_EKU_PRESENT   1	/* Usable, and says so for TCPCL.	*/
+#define TCPV4_EKU_ABSENT    0	/* Unrestricted (RFC 5280 4.2.1.12).	*/
+#define TCPV4_EKU_NO_BUNDLE 2	/* Usable, but no id-kp-bundleSecurity.	*/
+#define TCPV4_EKU_WRONG	    (-1) /* Restricted, and not to this use.	*/
+#define TCPV4_EKU_ERROR	    (-2) /* No usable peer certificate.		*/
 
-/*	Check the peer's end-entity certificate for the extended key usage
- *	its side of the handshake calls for: RFC 9174 4.4.2 has the passive
- *	entity's certificate carry id-kp-serverAuth and the active entity's
- *	id-kp-clientAuth, so which one is wanted follows from which role
- *	this connection took.
+/*	Check the peer's end-entity certificate against the extended key
+ *	usage profile of RFC 9174 4.4.2, which asks for rather less than
+ *	one might assume: a TCPCL certificate SHOULD carry
+ *	id-kp-bundleSecurity and MAY carry id-kp-clientAuth and
+ *	id-kp-serverAuth, and is not obliged to carry an EKU extension at
+ *	all.  So there are three usable shapes and one that is not:
  *
- *	A certificate with no Extended Key Usage extension is unrestricted
- *	and so usable here (RFC 5280 4.2.1.12), even though 4.4.2 asks an
- *	issuer for one; a certificate that carries the extension and
- *	leaves this purpose out has been issued for something else, and
- *	using it here is what RFC 5280 forbids.  Returns one of
- *	TCPV4_EKU_*.							*/
+ *	  ABSENT	no extension, so no restriction (RFC 5280
+ *			4.2.1.12) - usable, though not the profile 4.4.2
+ *			asks an issuer for.
+ *	  PRESENT	carries id-kp-bundleSecurity, or
+ *			anyExtendedKeyUsage: the profile 4.4.5 recommends.
+ *	  NO_BUNDLE	carries the TLS purpose this role needs
+ *			(id-kp-serverAuth for the passive entity,
+ *			id-kp-clientAuth for the active one) but does not
+ *			say it is for TCPCL.
+ *	  WRONG		carries an extension naming none of those, so it
+ *			was issued for something else; using it here is
+ *			what RFC 5280 forbids.
+ *
+ *	Returns one of TCPV4_EKU_*.					*/
 int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn);
+
+/*	Result of checking the peer's certificate key usage (RFC 9174
+ *	4.4.4.1, RFC 5280 4.2.1.3).					*/
+#define TCPV4_KU_OK	1	/* Present and allows a signature.	*/
+#define TCPV4_KU_ABSENT	0	/* No extension, so no restriction.	*/
+#define TCPV4_KU_WRONG	(-1)	/* Present and forbids a signature.	*/
+#define TCPV4_KU_ERROR	(-2)	/* No usable peer certificate.		*/
+
+/*	RFC 9174 4.4.4.1 has the entity apply security policy to the key
+ *	usage extension, if present, in accordance with RFC 5280 4.2.1.3
+ *	and the profile of 4.4.2 - which asks for digitalSignature, the
+ *	bit a TLS 1.3 handshake actually uses.  A certificate whose key
+ *	usage withholds it cannot have authenticated this handshake, so
+ *	accepting one would be accepting a signature its issuer said the
+ *	key was not for.  Returns one of TCPV4_KU_*.			*/
+int tcpv4TlsCheckKeyUsage(Tcpv4TlsConn *conn);
 
 /*	Result of validating an identity against certificate claims, in the
  *	three-way form RFC 9174 4.4.4 defines.				*/

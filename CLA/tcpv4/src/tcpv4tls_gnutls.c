@@ -254,7 +254,15 @@ Tcpv4TlsConn *tcpv4TlsHandshake(const Tcpv4ClaConfig *cfg,
 					conn->session);
 		}
 
-		if (status & GNUTLS_CERT_REVOKED)
+		/*	The status is (unsigned) -1 when no verification
+		 *	result is available - a handshake that failed
+		 *	before the peer's certificate was ever weighed.
+		 *	Every bit is then set, this one included, so
+		 *	without this guard any handshake failure at all
+		 *	reports the peer as revoked.			*/
+
+		if (status != (unsigned int) -1
+				&& (status & GNUTLS_CERT_REVOKED))
 		{
 			writeMemoNote("[?] tcpv4cla: peer's certificate has"
 				      " been revoked by its issuer;",
@@ -369,50 +377,61 @@ int tcpv4TlsPeerAuthenticated(Tcpv4TlsConn *conn)
 
 /*	*	*	Certificate profile	*	*	*	*/
 
-int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn)
+/*	id-kp-bundleSecurity, the PKIX Extended Key Purpose RFC 9174 8.11
+ *	registers for a certificate usable with TCPCL security, and which
+ *	4.4.5 recommends requiring of one that carries an EKU at all.	*/
+#define TCPV4_OID_BUNDLE_SECURITY "1.3.6.1.5.5.7.3.35"
+
+/*	Import the peer's end-entity certificate, which is the one whose
+ *	extensions govern this handshake.  Returns 0 on success.	*/
+
+static int peerCert(Tcpv4TlsConn *conn, gnutls_x509_crt_t *crt)
 {
 	const gnutls_datum_t *certs;
-	gnutls_x509_crt_t     crt;
-	const char	     *wanted;
 	unsigned int	      count = 0;
-	unsigned int	      seq;
-	int		      restricted = 0;
-	int		      found = 0;
-
-	if (conn == NULL)
-	{
-		return TCPV4_EKU_ERROR;
-	}
-
-	/*	RFC 9174 4.4.2: the certificate has to be valid for the
-	 *	role its holder is playing, and the peer's role is the
-	 *	opposite of ours - we are the TLS server exactly when the
-	 *	peer is the active entity (4.4.3).			*/
-
-	wanted = conn->isServer ? GNUTLS_KP_TLS_WWW_CLIENT
-				: GNUTLS_KP_TLS_WWW_SERVER;
 
 	certs = gnutls_certificate_get_peers(conn->session, &count);
 	if (certs == NULL || count == 0)
 	{
-		return TCPV4_EKU_ERROR;
+		return -1;
 	}
 
-	if (gnutls_x509_crt_init(&crt) < 0)
+	if (gnutls_x509_crt_init(crt) < 0)
+	{
+		return -1;
+	}
+
+	if (gnutls_x509_crt_import(*crt, &certs[0], GNUTLS_X509_FMT_DER) < 0)
+	{
+		gnutls_x509_crt_deinit(*crt);
+		return -1;
+	}
+
+	return 0;
+}
+
+int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn)
+{
+	gnutls_x509_crt_t crt;
+	const char	 *tlsPurpose;
+	unsigned int	  seq;
+	int		  restricted = 0;
+	int		  usable = 0;
+	int		  forBundles = 0;
+
+	if (conn == NULL || peerCert(conn, &crt) < 0)
 	{
 		return TCPV4_EKU_ERROR;
 	}
 
-	/*	certs[0] is the peer's end-entity certificate, which is the
-	 *	one whose key usage governs this handshake.		*/
+	/*	RFC 9174 4.4.3 makes the active entity the TLS client and
+	 *	the passive entity the TLS server, so the purpose wanted of
+	 *	the peer is the one for the role opposite ours.		*/
 
-	if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) < 0)
-	{
-		gnutls_x509_crt_deinit(crt);
-		return TCPV4_EKU_ERROR;
-	}
+	tlsPurpose = conn->isServer ? GNUTLS_KP_TLS_WWW_CLIENT
+				    : GNUTLS_KP_TLS_WWW_SERVER;
 
-	for (seq = 0; !found; seq++)
+	for (seq = 0;; seq++)
 	{
 		char	     oid[128];
 		size_t	     oidLen = sizeof(oid);
@@ -428,8 +447,8 @@ int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn)
 
 		if (rc == GNUTLS_E_SHORT_MEMORY_BUFFER)
 		{
-			/*	An OID too long to be one we are looking
-			 *	for, but still a restriction.		*/
+			/*	Too long to be an OID we know, but still a
+			 *	restriction.				*/
 
 			restricted = 1;
 			continue;
@@ -444,23 +463,75 @@ int tcpv4TlsCheckKeyPurpose(Tcpv4TlsConn *conn)
 		restricted = 1;
 
 		/*	anyExtendedKeyUsage leaves the certificate usable
-		 *	for every purpose (RFC 5280 4.2.1.12).		*/
+		 *	for every purpose (RFC 5280 4.2.1.12), this one
+		 *	included.					*/
 
-		if (strcmp(oid, wanted) == 0
-				|| strcmp(oid, GNUTLS_KP_ANY) == 0)
+		if (strcmp(oid, GNUTLS_KP_ANY) == 0)
 		{
-			found = 1;
+			usable = 1;
+			forBundles = 1;
+			continue;
+		}
+
+		if (strcmp(oid, TCPV4_OID_BUNDLE_SECURITY) == 0)
+		{
+			usable = 1;
+			forBundles = 1;
+			continue;
+		}
+
+		if (strcmp(oid, tlsPurpose) == 0)
+		{
+			usable = 1;
 		}
 	}
 
 	gnutls_x509_crt_deinit(crt);
 
-	if (found)
+	if (!restricted)
 	{
-		return TCPV4_EKU_PRESENT;
+		return TCPV4_EKU_ABSENT;
 	}
 
-	return restricted ? TCPV4_EKU_WRONG : TCPV4_EKU_ABSENT;
+	if (!usable)
+	{
+		return TCPV4_EKU_WRONG;
+	}
+
+	return forBundles ? TCPV4_EKU_PRESENT : TCPV4_EKU_NO_BUNDLE;
+}
+
+int tcpv4TlsCheckKeyUsage(Tcpv4TlsConn *conn)
+{
+	gnutls_x509_crt_t crt;
+	unsigned int	  usage = 0;
+	unsigned int	  critical;
+	int		  rc;
+
+	if (conn == NULL || peerCert(conn, &crt) < 0)
+	{
+		return TCPV4_KU_ERROR;
+	}
+
+	rc = gnutls_x509_crt_get_key_usage(crt, &usage, &critical);
+	gnutls_x509_crt_deinit(crt);
+
+	if (rc == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE)
+	{
+		return TCPV4_KU_ABSENT;
+	}
+
+	if (rc < 0)
+	{
+		return TCPV4_KU_ERROR;
+	}
+
+	/*	RFC 9174 4.4.2 asks for digitalSignature, which is the bit
+	 *	a TLS 1.3 handshake uses: every cipher suite it offers
+	 *	authenticates the peer by a signature.			*/
+
+	return (usage & GNUTLS_KEY_DIGITAL_SIGNATURE) ? TCPV4_KU_OK
+						      : TCPV4_KU_WRONG;
 }
 
 /*	*	*	NODE-ID authentication	*	*	*	*/
@@ -592,35 +663,21 @@ static int isNodeId(const char *uri)
 
 int tcpv4TlsMatchNodeId(Tcpv4TlsConn *conn, const char *nodeId)
 {
-	const gnutls_datum_t *certs;
-	gnutls_x509_crt_t     crt;
-	unsigned int	      count = 0;
-	unsigned int	      seq;
-	int		      found = 0;
-	int		      matched = 0;
+	gnutls_x509_crt_t crt;
+	unsigned int	  seq;
+	int		  found = 0;
+	int		  matched = 0;
 
 	if (conn == NULL || nodeId == NULL || *nodeId == '\0')
 	{
 		return TCPV4_NODEID_ERROR;
 	}
 
-	certs = gnutls_certificate_get_peers(conn->session, &count);
-	if (certs == NULL || count == 0)
-	{
-		return TCPV4_NODEID_ERROR;
-	}
+	/*	Only the end-entity certificate identifies the entity
+	 *	(RFC 9174 4.4.4.3).					*/
 
-	if (gnutls_x509_crt_init(&crt) < 0)
+	if (peerCert(conn, &crt) < 0)
 	{
-		return TCPV4_NODEID_ERROR;
-	}
-
-	/*	certs[0] is the peer's end-entity certificate; only that one
-	 *	identifies the entity (RFC 9174 4.4.4.3).		*/
-
-	if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) < 0)
-	{
-		gnutls_x509_crt_deinit(crt);
 		return TCPV4_NODEID_ERROR;
 	}
 

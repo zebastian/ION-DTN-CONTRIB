@@ -75,7 +75,7 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | Peer node ID (§4.6) | any EID scheme; sessions are keyed on the node ID, not on an ipn node number |
 | NODE-ID authentication (§4.4.1, §4.4.4.3, §7.9) | implemented (`-E`); an unauthenticated node ID never attracts egress |
 | Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
-| Certificate profile, extended key usage (§4.4.2) | implemented; a certificate restricted to other purposes is refused |
+| Certificate profile, key usage and EKU (§4.4.2, §4.4.4.1) | implemented; a certificate restricted to other purposes is refused, `-B` applies the §4.4.5 policy |
 | Path validation and revocation (§4.4.4.1) | implemented; revocation lists via `-R` (RFC 5280 §6.3). OCSP **not implemented** |
 | TCPCLv3 fallback after "Version mismatch" (§4.3) | **not implemented** (an implementation matter; use `tcpcli` for v3 peers) |
 | Emitting session extension items | **not implemented** (none defined) |
@@ -147,28 +147,47 @@ certificate one is checking at all.
 
 ### Certificate profile
 
-RFC 9174 §4.4.2 asks that a certificate be valid for the role its holder
-plays: `id-kp-serverAuth` for the passive entity, `id-kp-clientAuth` for the
-active one. Every `tcpv4cla` is both — it accepts sessions and opens them —
-so its certificate needs **both** purposes.
+RFC 9174 §4.4.2 asks for less than one might assume. A TCPCL certificate
+**SHOULD** carry `id-kp-bundleSecurity` (`1.3.6.1.5.5.7.3.35`), **MAY** carry
+`id-kp-clientAuth` and `id-kp-serverAuth`, and need carry no Extended Key
+Usage extension at all. §4.4.4.1 then requires that security policy be applied
+to the key usage and extended key usage extensions *if present*, per RFC 5280
+§§4.2.1.3 and 4.2.1.12.
 
-A peer certificate whose Extended Key Usage leaves out the purpose this
-handshake needs is refused: it was issued for something else, and RFC 5280
-§4.2.1.12 forbids using it here. Refusing it matters because everything
-downstream rests on that certificate, the NODE-ID above all — without the
-check, a mail certificate from a shared CA authenticates a TCPCL peer. A
-certificate carrying *no* Extended Key Usage extension is unrestricted, so it
-is accepted, with a memo noting the deviation from the profile.
+So a peer certificate is usable here when its EKU names the TLS purpose this
+role needs (`id-kp-serverAuth` from the passive entity, `id-kp-clientAuth`
+from the active one), or names `id-kp-bundleSecurity`, or names
+`anyExtendedKeyUsage`, or carries no EKU at all. It is refused when it carries
+an EKU naming none of those: it was issued for something else, and RFC 5280
+forbids using it here. That refusal matters because everything downstream
+rests on this certificate, the NODE-ID above all — without the check, a mail
+certificate from a shared CA authenticates a TCPCL peer.
 
-Generating a certificate that carries a NODE-ID and both purposes, with
-OpenSSL 1.1.1+:
+`-B` sets the policy §4.4.5 recommends, that a certificate carrying an EKU at
+all name `id-kp-bundleSecurity` in it: `require` refuses one that does not,
+`prefer` (default) accepts it and says so, `none` asks only what RFC 5280
+asks. None of the three refuses a certificate with no EKU, since §4.4.2 does
+not require one. The default is `prefer` rather than `require` because
+requiring it would refuse certificates that work today; a deployment issuing
+its own certificates should use `require`.
+
+A key usage extension that withholds `digitalSignature` is refused outright:
+every TLS 1.3 cipher suite authenticates the peer by a signature, so such a
+certificate cannot have authenticated the handshake it just completed. GnuTLS
+generally declines these during the handshake anyway; the check here is the
+backstop.
+
+Every `tcpv4cla` is both entities — it accepts sessions and opens them — so
+its own certificate wants both TLS purposes. Generating one that carries a
+NODE-ID and the full profile, with OpenSSL 1.1.1+:
 
 ```
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout node.key -out node.pem -days 365 -nodes -subj "/CN=node1.example" \
     -addext "subjectAltName=DNS:node1.example,\
 otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0" \
-    -addext "extendedKeyUsage=serverAuth,clientAuth"
+    -addext "extendedKeyUsage=serverAuth,clientAuth,1.3.6.1.5.5.7.3.35" \
+    -addext "keyUsage=digitalSignature"
 ```
 
 The TLS code is isolated behind `tcpv4tls.h`, so an OpenSSL or wolfSSL backend
@@ -187,7 +206,7 @@ a outduct tcpv4 'peer.example:4556' ''
 ```
 
 Flags (on the `tcpv4cla` induct command): `-c`/`-k` cert/key, `-C` CA file,
-`-R` CRL file, `-n` no-verify, `-T` TLS policy (`require`/`prefer`/`none`), `-E` NODE-ID
+`-R` CRL file, `-B` certificate profile policy, `-n` no-verify, `-T` TLS policy (`require`/`prefer`/`none`), `-E` NODE-ID
 policy (`require`/`prefer`/`none`), `-K` keepalive
 interval to propose, `-t` idle session timeout, `-S`/`-M` advertised Segment
 and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
@@ -461,6 +480,8 @@ wording is deliberately stable:
 | `peer claims an unauthenticated node ID that is not the one dialled` | the session will not be used for egress (§7.9) |
 | `peer's certificate is not valid for this role` | its extended key usage leaves out the purpose this handshake needs (§4.4.2); the session is refused |
 | `peer's certificate carries no extended key usage` | unrestricted, so usable, but not the profile §4.4.2 asks for |
+| `peer's certificate carries no id-kp-bundleSecurity` | usable, but does not say it is for TCPCL (§4.4.5); refused under `-B require` |
+| `peer's certificate key usage does not allow the signature` | its key usage withholds `digitalSignature` (§4.4.4.1, RFC 5280 §4.2.1.3) |
 | `peer's certificate has been revoked by its issuer` | it appears on a list loaded by `-R` (§4.4.4.1, RFC 5280 §6.3) |
 | `can't load CRL file` | `-R` named something unusable; the daemon stops rather than run without the check |
 

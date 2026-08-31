@@ -12,15 +12,29 @@
 # resting on that certificate rests on it too: the NODE-ID of 4.4.4.3
 # above all, and with it which node's traffic the session may collect.
 #
-# Three phases, three certificates, identical in every other respect:
+# 4.4.2 asks for rather less than one might assume: a TCPCL certificate
+# SHOULD carry id-kp-bundleSecurity (1.3.6.1.5.5.7.3.35) and MAY carry
+# id-kp-clientAuth and id-kp-serverAuth, and need carry no EKU at all.
+# 4.4.5 then recommends a policy requiring id-kp-bundleSecurity of a
+# certificate that carries an EKU.
 #
-#   serverAuth,clientAuth  the profile 4.4.2 asks for.  Both purposes,
+# Six phases, differing only in the certificate's key usage extensions:
+#
+#   serverAuth,clientAuth  usable for the TLS role.  Both purposes,
 #                          because every tcpv4cla is both entities: it
 #                          accepts sessions and opens them.
-#   emailProtection        restricted, and not to this.  The session
-#                          must be refused.
-#   (no EKU extension)     unrestricted, so usable (RFC 5280), but a
-#                          deviation from 4.4.2 worth logging.
+#   emailProtection        restricted, and to neither this TLS role nor
+#                          TCPCL.  The session must be refused.
+#   (no EKU extension)     unrestricted, so usable (RFC 5280 4.2.1.12),
+#                          but a deviation from 4.4.2 worth logging.
+#   bundleSecurity only    the profile 4.4.5 recommends.  It names no
+#                          TLS purpose, and refusing it - as this CLA
+#                          once did - refuses the RFC's own advice.
+#   no bundleSecurity,     accepted by default, refused under the policy
+#     with -B require      4.4.5 recommends.
+#   keyUsage without       4.4.4.1 applies policy to the key usage too:
+#     digitalSignature     a key its issuer said may not sign cannot
+#                          have signed this handshake.
 #
 # Requires openssl (1.1.1+ for -addext) plus the standard bp test tools.
 #
@@ -46,6 +60,50 @@ FAIL=0
 fail() { echo "FAILURE: $1"; FAIL=1; }
 pass() { echo "  PASS: $1"; }
 
+# Wait for a delivered copy of $1 rather than sleeping a fixed span:
+# loopback delivery takes a fraction of a second, where the fixed waits
+# this replaces were five to eight of them.  $2 caps the wait in seconds
+# (default 6).  $3, when given, is a marker in ion.log meaning the bundle
+# is not coming, so a phase that expects a refusal need not wait the cap
+# out.
+await_file()
+{
+	local src="$1"
+	local cap="${2:-6}"
+	local marker="$3"
+	local i
+
+	for i in $(seq 1 $((cap * 10))); do
+		if [ -f testfile1 ] && cmp -s "$src" testfile1; then
+			return 0
+		fi
+
+		if [ -n "$marker" ] && grep -q "$marker" ion.log 2>/dev/null
+		then
+			return 1
+		fi
+
+		sleep 0.1
+	done
+
+	return 1
+}
+
+# The daemon is ready when it says so in the log, rather than after a
+# fixed wait.  Returns 1 if it never said so, which start_node's own
+# check then reports.
+await_running()
+{
+	local i
+
+	for i in $(seq 1 50); do
+		grep -q "tcpv4cla is running" ion.log 2>/dev/null && return 0
+		sleep 0.1
+	done
+
+	return 1
+}
+
 for t in tcpv4cla openssl bpsendfile bprecvfile; do
 	if ! command -v "$t" >/dev/null 2>&1; then
 		echo "SKIP: '$t' not found."
@@ -65,16 +123,22 @@ mkdir -p "$CERTDIR" || { echo "SKIP: cannot create $CERTDIR."; exit 2; }
 head -c 512 /dev/urandom | base64 | head -c 512 > sendfile
 
 # A self-signed, self-trusted certificate identifying this host and node,
-# differing between phases only in its extended key usage.  $1 names the
-# phase; $2, when given, is the extendedKeyUsage value.
+# differing between phases only in its key usage extensions.  $1 names
+# the phase; $2, when given, is the extendedKeyUsage value; $3, when
+# given, is the keyUsage value.
 make_cert()
 {
 	local name="$1"
 	local eku="$2"
+	local ku="$3"
 	local args=()
 
 	if [ -n "$eku" ]; then
 		args=(-addext "extendedKeyUsage=$eku")
+	fi
+
+	if [ -n "$ku" ]; then
+		args+=(-addext "keyUsage=$ku")
 	fi
 
 	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -87,17 +151,20 @@ otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0" \
 	[ -f "$CERTDIR/$name.pem" ] && [ -f "$CERTDIR/$name.key" ]
 }
 
-# Bring the node up using the named certificate.  -E none keeps NODE-ID
-# policy out of the way, so the extended key usage is the only thing
-# that varies between the phases.
+# Bring the node up using the named certificate.  $2 is any extra option
+# to pass; by default -E none keeps NODE-ID policy out of the way, so the
+# key usage extensions are the only thing that varies between phases.
+# ION caps an induct command at 11 arguments, the duct name included, so
+# there is room for exactly one such option and no more.
 start_node()
 {
 	local name="$1"
+	local extra="${2:--E none}"
 	local cert="$CERTDIR/$name.pem"
 	local key="$CERTDIR/$name.key"
 
 	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
-		-e "s|CLICMD|tcpv4cla -c $cert -k $key -C $cert -E none|g" \
+		-e "s|CLICMD|tcpv4cla -c $cert -k $key -C $cert $extra|g" \
 		-e "s|config/loopback.ipnrc|config/loopback_runtime.ipnrc|g" \
 		"${CONFIGDIR}/loopback.bprc" > "${CONFIGDIR}/loopback_runtime.bprc"
 	sed -e "s|TCPDUCT|${TCPDUCT}|g" \
@@ -113,7 +180,7 @@ start_node()
 		pgrep -x tcpv4cla >/dev/null && break
 		sleep 1
 	done
-	sleep 3
+	oK=$(await_running; echo $?)
 	pgrep -x tcpv4cla >/dev/null
 }
 
@@ -127,15 +194,19 @@ stop_node()
 }
 
 # Send one bundle over the loopback session and say whether it arrived.
+# $1, when given, is a marker in ion.log that means the bundle is not
+# coming, so a phase expecting a refusal returns as soon as it appears.
 send_bundle()
 {
+	local result
+
 	rm -f testfile*
 	bprecvfile ipn:1.2 & RP=$!
 	sleep 1
 	bpsendfile ipn:1.1 ipn:1.2 sendfile >/dev/null 2>&1
-	sleep 6
+	await_file sendfile 6 "$1" && result=0 || result=1
 	kill $RP 2>/dev/null; wait $RP 2>/dev/null
-	[ -f testfile1 ] && cmp -s sendfile testfile1
+	return $result
 }
 
 # --- Phase 1: the profile RFC 9174 4.4.2 asks for ---------------------
@@ -188,7 +259,7 @@ if ! start_node wrongpurpose; then
 	exit 1
 fi
 
-send_bundle && DELIVERED=1 || DELIVERED=0
+send_bundle "not valid for this role" && DELIVERED=1 || DELIVERED=0
 
 if grep -q "not valid for this role" ion.log; then
 	pass "the certificate was refused for want of the right purpose."
@@ -241,6 +312,105 @@ if [ "$DELIVERED" = 1 ]; then
 	pass "bundle delivered."
 else
 	fail "no bundle delivered over an unrestricted certificate."
+fi
+stop_node
+
+# --- Phase 4: id-kp-bundleSecurity alone ------------------------------
+# The profile RFC 9174 4.4.5 recommends.  It names no TLS purpose at all,
+# so a check that insisted on id-kp-serverAuth or id-kp-clientAuth would
+# refuse exactly the certificate the RFC advises issuing.
+echo "Phase 4: id-kp-bundleSecurity alone is accepted..."
+if ! make_cert bundleonly "1.3.6.1.5.5.7.3.35"; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+if ! start_node bundleonly; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+send_bundle && DELIVERED=1 || DELIVERED=0
+
+if grep -q "not valid for this role" ion.log; then
+	fail "the profile RFC 9174 4.4.5 recommends was refused."
+else
+	pass "a certificate for TCPCL alone was accepted."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	pass "bundle delivered."
+else
+	fail "no bundle delivered over an id-kp-bundleSecurity certificate."
+fi
+stop_node
+
+# --- Phase 5: -B require ----------------------------------------------
+echo "Phase 5: -B require refuses a certificate that omits it..."
+if ! start_node conformant "-B require"; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+send_bundle "no id-kp-bundleSecurity and policy requires one" && DELIVERED=1 || DELIVERED=0
+
+if grep -q "no id-kp-bundleSecurity and policy requires one" ion.log; then
+	pass "the certificate was refused under -B require."
+else
+	fail "-B require did not refuse a certificate without it."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	fail "a bundle was delivered under -B require."
+else
+	pass "no bundle delivered."
+fi
+stop_node
+
+# --- Phase 6: a key that may not sign ---------------------------------
+# RFC 9174 4.4.4.1 applies security policy to the key usage extension as
+# well.  Every TLS 1.3 cipher suite authenticates the peer by a
+# signature, so a certificate whose key usage withholds digitalSignature
+# cannot have authenticated the handshake it just completed.
+#
+# GnuTLS declines such a certificate during the handshake itself, before
+# the check in this CLA is reached, so what is asserted here is the
+# outcome rather than which layer produced it; the CLA's own check
+# remains the backstop for a TLS backend that is less strict.  What the
+# CLA must not do is misreport the failure: the verification status is
+# (unsigned) -1 when no result is available, and reading a revocation
+# bit out of that says a peer was revoked whenever any handshake fails.
+echo "Phase 6: a key usage that forbids signing is refused..."
+if ! make_cert nosigning "serverAuth,clientAuth" "keyEncipherment"; then
+	echo "SKIP: could not generate a certificate."
+	exit 2
+fi
+
+if ! start_node nosigning; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	stop_node
+	exit 1
+fi
+
+send_bundle "handshake failed" && DELIVERED=1 || DELIVERED=0
+
+if grep -q "session established" ion.log; then
+	fail "a session was established on a key that may not sign."
+else
+	pass "no session established."
+fi
+if [ "$DELIVERED" = 1 ]; then
+	fail "a bundle was delivered over a key that may not sign."
+else
+	pass "no bundle delivered."
+fi
+if grep -q "has been revoked" ion.log; then
+	fail "a handshake failure was misreported as a revocation."
+else
+	pass "the failure was not misreported as a revocation."
 fi
 stop_node
 

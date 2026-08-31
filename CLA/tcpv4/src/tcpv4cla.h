@@ -74,6 +74,17 @@ extern "C" {
 #define TCPV4_EIDPOL_PREFER	1
 #define TCPV4_EIDPOL_NONE	2
 
+/*	Local policy for the TCPCL certificate profile (RFC 9174 4.4.2).
+ *	4.4.5 recommends that a certificate carrying an Extended Key Usage
+ *	extension at all be required to name id-kp-bundleSecurity in it,
+ *	which is REQUIRE; PREFER accepts one that does not and says so;
+ *	NONE asks only what RFC 5280 4.2.1.12 asks, that the extension not
+ *	exclude this use.  None of the three rejects a certificate with no
+ *	such extension: 4.4.2 does not require one.			*/
+#define TCPV4_EKUPOL_REQUIRE	0
+#define TCPV4_EKUPOL_PREFER	1
+#define TCPV4_EKUPOL_NONE	2
+
 /*
  * Configuration parsed from command-line arguments.  A certificate and key
  * are required whenever TLS is not disabled: RFC 9174 4.4.3 has the passive
@@ -91,6 +102,7 @@ typedef struct
 	int  noVerify;			   /* skip peer verification.	*/
 	int  tlsPolicy;			   /* TCPV4_TLS_*.		*/
 	int  eidPolicy;			   /* TCPV4_EIDPOL_*.		*/
+	int  ekuPolicy;			   /* TCPV4_EKUPOL_*.		*/
 	int  keepalive;	   /* Keepalive Interval we propose, seconds.	*/
 	int  idleSec;	   /* Idle session termination; 0 disables.	*/
 	int  segmentMru;   /* advertised Segment MRU.			*/
@@ -121,6 +133,7 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port);
  *   -n             do not verify the peer certificate
  *   -T <policy>    TLS policy: require (default), prefer, none
  *   -E <policy>    NODE-ID authentication: require (default), prefer, none
+ *   -B <policy>    id-kp-bundleSecurity: require, prefer (default), none
  *   -K <seconds>   Keepalive Interval to propose (default 30, 0 disables)
  *   -t <seconds>   idle session termination timeout (default 0 = never)
  *   -S <bytes>     advertised Segment MRU (default 65536)
