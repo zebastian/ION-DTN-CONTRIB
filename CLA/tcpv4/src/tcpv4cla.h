@@ -49,6 +49,25 @@ extern "C" {
  *	capped per peer, so a legitimate peer reconnecting is unaffected.	*/
 #define TCPV4_MAX_PEER_NEGOTIATING 4
 
+/*	Transmission window: how many transfers, and how many octets of
+ *	them, may be awaiting their XFER_ACK on one session at once; -W
+ *	overrides both.  RFC 9174 5.2.2 forbids interleaving the segments
+ *	of two transfers within a session, but not beginning a transfer
+ *	before the previous one has been acknowledged - and it is that
+ *	which keeps a link with any appreciable round-trip time busy,
+ *	rather than idle for one round trip per bundle.  The window is
+ *	therefore what bounds a delayed link's throughput: about one
+ *	window per round trip, whichever of the two bounds binds first.
+ *
+ *	The window is bounded by octets as well as by count, because an
+ *	outstanding transfer pins its bundle's outbound ZCO space until
+ *	the acknowledgment retires it.  Either bound may be given as 0,
+ *	which leaves that dimension unbounded and the other one to bound
+ *	the window on its own; both at once is refused.			*/
+#define TCPV4_DEFAULT_TX_WINDOW	       100
+#define TCPV4_MAX_TX_WINDOW	       65536
+#define TCPV4_DEFAULT_TX_WINDOW_BYTES  (4 * 1024 * 1024)
+
 /*	Ceiling on the pause a sender takes after the engine declines a
  *	bundle.  BP offers a declined bundle again immediately, and the
  *	reasons the engine declines - a reconnection backoff with seconds
@@ -110,6 +129,10 @@ typedef struct
 	int  rcvBufSize;   /* SO_RCVBUF, bytes; 0 = OS default.		*/
 	int  sndBufSize;   /* SO_SNDBUF, bytes; 0 = OS default.		*/
 	int  maxSessions;  /* Concurrently open sessions.		*/
+	int  txWindow;	   /* Transfers awaiting acknowledgment; 0 =
+			      bounded by txWindowBytes alone.		*/
+	vast txWindowBytes; /* Octets of those; 0 = bounded by txWindow
+			      alone.					*/
 	char tlsPriority[TCPV4_MAX_PRIORITY_LEN]; /* GnuTLS priority
 					string; empty = the default.	*/
 } Tcpv4ClaConfig;
@@ -141,6 +164,9 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port);
  *   -r <bytes>     socket receive buffer (SO_RCVBUF; 0 = OS default)
  *   -w <bytes>     socket send buffer (SO_SNDBUF; 0 = OS default)
  *   -L <count>     concurrently open sessions (default 64)
+ *   -W <count>[:<bytes>]  transfers, and octets of them, that may await
+ *                  acknowledgment on one session at once (default
+ *                  100:4194304); either bound may be 0 for "unbounded"
  *   -P <string>    TLS priority string (GnuTLS syntax); TLS 1.3 is
  *                  imposed on top of it, per RFC 9174 4.4.3
  *

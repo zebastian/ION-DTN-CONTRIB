@@ -81,6 +81,46 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port)
 }
 
 /*
+ * Parse a transmission window argument, "count[:bytes]": how many transfers,
+ * and how many octets of them, may await acknowledgment on one session at
+ * once.  Either bound may be 0, which leaves that dimension unbounded and
+ * the other one to bound the window on its own; both at once would let a
+ * session pin unbounded outbound ZCO space, so it is refused.  Omitting
+ * ":bytes" leaves the octet bound at its default.  Returns 0, or -1.
+ */
+static int parseTxWindow(const char *arg, Tcpv4ClaConfig *cfg)
+{
+	char	 *end;
+	long long count;
+	long long bytes = cfg->txWindowBytes;
+
+	count = strtoll(arg, &end, 10);
+	if (end == arg || count < 0 || count > TCPV4_MAX_TX_WINDOW)
+	{
+		return -1;
+	}
+
+	if (*end == ':')
+	{
+		arg = end + 1;
+		bytes = strtoll(arg, &end, 10);
+		if (end == arg || bytes < 0)
+		{
+			return -1;
+		}
+	}
+
+	if (*end != '\0' || (count == 0 && bytes == 0))
+	{
+		return -1;
+	}
+
+	cfg->txWindow = (int) count;
+	cfg->txWindowBytes = (vast) bytes;
+	return 0;
+}
+
+/*
  * Parse optional command-line arguments.
  *
  *   -c <certfile>  end-entity certificate (PEM)  [required unless -T none]
@@ -98,6 +138,9 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port)
  *   -r <bytes>     socket receive buffer (SO_RCVBUF; 0 = OS default)
  *   -w <bytes>     socket send buffer (SO_SNDBUF; 0 = OS default)
  *   -L <count>     concurrently open sessions (default 64)
+ *   -W <count>[:<bytes>]  transfers, and octets of them, that may await
+ *                  acknowledgment on one session at once (default
+ *                  100:4194304); either bound may be 0 for "unbounded"
  *   -P <string>    TLS priority string (GnuTLS syntax)
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
@@ -118,6 +161,8 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 	cfg->segmentMru = TCPV4_DEFAULT_SEGMENT_MRU;
 	cfg->transferMru = TCPV4CLA_BUFSZ;
 	cfg->maxSessions = TCPV4_DEFAULT_MAX_SESSIONS;
+	cfg->txWindow = TCPV4_DEFAULT_TX_WINDOW;
+	cfg->txWindowBytes = TCPV4_DEFAULT_TX_WINDOW_BYTES;
 
 	for (i = 1; i < argc - 1; i++)
 	{
@@ -168,7 +213,6 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 			if (strcmp(argv[i], "require") == 0)
 			{
 				cfg->eidPolicy = TCPV4_EIDPOL_REQUIRE;
-	cfg->ekuPolicy = TCPV4_EKUPOL_PREFER;
 			}
 			else if (strcmp(argv[i], "prefer") == 0)
 			{
@@ -264,6 +308,15 @@ int parseTcpv4Args(int argc, char *argv[], Tcpv4ClaConfig *cfg)
 							> TCPV4_MAX_SESSIONS_LIMIT)
 			{
 				putErrmsg("tcpv4cla: bad -L session limit.",
+						argv[i]);
+				return -1;
+			}
+		}
+		else if (strcmp(argv[i], "-W") == 0 && i + 1 < argc)
+		{
+			if (parseTxWindow(argv[++i], cfg) < 0)
+			{
+				putErrmsg("tcpv4cla: bad -W window.",
 						argv[i]);
 				return -1;
 			}

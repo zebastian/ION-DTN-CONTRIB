@@ -60,19 +60,6 @@ extern "C" {
  *	timer, so no sender is left blocked indefinitely.		*/
 #define TCPV4_XFER_TIMEOUT	 300
 
-/*	Transmission window: how many transfers may be awaiting their
- *	XFER_ACK at once.  RFC 9174 5.2.2 forbids interleaving the segments
- *	of two transfers within a session, but not beginning a transfer
- *	before the previous one has been acknowledged - and it is that
- *	which keeps a link with any appreciable round-trip time busy,
- *	rather than idle for one round trip per bundle.
- *
- *	The window is bounded by octets as well as by count, because an
- *	outstanding transfer pins its bundle's outbound ZCO space until the
- *	acknowledgment retires it.					*/
-#define TCPV4_TX_WINDOW		 100
-#define TCPV4_TX_WINDOW_BYTES	 (4 * 1024 * 1024)
-
 /*	Octets read out of a bundle at a time.  A transfer is streamed
  *	rather than held in memory, which bounds both a session's transmit
  *	footprint and the length of the SDR transaction each read costs.	*/

@@ -211,7 +211,16 @@ policy (`require`/`prefer`/`none`), `-K` keepalive
 interval to propose, `-t` idle session timeout, `-S`/`-M` advertised Segment
 and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
 (`SO_RCVBUF`/`SO_SNDBUF`; 0 = OS default), `-L` concurrent session limit,
-`-P` GnuTLS priority string.
+`-W` transmission window as `count[:bytes]`, `-P` GnuTLS priority string.
+
+The transmission window is what bounds throughput on a link with a long
+round-trip time: several transfers may await their `XFER_ACK` at once, so a
+session carries about one window per round trip rather than one bundle. It
+defaults to `100:4194304` - 100 transfers or 4 MB of them, whichever binds
+first - which is about 500 bundles per second at a 200 ms round-trip time.
+Raise it for a long link; the octet bound is the outbound ZCO space a session
+may pin, since an unacknowledged transfer holds its bundle until the
+acknowledgment retires it.
 
 A peer is named by the neighbour EID of its egress plan, in whatever scheme
 that EID uses. RFC 9174 §4.6 identifies a peer by a node ID rather than by a
@@ -351,6 +360,14 @@ limit while BP was congested.
   `tcpcli` writes each segment's header and payload separately, so part of
   that gap is Nagle rather than pipelining.
 
+  `BENCH_WINDOW` passes `-W` through to `tcpv4cla`, and `BENCH_RCVBUF` /
+  `BENCH_SNDBUF` pass `-r` / `-w`, which is how to find out what a run is
+  actually measuring. At this size and delay it is not the window: 4 KiB
+  bundles at 300/s hold the impairer at about 100 packets/s, which is all it
+  carries at a 100 ms delay, and neither a larger window nor larger socket
+  buffers moves the figure. Smaller bundles are where the default window
+  binds - see "What the transmission window is worth" below.
+
   `BENCH_MSS=1460` clamps the MSS both ends advertise, giving realistically
   sized segments without touching loopback's 64 KiB MTU. That multiplies the
   packet count by about forty, which is more than `linkimpair` can carry: as
@@ -434,6 +451,45 @@ them.
 Throughput at small sizes is dominated by ION's per-bundle cost, not by
 the convergence layer: all three modes land within 3% of each other at
 1 KiB.
+
+### What the transmission window is worth
+
+`bench/bench-tcpv4-impaired` with `BENCH_WINDOW` sweeping `-W`, TLS mode,
+same host, `linkimpair` supplying the delay:
+
+| link | bundle | `-W` | bundles/s | Mbps |
+|------|-------:|------|----------:|-----:|
+| 200 ms RTT | 1 KiB | `10:33554432`  |  40 |  0.33 |
+| 200 ms RTT | 1 KiB | default (`100:4194304`) | 402 |  3.30 |
+| 200 ms RTT | 1 KiB | `1000:33554432` | 931 |  7.63 |
+| 200 ms RTT | 1 KiB | `1000:32768` | 111 |  0.91 |
+|  10 ms RTT | 4 KiB | `10:33554432`  | 733 | 24.0  |
+|  10 ms RTT | 4 KiB | default | 3561 | 116.7 |
+
+The window is the bound, and it is close to arithmetic: a session carries
+about one window per round trip, so 100 transfers per 200 ms is a ceiling of
+500 bundles/s and 402 is what that measures out at. Ten times the window is
+2.3 times the throughput here, not ten, because something else takes over
+before the new ceiling is reached - which is the point of measuring rather
+than assuming. The fourth row holds the count at 1000 and shrinks the octet
+bound to 32 KiB instead: 32 KiB of 1 KiB bundles is 32 in flight, and the
+throughput lands where a window of 32 would. Either half of `-W` can be the
+one that binds.
+
+The default does not bind everywhere. At 10 ms RTT it admits 10,000
+bundles/s, ten times what ION itself will pass at 4 KiB, so the last row is
+measuring ION and not the window. And at 200 ms RTT with 4 KiB bundles this
+testbed tops out around 10 Mbps whatever the window is (303 bundles/s at the
+default, 247 with `-W 1000:33554432` and 8 MB socket buffers): every such run
+sits at 94-115 packets/s, which is `linkimpair`'s own capacity at a 100 ms
+delay, so it is the impairer being measured. Raise the window when a link's
+round-trip time is long and its bundles are small; measure before assuming it
+was the window.
+
+One practical limit when tuning: ION allows an induct's command at most 11
+arguments including the duct name, and `-c cert -k key -n -W ... -r ... -w
+...` overruns it - the daemon then fails to start. That is why `-W` carries
+both bounds in one argument.
 
 > A note on where these numbers came from: the first version of this CLA
 > benchmarked at 0.2 Mbps, some 30x slower than `tcpcli`, because it wrote

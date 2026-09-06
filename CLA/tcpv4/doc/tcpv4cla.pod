@@ -8,7 +8,8 @@ B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-R> I<crlfile>] [B<-
 [B<-T> I<policy>] [B<-E> I<policy>] [B<-B> I<policy>] [B<-K> I<keepalive>]
 [B<-t> I<idlesec>]
 [B<-S> I<segmentmru>] [B<-M> I<transfermru>] [B<-r> I<bytes>]
-[B<-w> I<bytes>] [B<-L> I<sessions>] [B<-P> I<priority>] I<host>[:I<port>]
+[B<-w> I<bytes>] [B<-L> I<sessions>] [B<-W> I<count>[:I<bytes>]]
+[B<-P> I<priority>] I<host>[:I<port>]
 
 =head1 DESCRIPTION
 
@@ -169,6 +170,25 @@ close as a network fault; only a few such connections are entertained at once.
 Independently of this limit, at most four connections from any one peer
 address may be part way through negotiation at the same time, so that a single
 address cannot hold every session slot on the node.
+
+=item B<-W> I<count>[:I<bytes>]
+
+Transmission window: how many transfers, and how many octets of them, may be
+awaiting their B<XFER_ACK> on one session at once (default C<100:4194304>).
+RFC 9174 section 5.2.2 forbids interleaving the segments of two transfers
+within a session, but not beginning a transfer before the previous one has
+been acknowledged, and it is that which keeps a link with a long round-trip
+time busy rather than idle for one round trip per bundle.  The window is
+therefore what bounds throughput on such a link: roughly one window per round
+trip, whichever of the two bounds binds first - so at a 200 ms round-trip
+time the default count admits about 500 bundles per second, and the default
+octet bound admits about 20 MB/s.
+
+The octet bound is there because an unacknowledged transfer pins its bundle's
+outbound ZCO space until the acknowledgment retires it, so raising the window
+raises the outbound ZCO space a session can hold.  Either bound may be given
+as 0, which leaves that dimension unbounded and the other one to bound the
+window on its own; both at once is refused.
 
 =item B<-P> I<priority>
 

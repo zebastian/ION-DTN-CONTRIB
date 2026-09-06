@@ -60,6 +60,9 @@
 #   BENCH_MODES       modes to sweep                (default "tls plaintext tcpv3")
 #   TCPV4_PORT        TCP port for the tcpv4 link   (default 4856)
 #   TCPV3_PORT        TCP port for the tcpcli link  (default 4857)
+#   BENCH_WINDOW      tcpv4cla -W count[:bytes]     (default: the CLA's own)
+#   BENCH_RCVBUF      SO_RCVBUF, bytes              (default 0 = OS default)
+#   BENCH_SNDBUF      SO_SNDBUF, bytes              (default 0 = OS default)
 #   NFQUEUE_NUM       NFQUEUE number to use         (default 17)
 #   IPTABLES          path to iptables              (default /usr/sbin/iptables)
 #   LINKIMPAIR        path to the linkimpair binary
@@ -123,9 +126,25 @@ MAXBUNDLES="${MAXBUNDLES:-2000}"
 BENCH_MODES="${BENCH_MODES:-tls plaintext tcpv3}"
 TCPV4_PORT="${TCPV4_PORT:-4856}"
 TCPV3_PORT="${TCPV3_PORT:-4857}"
+BENCH_WINDOW="${BENCH_WINDOW:-}"
+BENCH_RCVBUF="${BENCH_RCVBUF:-0}"
+BENCH_SNDBUF="${BENCH_SNDBUF:-0}"
 NFQUEUE_NUM="${NFQUEUE_NUM:-17}"
 IPTABLES="${IPTABLES:-/usr/sbin/iptables}"
 STALL_SECS="${STALL_SECS:-30}"
+
+# Transmission window (-W) and socket buffers (-r/-w), passed to tcpv4cla.
+# Both bound a delayed link, and which of them binds first is the question
+# this benchmark exists to answer: the CL carries at most one window per
+# round trip (the default 100 transfers is about 500 bundles per second at a
+# 200 ms round trip), and TCP itself carries at most one socket buffer per
+# round trip whatever the CL asks of it.  ION's tcpcli takes neither flag -
+# it keeps one transfer in flight - so leave these unset when comparing
+# against it.
+CLAOPTS=""
+[ -n "$BENCH_WINDOW" ] && CLAOPTS="$CLAOPTS -W $BENCH_WINDOW"
+[ "$BENCH_RCVBUF" -gt 0 ] && CLAOPTS="$CLAOPTS -r $BENCH_RCVBUF"
+[ "$BENCH_SNDBUF" -gt 0 ] && CLAOPTS="$CLAOPTS -w $BENCH_SNDBUF"
 
 # Privilege is applied to iptables alone; everything else runs as the
 # invoking user.  "sudo -n" never prompts, so a missing grant fails at once
@@ -451,8 +470,8 @@ mode_daemon()
 mode_clicmd()
 {
 	case "$1" in
-	tls) echo "tcpv4cla -c ${CERT} -k ${KEY} -n" ;;
-	plaintext) echo "tcpv4cla -T none" ;;
+	tls) echo "tcpv4cla${CLAOPTS} -c ${CERT} -k ${KEY} -n" ;;
+	plaintext) echo "tcpv4cla${CLAOPTS} -T none" ;;
 	tcpv3) echo "tcpcli" ;;
 	*)
 		echo "ERROR: unknown mode '$1'." >&2

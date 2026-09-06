@@ -36,6 +36,7 @@
 #   TCPV3_PORT        TCP port for the tcpcli link (default 4857)
 #   BENCH_RCVBUF      SO_RCVBUF, bytes           (default 0 = OS default)
 #   BENCH_SNDBUF      SO_SNDBUF, bytes           (default 0 = OS default)
+#   BENCH_WINDOW      tcpv4cla -W count[:bytes]  (default: the CLA's own)
 #   STALL_SECS        seconds without an arrival before a size is done (10)
 #
 # Output: a table on stdout and results.csv
@@ -59,6 +60,7 @@ TCPV4_PORT="${TCPV4_PORT:-4856}"
 TCPV3_PORT="${TCPV3_PORT:-4857}"
 BENCH_RCVBUF="${BENCH_RCVBUF:-0}"
 BENCH_SNDBUF="${BENCH_SNDBUF:-0}"
+BENCH_WINDOW="${BENCH_WINDOW:-}"
 STALL_SECS="${STALL_SECS:-10}"
 
 CONFIGDIR="./config"
@@ -66,12 +68,13 @@ CERT="$(pwd)/server.pem"
 KEY="$(pwd)/server.key"
 RESULTS="$(pwd)/results.csv"
 
-# Optional socket-buffer sizing, passed to tcpv4cla (-r/-w).  ION's tcpcli
-# takes no such flags, so the tcpv3 baseline always uses the OS defaults;
-# leave these at 0 when comparing against it.
-SOCKOPTS=""
-[ "$BENCH_RCVBUF" -gt 0 ] && SOCKOPTS="$SOCKOPTS -r $BENCH_RCVBUF"
-[ "$BENCH_SNDBUF" -gt 0 ] && SOCKOPTS="$SOCKOPTS -w $BENCH_SNDBUF"
+# Optional socket-buffer sizing (-r/-w) and transmission window (-W), passed
+# to tcpv4cla.  ION's tcpcli takes no such flags, so the tcpv3 baseline always
+# uses the defaults; leave these unset when comparing against it.
+CLAOPTS=""
+[ "$BENCH_RCVBUF" -gt 0 ] && CLAOPTS="$CLAOPTS -r $BENCH_RCVBUF"
+[ "$BENCH_SNDBUF" -gt 0 ] && CLAOPTS="$CLAOPTS -w $BENCH_SNDBUF"
+[ -n "$BENCH_WINDOW" ] && CLAOPTS="$CLAOPTS -W $BENCH_WINDOW"
 
 # How many bundles of this size make up one size's byte budget.
 bundles_for()
@@ -110,8 +113,8 @@ mode_daemon()
 mode_clicmd()
 {
 	case "$1" in
-	tls) echo "tcpv4cla${SOCKOPTS} -c ${CERT} -k ${KEY} -n" ;;
-	plaintext) echo "tcpv4cla${SOCKOPTS} -T none" ;;
+	tls) echo "tcpv4cla${CLAOPTS} -c ${CERT} -k ${KEY} -n" ;;
+	plaintext) echo "tcpv4cla${CLAOPTS} -T none" ;;
 	tcpv3) echo "tcpcli" ;;
 	*)
 		echo "ERROR: unknown mode '$1'." >&2

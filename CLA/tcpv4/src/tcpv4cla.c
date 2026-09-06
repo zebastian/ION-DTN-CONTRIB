@@ -548,10 +548,15 @@ int main(int argc, char *argv[])
 		     "[-B require|prefer|none] "
 		     "[-K keepalive] [-t idlesec] [-S segmentmru] "
 		     "[-M transfermru] [-r rcvbuf] [-w sndbuf] "
-		     "[-L maxsessions] [-P tlspriority] <host[:port]>");
+		     "[-L maxsessions] [-W count[:bytes]] "
+		     "[-P tlspriority] <host[:port]>");
 		PUTS("  -r/-w set SO_RCVBUF/SO_SNDBUF; leaving them at 0 "
 		     "keeps the kernel's socket buffer autotuning, which "
 		     "is usually the better choice.");
+		PUTS("  -W bounds the transfers awaiting acknowledgment on "
+		     "one session, by count and by octets (default "
+		     "100:4194304); a link with a long round-trip time "
+		     "carries about one window per round trip.");
 		return 0;
 	}
 

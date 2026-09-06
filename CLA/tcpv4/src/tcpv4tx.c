@@ -511,6 +511,8 @@ static void releaseConn(Tcpv4Engine *e, Tcpv4Conn *conn)
 
 static int queueXfer(Tcpv4Conn *conn, Object bundle, vast length)
 {
+	int		window = conn->owner->cfg.txWindow;
+	vast		windowBytes = conn->owner->cfg.txWindowBytes;
 	Tcpv4Xfer      *x;
 	struct timespec deadline;
 	int		result = 0;
@@ -542,9 +544,10 @@ static int queueXfer(Tcpv4Conn *conn, Object bundle, vast length)
 	 *	than the whole byte budget still has to go somewhere.	*/
 
 	while (!conn->txStopped && conn->txCount > 0
-			&& (conn->txCount >= TCPV4_TX_WINDOW
-					|| conn->txBytes + length
-							> TCPV4_TX_WINDOW_BYTES))
+			&& ((window > 0 && conn->txCount >= window)
+				|| (windowBytes > 0
+					&& conn->txBytes + length
+							> windowBytes)))
 	{
 		if (pthread_cond_timedwait(&conn->txCond, &conn->txMutex,
 				    &deadline)
