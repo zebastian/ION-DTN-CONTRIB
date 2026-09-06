@@ -63,6 +63,12 @@ sudo make install
 `/usr/local`) and checks each contribution's own dependencies. Per-contribution
 build notes and dependencies live in each sub-project's `README.md`.
 
+Recent ION deprecates the `Object` and `Address` aliases of `SdrObject` and
+`SdrAddress`, defining them only under `ION_USE_LEGACY_ALIASES`. The ION APIs
+these contributions call still speak in `Object` - `bpP.h` itself is written in
+it - so `configure` probes the installed headers and adds
+`-DION_USE_LEGACY_ALIASES` when they no longer offer the aliases unasked.
+
 Contributions are opt-in, the same way `install-deps.sh` and `test.sh` select
 them: nothing is built by default, so enable each one you want (or all of
 them). A contribution's dependency checks are skipped when it is not selected,

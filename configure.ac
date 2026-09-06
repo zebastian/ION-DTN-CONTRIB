@@ -42,6 +42,22 @@ save_CPPFLAGS="$CPPFLAGS"
 CPPFLAGS="$CPPFLAGS $ION_CFLAGS"
 AC_CHECK_HEADER([bp.h], [],
   [AC_MSG_ERROR([ION-DTN headers not found under ${ion_prefix}/include. Install ION-DTN or pass --with-ion=PREFIX.])])
+
+# Recent ION deprecates the "Object" and "Address" aliases of SdrObject and
+# SdrAddress, defining them only under ION_USE_LEGACY_ALIASES.  Every ION API
+# these contributions call still speaks in Object - bpP.h itself is written in
+# it - so ask for the aliases when the headers no longer offer them unasked.
+AC_MSG_CHECKING([whether ION defines the legacy Object alias])
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM([[#include "sdrxn.h"]], [[Object o = 0; (void) o;]])],
+  [AC_MSG_RESULT([yes])],
+  [CPPFLAGS="$CPPFLAGS -DION_USE_LEGACY_ALIASES"
+   AC_COMPILE_IFELSE(
+     [AC_LANG_PROGRAM([[#include "sdrxn.h"]], [[Object o = 0; (void) o;]])],
+     [AC_MSG_RESULT([only under ION_USE_LEGACY_ALIASES])
+      ION_CFLAGS="$ION_CFLAGS -DION_USE_LEGACY_ALIASES"],
+     [AC_MSG_RESULT([no])
+      AC_MSG_ERROR([ION under ${ion_prefix} defines neither Object nor ION_USE_LEGACY_ALIASES; its SDR headers are not the ones these contributions are written against.])])])
 CPPFLAGS="$save_CPPFLAGS"
 
 save_LDFLAGS="$LDFLAGS"
