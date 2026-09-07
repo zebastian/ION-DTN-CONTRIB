@@ -16,6 +16,16 @@ typedef struct
 	MysqlClaConfig *cfg;
 } ReceiverThreadParms;
 
+/*	The receiver thread reads this flag for as long as it runs, and
+ *	the main thread clears it at shutdown, so both go through a relaxed
+ *	atomic access: the reader acts on a whole poll cycle rather than on
+ *	the instant of the write, and the join that follows is what orders
+ *	everything else.					*/
+
+#define MYSQL_GET(field)	__atomic_load_n(&(field), __ATOMIC_RELAXED)
+#define MYSQL_SET(field, v)	__atomic_store_n(&(field), (v), \
+				__ATOMIC_RELAXED)
+
 static void interruptThread(int signum)
 {
 	(void) signum;
@@ -182,7 +192,7 @@ static void *receiveBundles(void *parm)
 		return NULL;
 	}
 
-	while (rtp->running)
+	while (MYSQL_GET(rtp->running))
 	{
 		if (rtp->conn == NULL || mysql_ping(rtp->conn) != 0)
 		{
@@ -318,7 +328,7 @@ int main(int argc, char *argv[])
 	ionNoteMainThread("mysqlcli");
 	isignal(SIGTERM, interruptThread);
 
-	rtp.running = 1;
+	MYSQL_SET(rtp.running, 1);
 	if (pthread_begin(&receiverThread, NULL, receiveBundles, &rtp))
 	{
 		putSysErrmsg("mysqlcli can't create receiver thread", NULL);
@@ -342,7 +352,7 @@ int main(int argc, char *argv[])
 
 	ionPauseMainThread(-1);
 
-	rtp.running = 0;
+	MYSQL_SET(rtp.running, 0);
 	pthread_join(receiverThread, NULL);
 
 	if (rtp.conn)

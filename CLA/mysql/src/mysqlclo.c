@@ -33,6 +33,16 @@ typedef struct
 	MysqlClaConfig *cfg;
 } CloState;
 
+/*	The flush thread reads this flag under the batch mutex, but also
+ *	while reconnecting with the mutex released - and the main thread
+ *	clears it at shutdown - so every access is a relaxed atomic one.
+ *	The mutex still orders the batch itself; this is only so that a
+ *	reconnecting flush thread notices the shutdown it is waiting out.	*/
+
+#define MYSQL_GET(field)	__atomic_load_n(&(field), __ATOMIC_RELAXED)
+#define MYSQL_SET(field, v)	__atomic_store_n(&(field), (v), \
+				__ATOMIC_RELAXED)
+
 static sm_SemId mysqlcloSemaphore(sm_SemId *semid)
 {
 	static sm_SemId semaphore = -1;
@@ -125,7 +135,7 @@ static void *flushBundles(void *parm)
 	}
 
 	pthread_mutex_lock(&state->mutex);
-	while (state->running || state->count > 0)
+	while (MYSQL_GET(state->running) || state->count > 0)
 	{
 		if (state->count == 0)
 		{
@@ -136,7 +146,7 @@ static void *flushBundles(void *parm)
 		/*	Hold a partial batch for up to flushMs to let it
      *	fill, but flush at once when it reaches batch.	*/
 
-		if (state->count < cfg->batch && state->running
+		if (state->count < cfg->batch && MYSQL_GET(state->running)
 				&& cfg->flushMs > 0)
 		{
 			struct timespec ts;
@@ -150,7 +160,8 @@ static void *flushBundles(void *parm)
 				ts.tv_nsec -= 1000000000L;
 			}
 
-			while (state->count < cfg->batch && state->running)
+			while (state->count < cfg->batch
+					&& MYSQL_GET(state->running))
 			{
 				if (pthread_cond_timedwait(&state->notEmpty,
 						    &state->mutex, &ts)
@@ -169,7 +180,8 @@ static void *flushBundles(void *parm)
 
 		/*	Ensure a live connection (best-effort backoff).	*/
 
-		while ((conn == NULL || mysql_ping(conn) != 0) && state->running)
+		while ((conn == NULL || mysql_ping(conn) != 0)
+				&& MYSQL_GET(state->running))
 		{
 			if (conn != NULL)
 			{
@@ -323,7 +335,7 @@ int main(int argc, char *argv[])
 
 	memset((char *) &state, 0, sizeof(state));
 	state.cfg = &cfg;
-	state.running = 1;
+	MYSQL_SET(state.running, 1);
 	state.items = MTAKE(sizeof(BatchItem) * cfg.batch);
 	if (state.items == NULL)
 	{
@@ -427,7 +439,8 @@ int main(int argc, char *argv[])
 					sizeof(item.dst)));
 
 			pthread_mutex_lock(&state.mutex);
-			while (state.count == cfg.batch && state.running)
+			while (state.count == cfg.batch
+					&& MYSQL_GET(state.running))
 			{
 				pthread_cond_wait(&state.notFull, &state.mutex);
 			}
@@ -442,7 +455,7 @@ int main(int argc, char *argv[])
 	/*	Shut down: let the flush thread drain remaining bundles.*/
 
 	pthread_mutex_lock(&state.mutex);
-	state.running = 0;
+	MYSQL_SET(state.running, 0);
 	pthread_cond_broadcast(&state.notEmpty);
 	pthread_cond_broadcast(&state.notFull);
 	pthread_mutex_unlock(&state.mutex);
