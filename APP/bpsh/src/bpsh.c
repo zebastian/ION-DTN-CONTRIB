@@ -34,6 +34,16 @@ static char	       currentCwd[BPSH_CWD_MAX]; /* shell cwd from CWD frames */
 static uvast	       sessionId;
 static uvast	       sendSeq = 0;
 static int	       running = 1;
+
+/*	running is cleared by the signal handler, and by the main thread
+ *	when the remote command has exited, while the stdin forwarder
+ *	thread reads it - so every access is a relaxed atomic one.  The
+ *	reader acts on a whole poll timeout rather than on the instant of
+ *	the write, so ordering beyond atomicity buys nothing here.	*/
+
+#define BPSH_RUNNING()	__atomic_load_n(&running, __ATOMIC_RELAXED)
+#define BPSH_STOP()	__atomic_store_n(&running, 0, __ATOMIC_RELAXED)
+
 static pthread_mutex_t sendMutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*	Frame received from the wire, decoded, and held until the
@@ -78,7 +88,7 @@ static void handleFault(int signum)
 static void handleQuit(int signum)
 {
 	(void) signum;
-	running = 0;
+	BPSH_STOP();
 	if (sap)
 	{
 		bp_interrupt(sap);
@@ -187,7 +197,7 @@ static void freePending(PendingFrame *p)
  *	Returns NULL on interrupt or fatal error.			*/
 static PendingFrame *recvOnePending(void)
 {
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		BpshFrame      frame;
 		unsigned char *bytes;
@@ -204,7 +214,7 @@ static PendingFrame *recvOnePending(void)
 
 		if (rc == BPSH_RECV_NONE)
 		{
-			if (!running)
+			if (!BPSH_RUNNING())
 			{
 				return NULL;
 			}
@@ -240,7 +250,7 @@ static PendingFrame *recvOnePending(void)
  *	Caller must freePending() the result.				*/
 static PendingFrame *recvOrderedFrame(void)
 {
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		PendingFrame  *p;
 		PendingFrame **link;
@@ -322,7 +332,7 @@ static void storeCwd(const unsigned char *payload, size_t len)
 /*	Wait for INIT_ACK matching our sessionId.  Returns 0 on success.	*/
 static int awaitInitAck(void)
 {
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		PendingFrame *p = recvOrderedFrame();
 
@@ -363,7 +373,7 @@ static int awaitInitAck(void)
  *	their respective streams as they arrive, until EXIT.		*/
 static int awaitCommandResult(int *exitCode, BpshExitCause *cause)
 {
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		PendingFrame *p = recvOrderedFrame();
 
@@ -576,7 +586,7 @@ static int readLineRaw(char *buf, size_t size, const char *prompt)
 	buf[0] = '\0';
 	redrawLine(prompt, buf, len, pos);
 
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		unsigned char c;
 		ssize_t	      n = read(STDIN_FILENO, &c, 1);
@@ -768,7 +778,7 @@ static int readLineRaw(char *buf, size_t size, const char *prompt)
 	buf[len] = '\0';
 	putchar('\n');
 	fflush(stdout);
-	return running ? ret : -1;
+	return BPSH_RUNNING() ? ret : -1;
 }
 
 /*	Compose the REPL prompt: bpsh#<local>@<remote>, with the shell's
@@ -818,7 +828,7 @@ static int repl(void)
 	int	      isTty = isatty(fileno(stdin));
 	int	      color = isTty && wantColorPrompt();
 
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		buildPrompt(prompt, sizeof prompt, color);
 
@@ -900,7 +910,7 @@ static void *stdinForwarder(void *arg)
 
 	(void) arg;
 
-	while (running)
+	while (BPSH_RUNNING())
 	{
 		struct pollfd pfd;
 		ssize_t       n;
@@ -1133,7 +1143,7 @@ int main(int argc, char **argv)
 			/*	The remote command has exited; stop forwarding
 			 *	stdin so we don't block waiting for our stdin
 			 *	to be closed.				*/
-			running = 0;
+			BPSH_STOP();
 			pthread_join(forwarder, NULL);
 		}
 	}
