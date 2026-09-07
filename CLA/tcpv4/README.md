@@ -2,7 +2,7 @@
 
 A Bundle Protocol v7 convergence layer adapter implementing **TCPCL version
 4**, [RFC 9174](https://www.rfc-editor.org/rfc/rfc9174.html), over TLS 1.3
-(**GnuTLS**).
+(**GnuTLS** or **Mbed TLS**).
 
 ION ships a TCPCL **version 3** adapter (`tcpcli`, RFC 7242). TCPCLv4 is a
 different protocol on the wire — different contact header, different message
@@ -59,7 +59,7 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | Area | Status |
 |------|--------|
 | Contact header, version negotiation, `CAN_TLS` (§4.2, §4.3) | implemented |
-| TLS 1.3 handshake, mutual certificates, SNI (§4.4) | implemented (GnuTLS) |
+| TLS 1.3 handshake, mutual certificates, SNI (§4.4) | implemented (GnuTLS or Mbed TLS) |
 | `SESS_INIT` exchange + parameter negotiation (§4.6, §4.7) | implemented |
 | Session extension items (§4.8) | parsed; unknown CRITICAL ends the session |
 | `KEEPALIVE`, `MSG_REJECT` (§5.1) | implemented |
@@ -90,9 +90,56 @@ while still using TLS, and the session is then reported as unauthenticated.
 
 `-T` sets the policy applied to the negotiated Enable TLS value: `require`
 (default), `prefer` (opportunistic security, RFC 7435), or `none` (plaintext).
-Only TLS 1.3 is offered, per §4.4.3: `-P` chooses the cipher policy (a GnuTLS
-priority string, `SECURE128` by default) but not the protocol version, which
-is appended to whatever it names.
+Only TLS 1.3 is offered, per §4.4.3: `-P` chooses the cipher policy — in the
+syntax of whichever backend this build uses (see below) — but not the protocol
+version, which is imposed on top of whatever it names.
+
+### TLS backends
+
+The TLS 1.3 §4.4.3 requires can come from either of two libraries, chosen when
+the tree is configured:
+
+```
+./configure --enable-cla-tcpv4                          # auto: GnuTLS if present
+./configure --enable-cla-tcpv4 --with-tcpv4-tls=mbedtls # Mbed TLS >= 3.6
+```
+
+GnuTLS needs 3.6.5 or later (TLS 1.3). Mbed TLS needs 3.6 or later, built with
+`MBEDTLS_SSL_PROTO_TLS1_3` — TLS 1.3 arrived in 3.x and can still be compiled
+out — and with `MBEDTLS_THREADING_C`, since the CLA shares one TLS
+configuration between the handshakes of concurrent sessions and that is what
+the library's threading layer makes safe. `configure` asks the headers for all
+three rather than trusting a version number. Note that only recent
+distributions package Mbed TLS 3.6 (Debian and Ubuntu shipped 2.28 for a long
+while); where the packaged one is older, build 3.6 and name it with
+`MBEDTLS_CFLAGS` / `MBEDTLS_LIBS` or through `PKG_CONFIG_PATH`. `tcpv4cla`
+names the backend it is running with in its start-up line in `ion.log`.
+
+All of the CLA's use of a TLS library is confined behind `src/tcpv4tls.h` and
+implemented in one `src/tcpv4tls_<backend>.c`, so the session engine, the
+protocol and the wire are the same either way. Three things an operator can
+see are not:
+
+- **`-P` syntax.** GnuTLS takes a priority string (`SECURE128` by default);
+  Mbed TLS takes a colon-separated list of ciphersuite names, such as
+  `TLS1-3-AES-256-GCM-SHA384:TLS1-3-CHACHA20-POLY1305-SHA256`. Without `-P`
+  each library's own list is used, less `TLS_AES_128_CCM_8_SHA256` — the one
+  TLS 1.3 suite with a truncated (64-bit) authentication tag, which BCP 195
+  (RFC 9325 §4.2) asks not be negotiated and which Mbed TLS would otherwise
+  offer.
+- **The system trust store**, used when `-C` is absent. GnuTLS finds the
+  platform's; the Mbed TLS backend, which has no such notion to draw on, looks
+  in the usual files (`/etc/ssl/certs/ca-certificates.crt` and its
+  equivalents) and then in `/etc/ssl/certs`. A system that keeps its anchors
+  elsewhere wants `-C`.
+- **This node's own certificate.** Mbed TLS will not offer a server
+  certificate that omits `id-kp-serverAuth`, which §4.4.2 does not require of
+  one, so under that backend `-c` has to name a certificate carrying
+  `id-kp-serverAuth` and `id-kp-clientAuth` — as the example below does — or
+  carrying no extended key usage at all. A certificate carrying
+  `id-kp-bundleSecurity` alone, which is what §4.4.5 recommends issuing, is
+  accepted from a *peer* under both backends but cannot be used as this node's
+  own under Mbed TLS.
 
 ### Node ID authentication
 
@@ -173,9 +220,9 @@ its own certificates should use `require`.
 
 A key usage extension that withholds `digitalSignature` is refused outright:
 every TLS 1.3 cipher suite authenticates the peer by a signature, so such a
-certificate cannot have authenticated the handshake it just completed. GnuTLS
-generally declines these during the handshake anyway; the check here is the
-backstop.
+certificate cannot have authenticated the handshake it just completed. Both
+TLS libraries generally decline these during the handshake anyway; the check
+here is the backstop.
 
 Every `tcpv4cla` is both entities — it accepts sessions and opens them — so
 its own certificate wants both TLS purposes. Generating one that carries a
@@ -190,8 +237,12 @@ otherName:1.3.6.1.5.5.7.8.11;IA5:ipn:1.0" \
     -addext "keyUsage=digitalSignature"
 ```
 
-The TLS code is isolated behind `tcpv4tls.h`, so an OpenSSL or wolfSSL backend
-can be added as a sibling `tcpv4tls_*.c` without touching the engine.
+The TLS code is isolated behind `tcpv4tls.h` — the GnuTLS and Mbed TLS
+backends are two implementations of it — so an OpenSSL or wolfSSL backend can
+be added as a sibling `tcpv4tls_*.c` without touching the engine. The
+certificate decoding that neither library does for us (the NODE-ID
+`otherName`, the extension walk) lives once in `tcpv4x509.c` rather than in
+each backend.
 
 ## Configuration
 
@@ -211,7 +262,8 @@ policy (`require`/`prefer`/`none`), `-K` keepalive
 interval to propose, `-t` idle session timeout, `-S`/`-M` advertised Segment
 and Transfer MRUs, `-r`/`-w` socket receive/send buffer sizes in bytes
 (`SO_RCVBUF`/`SO_SNDBUF`; 0 = OS default), `-L` concurrent session limit,
-`-W` transmission window as `count[:bytes]`, `-P` GnuTLS priority string.
+`-W` transmission window as `count[:bytes]`, `-P` cipher policy in the TLS
+backend's own syntax.
 
 The transmission window is what bounds throughput on a link with a long
 round-trip time: several transfers may await their `XFER_ACK` at once, so a
@@ -276,6 +328,9 @@ src/tcpv4nodeid.{c,h}   node ID comparison (dependency-free)
 src/tcpv4msg.{c,h}      RFC 9174 wire-message codec (dependency-free)
 src/tcpv4tls.h          TLS backend interface
 src/tcpv4tls_gnutls.c   GnuTLS backend (TLS 1.3)
+src/tcpv4tls_mbedtls.c  Mbed TLS backend (TLS 1.3)
+src/tcpv4x509.{c,h}     certificate decoding shared by the backends
+                        (dependency-free)
 src/tcpv4session.h      session engine interface (engine start/send/stop)
 src/tcpv4sessint.h      session engine internals, shared by the units below
 src/tcpv4session.c      engine: listening socket, session list, reconnection
@@ -328,8 +383,10 @@ limit while BP was congested.
 ## Testing
 
 - `make check` — codec round-trip unit tests for the contact header, every
-  message type, and the extension-item TLV walker; and node ID comparison,
-  which decides which session may carry a node's traffic.
+  message type, and the extension-item TLV walker; node ID comparison, which
+  decides which session may carry a node's traffic; and the certificate
+  decoding both TLS backends share, which decides who a peer is allowed to
+  be.
 - `tests/protocol-tcpv4` — the error paths, driven by a synthetic RFC 9174
   peer (`peer.py`) that speaks the protocol on a plaintext socket. The bp
   test tools can drive the happy path and no more: they cannot send a
@@ -393,7 +450,11 @@ limit while BP was congested.
   entities) establishes a session and carries a bundle; `emailProtection`
   alone is refused, and nothing gets through; no extension at all is
   accepted, since RFC 5280 §4.2.1.12 makes that unrestricted, with the
-  deviation logged.
+  deviation logged. Two further phases cover `-B require` and a key usage
+  that forbids signing. The phase that offers `id-kp-bundleSecurity` alone
+  is skipped under the Mbed TLS backend, which will not offer such a
+  certificate as its own (see "TLS backends"); everything the test asks of a
+  *peer's* certificate holds under both.
 - `tests/revocation-tcpv4` — RFC 9174 §4.4.4.1, against a real CA, since a
   self-signed certificate has no issuer to withdraw it: a certificate the CRL
   does not name carries a bundle; the same certificate, once the CA has
@@ -504,9 +565,11 @@ both bounds in one argument.
 Wireshark dissects TCPCLv4 natively (`tcpcl` dissector, "TCP Convergence
 Layer"); point it at the port in use with *Decode As...* if it is not 4556. A
 plaintext run (`-T none`) is therefore readable with no extra setup. For a TLS
-run, GnuTLS writes a TLS key log to the file named by the `SSLKEYLOGFILE`
-environment variable, so exporting it before starting ION (the spawned
-`tcpv4cla` inherits it) lets Wireshark decrypt the session:
+run **built against GnuTLS**, the library writes a TLS key log to the file
+named by the `SSLKEYLOGFILE` environment variable, so exporting it before
+starting ION (the spawned `tcpv4cla` inherits it) lets Wireshark decrypt the
+session; Mbed TLS has no equivalent, so under that backend a plaintext run is
+the way to read the exchange:
 
 ```
 export SSLKEYLOGFILE=/tmp/tcpv4.keys

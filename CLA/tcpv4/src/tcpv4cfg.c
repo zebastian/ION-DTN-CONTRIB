@@ -141,7 +141,7 @@ static int parseTxWindow(const char *arg, Tcpv4ClaConfig *cfg)
  *   -W <count>[:<bytes>]  transfers, and octets of them, that may await
  *                  acknowledgment on one session at once (default
  *                  100:4194304); either bound may be 0 for "unbounded"
- *   -P <string>    TLS priority string (GnuTLS syntax)
+ *   -P <string>    cipher policy, in the TLS backend's own syntax
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
  * the final argument (the host), which the caller consumes.

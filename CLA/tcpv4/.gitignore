@@ -37,4 +37,7 @@ tcpv4msg_test.trs
 tcpv4nodeid_test
 tcpv4nodeid_test.log
 tcpv4nodeid_test.trs
+tcpv4x509_test
+tcpv4x509_test.log
+tcpv4x509_test.trs
 test-suite.log

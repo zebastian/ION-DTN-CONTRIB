@@ -14,7 +14,8 @@ B<tcpv4cla> B<-c> I<cert> B<-k> I<key> [B<-C> I<cafile>] [B<-R> I<crlfile>] [B<-
 =head1 DESCRIPTION
 
 B<tcpv4cla> is a background "daemon" task that implements version 4 of the
-DTN TCP convergence-layer protocol, RFC 9174, over TLS 1.3 (GnuTLS).  TCPCLv4
+DTN TCP convergence-layer protocol, RFC 9174, over TLS 1.3 (GnuTLS or Mbed
+TLS, whichever the build was configured for).  TCPCLv4
 sessions are bidirectional: once established, either entity may transfer
 bundles over the session regardless of which one opened the TCP connection.
 
@@ -192,11 +193,36 @@ window on its own; both at once is refused.
 
 =item B<-P> I<priority>
 
-GnuTLS priority string selecting the cipher policy (default C<SECURE128>).
-The protocol version is not the operator's to choose: TLS 1.3 is appended to
-whatever is given here, because RFC 9174 section 4.4.3 requires it.
+Cipher policy, in the syntax of the TLS backend this B<tcpv4cla> was built
+against - which it names in B<ion.log> as it starts.  Under GnuTLS it is a
+priority string (default C<SECURE128>); under Mbed TLS it is a colon-separated
+list of ciphersuite names, such as
+C<TLS1-3-AES-256-GCM-SHA384:TLS1-3-CHACHA20-POLY1305-SHA256>, and without it
+the library's own list applies, less C<TLS_AES_128_CCM_8_SHA256> - the one
+TLS 1.3 suite with a truncated authentication tag, which BCP 195 asks not be
+negotiated.  The protocol
+version is not the operator's to choose either way: TLS 1.3 is imposed on top
+of whatever is given here, because RFC 9174 section 4.4.3 requires it.
 
 =back
+
+=head1 TLS BACKENDS
+
+Which TLS library provides the TLS 1.3 of RFC 9174 section 4.4.3 is a build
+choice (F<configure --with-tcpv4-tls>), and B<tcpv4cla> names the one it is
+running with in its start-up line in B<ion.log>.  The protocol on the wire is
+the same either way; three things an operator can see are not.
+
+B<-P> takes each library's own syntax, as above.  Without B<-C>, peers are
+verified against the platform's trust store, which GnuTLS locates itself and
+which the Mbed TLS backend looks for in the usual files
+(F</etc/ssl/certs/ca-certificates.crt> and its equivalents), so a system that
+keeps it elsewhere wants B<-C>.  And Mbed TLS declines to offer a server
+certificate that does not carry C<id-kp-serverAuth>, which RFC 9174 section
+4.4.2 does not require of one: under that backend this node's own certificate
+(B<-c>) has to carry C<id-kp-serverAuth> and C<id-kp-clientAuth>, or no
+extended key usage at all.  What is asked of a I<peer's> certificate is the
+same under both, and is what section 4.4.2 asks.
 
 =head1 EXIT STATUS
 

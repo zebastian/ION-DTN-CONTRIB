@@ -36,6 +36,13 @@
 #     digitalSignature     a key its issuer said may not sign cannot
 #                          have signed this handshake.
 #
+# Each phase uses one certificate at both ends, so a certificate the TLS
+# backend will not offer as its own never reaches the CLA's check of the
+# peer's copy of it.  Mbed TLS declines to offer one that names no TLS
+# purpose, which is why two phases below ask what the outcome was rather
+# than which layer produced it, and why the bundleSecurity-only phase is
+# skipped under that backend (see CLA/tcpv4/README.md, "TLS backends").
+#
 # Requires openssl (1.1.1+ for -addext) plus the standard bp test tools.
 #
 
@@ -209,6 +216,20 @@ send_bundle()
 	return $result
 }
 
+# Non-zero unless the TLS backend insists that this node's *own*
+# certificate name the TLS purpose of the role it is playing.  Mbed TLS
+# will not offer a server certificate that omits id-kp-serverAuth, and
+# RFC 9174 4.4.2 does not ask for one, so under that backend a phase
+# whose certificate names no TLS purpose fails in the handshake - before
+# the CLA ever weighs the peer's copy of it.  The CLA's own checks are
+# the same either way; what differs is which layer says no, and for the
+# certificate 4.4.5 recommends, whether a session is possible at all.
+# See CLA/tcpv4/README.md, "TLS backends".
+own_cert_needs_tls_purpose()
+{
+	grep -q "TLS backend: Mbed TLS" ion.log 2>/dev/null
+}
+
 # --- Phase 1: the profile RFC 9174 4.4.2 asks for ---------------------
 echo "Phase 1: serverAuth,clientAuth is accepted..."
 if ! make_cert conformant "serverAuth,clientAuth"; then
@@ -259,9 +280,15 @@ if ! start_node wrongpurpose; then
 	exit 1
 fi
 
-send_bundle "not valid for this role" && DELIVERED=1 || DELIVERED=0
+if own_cert_needs_tls_purpose; then
+	MARKER="TLS handshake failed"
+else
+	MARKER="not valid for this role"
+fi
 
-if grep -q "not valid for this role" ion.log; then
+send_bundle "$MARKER" && DELIVERED=1 || DELIVERED=0
+
+if grep -q "$MARKER" ion.log; then
 	pass "the certificate was refused for want of the right purpose."
 else
 	fail "a certificate restricted to emailProtection was not refused."
@@ -332,17 +359,25 @@ if ! start_node bundleonly; then
 	exit 1
 fi
 
-send_bundle && DELIVERED=1 || DELIVERED=0
+if own_cert_needs_tls_purpose; then
+	# The CLA would accept this peer certificate; the backend will
+	# not offer it as its own, so no session is possible either way.
+	echo "  SKIP: this TLS backend offers no server certificate that"
+	echo "        names no TLS purpose (see the note above)."
+else
+	send_bundle && DELIVERED=1 || DELIVERED=0
 
-if grep -q "not valid for this role" ion.log; then
-	fail "the profile RFC 9174 4.4.5 recommends was refused."
-else
-	pass "a certificate for TCPCL alone was accepted."
-fi
-if [ "$DELIVERED" = 1 ]; then
-	pass "bundle delivered."
-else
-	fail "no bundle delivered over an id-kp-bundleSecurity certificate."
+	if grep -q "not valid for this role" ion.log; then
+		fail "the profile RFC 9174 4.4.5 recommends was refused."
+	else
+		pass "a certificate for TCPCL alone was accepted."
+	fi
+	if [ "$DELIVERED" = 1 ]; then
+		pass "bundle delivered."
+	else
+		fail "no bundle delivered over an id-kp-bundleSecurity \
+certificate."
+	fi
 fi
 stop_node
 

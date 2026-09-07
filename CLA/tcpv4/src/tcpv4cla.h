@@ -1,6 +1,7 @@
 /*
 	tcpv4cla.h:	common definitions for the TCPCLv4 convergence
-			layer adapter (RFC 9174, TLS via GnuTLS).
+			layer adapter (RFC 9174, TLS 1.3 via GnuTLS or
+			Mbed TLS - see tcpv4tls.h).
 
 	Bundles are carried as XFER_SEGMENT messages over a TCP connection
 	that is (by default) protected with TLS 1.3.
@@ -133,8 +134,9 @@ typedef struct
 			      bounded by txWindowBytes alone.		*/
 	vast txWindowBytes; /* Octets of those; 0 = bounded by txWindow
 			      alone.					*/
-	char tlsPriority[TCPV4_MAX_PRIORITY_LEN]; /* GnuTLS priority
-					string; empty = the default.	*/
+	char tlsPriority[TCPV4_MAX_PRIORITY_LEN]; /* cipher policy, in
+					the TLS backend's own syntax;
+					empty = the default.		*/
 } Tcpv4ClaConfig;
 
 /*
@@ -167,8 +169,10 @@ int parseTcpv4DuctName(const char *ductName, char *host, int *port);
  *   -W <count>[:<bytes>]  transfers, and octets of them, that may await
  *                  acknowledgment on one session at once (default
  *                  100:4194304); either bound may be 0 for "unbounded"
- *   -P <string>    TLS priority string (GnuTLS syntax); TLS 1.3 is
- *                  imposed on top of it, per RFC 9174 4.4.3
+ *   -P <string>    cipher policy, in the TLS backend's own syntax (a
+ *                  GnuTLS priority string, or a colon-separated list of
+ *                  Mbed TLS ciphersuite names); TLS 1.3 is imposed on
+ *                  top of it, per RFC 9174 4.4.3
  *
  * Scans the options in argv[1..argc-2]; ION appends the duct name as
  * the final argument (the host), which the caller consumes.

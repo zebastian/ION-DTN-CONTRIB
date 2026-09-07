@@ -1,6 +1,10 @@
 #!/bin/sh
-# install-deps.sh — prerequisites for the TCPCLv4 CLA (GnuTLS).
+# install-deps.sh — prerequisites for the TCPCLv4 CLA.
 #   (default)  build deps: GnuTLS dev (TLS 1.3, RFC 9174 4.4.3).
+#   mbedtls    build deps: Mbed TLS dev, the alternative TLS backend
+#              (--with-tcpv4-tls=mbedtls).  Note that the packaged Mbed TLS
+#              is 3.6 or later only on recent distributions; the backend
+#              needs 3.6 for TLS 1.3, and configure says so if it is older.
 #   test       test deps:  openssl, for the loopback test's certificate.
 
 set -eu
@@ -22,8 +26,9 @@ fi
 case "${1:-build}" in
 test) PKGS="openssl" ;;
 build) PKGS="libgnutls28-dev" ;;
+mbedtls) PKGS="libmbedtls-dev" ;;
 *)
-	echo "usage: $0 [test]" >&2
+	echo "usage: $0 [mbedtls|test]" >&2
 	exit 1
 	;;
 esac

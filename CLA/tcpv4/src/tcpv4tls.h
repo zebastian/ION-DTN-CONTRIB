@@ -28,6 +28,12 @@ typedef struct Tcpv4TlsCreds Tcpv4TlsCreds;
 /*	Per-connection TLS session.  Opaque; defined by the backend.	*/
 typedef struct Tcpv4TlsConn Tcpv4TlsConn;
 
+/*	The TLS library this build speaks through, named and versioned, for
+ *	the start-up log.  The backends differ in what they accept - see
+ *	CLA/tcpv4/README.md - so which one is running is worth recording
+ *	next to the certificate faults it reports.			*/
+const char *tcpv4TlsBackend(void);
+
 /*	Allocate credentials from cfg for the TLS client (isServer == 0) or
  *	the TLS server (isServer != 0) role.  Both roles require cert + key
  *	per RFC 9174 4.4.3; peers are verified against cfg->caFile, or the

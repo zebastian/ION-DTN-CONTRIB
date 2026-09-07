@@ -1,4 +1,4 @@
-# TCPCLv4 convergence layer adapter for ION-DTN (RFC 9174, GnuTLS).
+# TCPCLv4 convergence layer adapter for ION-DTN (RFC 9174, TLS 1.3).
 #
 # Builds the tcpv4cla daemon against an installed ION-DTN.  bpP.h is a private
 # ION header that ION does not install; a copy is vendored under the top-level
@@ -9,12 +9,17 @@ AM_CPPFLAGS = -I$(top_srcdir)/include $(ION_CFLAGS) $(TCPV4_CFLAGS)
 bin_PROGRAMS = tcpv4cla
 
 noinst_HEADERS = src/tcpv4cla.h src/tcpv4session.h src/tcpv4sessint.h \
-	src/tcpv4tls.h src/tcpv4msg.h src/tcpv4nodeid.h
+	src/tcpv4tls.h src/tcpv4x509.h src/tcpv4msg.h src/tcpv4nodeid.h
 
-# TLS backend.  RFC 9174 4.4.3 mandates TLS 1.3; GnuTLS is the backend that
-# ships here, and an OpenSSL tcpv4tls_*.c can be swapped in behind the same
-# interface.
-TCPV4_TLS_SOURCES = src/tcpv4tls_gnutls.c
+# TLS backend, chosen by configure (--with-tcpv4-tls).  RFC 9174 4.4.3
+# mandates TLS 1.3; GnuTLS and Mbed TLS both ship here, and a further
+# tcpv4tls_*.c can be swapped in behind the same interface.  The certificate
+# decoding neither library does for us is shared rather than written twice.
+if TCPV4_TLS_MBEDTLS
+TCPV4_TLS_SOURCES = src/tcpv4tls_mbedtls.c src/tcpv4x509.c
+else
+TCPV4_TLS_SOURCES = src/tcpv4tls_gnutls.c src/tcpv4x509.c
+endif
 
 # The session engine is split by layer: message I/O, negotiation, the receive
 # path, the send path, and the engine itself (session list and threads).
@@ -26,15 +31,18 @@ tcpv4cla_SOURCES = src/tcpv4cla.c src/tcpv4cfg.c $(TCPV4_SESSION_SOURCES) \
 tcpv4cla_LDADD = $(ION_LIBS) $(TCPV4_LIBS) -lpthread
 
 # --- unit tests (make check) --- #
-# tcpv4msg and tcpv4nodeid are dependency-free (no ION/GnuTLS), so their
-# tests override the ION include path with the source dir only.
+# tcpv4msg, tcpv4nodeid and tcpv4x509 are dependency-free (no ION, no TLS
+# library), so their tests override the ION include path with the source
+# dir only.
 
-check_PROGRAMS = tcpv4msg_test tcpv4nodeid_test
-TESTS = tcpv4msg_test tcpv4nodeid_test
+check_PROGRAMS = tcpv4msg_test tcpv4nodeid_test tcpv4x509_test
+TESTS = tcpv4msg_test tcpv4nodeid_test tcpv4x509_test
 tcpv4msg_test_SOURCES = tests/tcpv4msg_test.c src/tcpv4msg.c
 tcpv4msg_test_CPPFLAGS = -I$(srcdir)/src
 tcpv4nodeid_test_SOURCES = tests/tcpv4nodeid_test.c src/tcpv4nodeid.c
 tcpv4nodeid_test_CPPFLAGS = -I$(srcdir)/src
+tcpv4x509_test_SOURCES = tests/tcpv4x509_test.c src/tcpv4x509.c
+tcpv4x509_test_CPPFLAGS = -I$(srcdir)/src
 
 # --- man pages (generated from POD when pod2man is available) --- #
 

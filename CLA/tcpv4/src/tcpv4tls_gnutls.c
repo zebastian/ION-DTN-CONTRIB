@@ -4,6 +4,7 @@
 									*/
 
 #include "tcpv4tls.h"
+#include "tcpv4x509.h"
 #include <errno.h>
 #include <string.h>
 #include <gnutls/gnutls.h>
@@ -30,6 +31,14 @@ struct Tcpv4TlsConn
 	int		 peerAuthenticated;
 	int		 isServer;	/* We are the passive entity.	*/
 };
+
+const char *tcpv4TlsBackend(void)
+{
+	static char name[64];
+
+	isprintf(name, sizeof name, "GnuTLS %s", gnutls_check_version(NULL));
+	return name;
+}
 
 Tcpv4TlsCreds *tcpv4TlsCredsNew(const Tcpv4ClaConfig *cfg, int isServer)
 {
@@ -540,127 +549,6 @@ int tcpv4TlsCheckKeyUsage(Tcpv4TlsConn *conn)
  *	for a bundle endpoint ID.					*/
 #define TCPV4_OID_BUNDLE_EID "1.3.6.1.5.5.7.8.11"
 
-/*	Read one DER tag-length-value of the expected tag at *off.  On
- *	success *off is left at the first content octet and *vlen holds the
- *	content length.  Returns 0 on success, -1 otherwise.		*/
-
-static int derTlv(const unsigned char *der, size_t len, size_t *off,
-		unsigned char tag, size_t *vlen)
-{
-	size_t	      i = *off;
-	size_t	      n;
-	unsigned char b;
-
-	if (i >= len || len - i < 2 || der[i] != tag)
-	{
-		return -1;
-	}
-
-	i++;
-	b = der[i++];
-	if (b < 0x80)
-	{
-		n = b;
-	}
-	else
-	{
-		unsigned int octets = b & 0x7F;
-
-		if (octets == 0 || octets > sizeof(size_t) || len - i < octets)
-		{
-			return -1;
-		}
-
-		n = 0;
-		while (octets-- > 0)
-		{
-			n = (n << 8) | der[i++];
-		}
-	}
-
-	if (n > len - i)
-	{
-		return -1;
-	}
-
-	*off = i;
-	*vlen = n;
-	return 0;
-}
-
-/*	Extract the URI from a BundleEID otherName value.  RFC 9174
- *	4.4.2.1 encodes it as an IA5String; Appendix C shows it inside the
- *	[0] EXPLICIT wrapper of AnotherName's value field.  GnuTLS hands
- *	back the raw DER of that value for an OID it does not know, which
- *	across versions is either the wrapper or the IA5String alone, so
- *	accept both.  Returns 0 on success, -1 if the value is not an
- *	IA5String this code can read.					*/
-
-static int bundleEidUri(const unsigned char *der, size_t len, char *into,
-		size_t cap)
-{
-	size_t off = 0;
-	size_t vlen;
-	size_t end = len;
-
-	if (derTlv(der, len, &off, 0xA0, &vlen) == 0)
-	{
-		end = off + vlen; /* Descend into the [0] wrapper.	*/
-	}
-	else
-	{
-		off = 0;
-	}
-
-	if (derTlv(der, end, &off, 0x16, &vlen) < 0) /* IA5String.	*/
-	{
-		return -1;
-	}
-
-	if (vlen == 0 || vlen >= cap)
-	{
-		return -1;
-	}
-
-	memcpy(into, der + off, vlen);
-	into[vlen] = '\0';
-
-	/*	A node ID is text; an embedded NUL would make the URI we
-	 *	compare shorter than the one the certificate carries.	*/
-
-	if (strlen(into) != vlen)
-	{
-		return -1;
-	}
-
-	return 0;
-}
-
-/*	RFC 9174 4.4.1: an entry whose value is some URI other than a node
- *	ID is ignored rather than counted as a failed NODE-ID.  A node ID
- *	is an endpoint ID that names a node and nothing on it: for ipn that
- *	is service number 0, for dtn an empty demux (RFC 9171 4.2.5).  A
- *	scheme this code has no rule for is left in play, so that an exact
- *	match still authenticates it.					*/
-
-static int isNodeId(const char *uri)
-{
-	size_t len = strlen(uri);
-
-	if (strncmp(uri, "ipn:", 4) == 0)
-	{
-		return len > 6 && strcmp(uri + len - 2, ".0") == 0;
-	}
-
-	if (strncmp(uri, "dtn:", 4) == 0)
-	{
-		return strcmp(uri, "dtn:none") == 0
-				|| (len > 6 && uri[len - 1] == '/');
-	}
-
-	return 1;
-}
-
 int tcpv4TlsMatchNodeId(Tcpv4TlsConn *conn, const char *nodeId)
 {
 	gnutls_x509_crt_t crt;
@@ -718,12 +606,12 @@ int tcpv4TlsMatchNodeId(Tcpv4TlsConn *conn, const char *nodeId)
 			continue;
 		}
 
-		if (bundleEidUri(value, valueLen, uri, sizeof uri) < 0)
+		if (tcpv4X509BundleEid(value, valueLen, uri, sizeof uri) < 0)
 		{
 			continue; /* Malformed; not a NODE-ID we can use.*/
 		}
 
-		if (!isNodeId(uri))
+		if (!tcpv4X509IsNodeId(uri))
 		{
 			continue;
 		}

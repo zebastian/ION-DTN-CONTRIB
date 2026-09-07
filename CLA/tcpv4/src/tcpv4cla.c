@@ -9,6 +9,7 @@
 			exists).
 									*/
 #include "tcpv4session.h"
+#include "tcpv4tls.h"
 
 /*	Per-session receive state.  Every session's receiver thread gets its
  *	own acquisition work area and attendant, so that one session
@@ -624,8 +625,8 @@ int main(int argc, char *argv[])
 		char txt[1024];
 
 		isprintf(txt, sizeof(txt),
-				"[i] tcpv4cla is running, duct '%s'.",
-				ductName);
+				"[i] tcpv4cla is running, duct '%s' (TLS "
+				"backend: %s).", ductName, tcpv4TlsBackend());
 		writeMemo(txt);
 	}
 
