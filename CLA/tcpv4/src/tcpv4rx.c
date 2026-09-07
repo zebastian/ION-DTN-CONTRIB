@@ -271,7 +271,7 @@ static int handleXferSegment(Tcpv4Conn *conn)
 
 	if (seg.flags & TMSG_FLAG_START)
 	{
-		if (conn->rxActive)
+		if (TCPV4_GET(conn->rxActive))
 		{
 			/*	RFC 9174 5.2.2 forbids interleaving
 			 *	transfers within one session.		*/
@@ -285,7 +285,7 @@ static int handleXferSegment(Tcpv4Conn *conn)
 		}
 
 		pthread_mutex_lock(&e->mutex);
-		conn->rxActive = 1;
+		TCPV4_SET(conn->rxActive, 1);
 		pthread_mutex_unlock(&e->mutex);
 		conn->rxId = seg.transferId;
 		conn->rxLen = 0;
@@ -340,7 +340,7 @@ static int handleXferSegment(Tcpv4Conn *conn)
 	}
 	else
 	{
-		if (!conn->rxActive || seg.transferId != conn->rxId)
+		if (!TCPV4_GET(conn->rxActive) || seg.transferId != conn->rxId)
 		{
 			writeMemoNote("[?] tcpv4cla got a segment outside any"
 				      " transfer from",
@@ -392,7 +392,7 @@ static int handleXferSegment(Tcpv4Conn *conn)
 	if (seg.flags & TMSG_FLAG_END)
 	{
 		pthread_mutex_lock(&e->mutex);
-		conn->rxActive = 0;
+		TCPV4_SET(conn->rxActive, 0);
 		pthread_mutex_unlock(&e->mutex);
 
 		if (!conn->rxRefused)
@@ -759,10 +759,10 @@ int tcpv4MessageLoop(Tcpv4Conn *conn)
 		}
 
 		pthread_mutex_lock(&e->mutex);
-		conn->secSinceRx = 0;
+		TCPV4_SET(conn->secSinceRx, 0);
 		if (type != TMSG_KEEPALIVE)
 		{
-			conn->secSinceData = 0;
+			TCPV4_SET(conn->secSinceData, 0);
 		}
 
 		pthread_mutex_unlock(&e->mutex);

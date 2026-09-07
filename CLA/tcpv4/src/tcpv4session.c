@@ -394,7 +394,7 @@ static void *acceptThread(void *parm)
 	int			busy;
 	int			newSock;
 
-	while (e->running)
+	while (TCPV4_GET(e->running))
 	{
 		pfd.fd = e->listenSock;
 		pfd.events = POLLIN;
@@ -414,7 +414,7 @@ static void *acceptThread(void *parm)
 				continue;
 			}
 
-			if (e->running)
+			if (TCPV4_GET(e->running))
 			{
 				putSysErrmsg("tcpv4cla accept() failed", NULL);
 				ionKillMainThread("tcpv4cla");
@@ -423,7 +423,7 @@ static void *acceptThread(void *parm)
 			break;
 		}
 
-		if (!e->running)
+		if (!TCPV4_GET(e->running))
 		{
 			closesocket(newSock);
 			break;
@@ -548,9 +548,9 @@ static void clockTick(Tcpv4Engine *e)
 		tick[count].sendKa = 0;
 		tick[count].sendTerm = 0;
 		tick[count].timedOut = 0;
-		conn->secSinceTx++;
-		conn->secSinceRx++;
-		conn->secSinceData++;
+		TCPV4_BUMP(conn->secSinceTx);
+		TCPV4_BUMP(conn->secSinceRx);
+		TCPV4_BUMP(conn->secSinceData);
 
 		if (conn->state == TCS_NEGOTIATING)
 		{
@@ -566,7 +566,7 @@ static void clockTick(Tcpv4Engine *e)
 
 		if (conn->keepalive > 0)
 		{
-			if (conn->secSinceTx >= conn->keepalive)
+			if (TCPV4_GET(conn->secSinceTx) >= conn->keepalive)
 			{
 				tick[count].sendKa = 1;
 			}
@@ -575,16 +575,18 @@ static void clockTick(Tcpv4Engine *e)
 			 *	negotiated interval ends the session; two
 			 *	intervals allows for one lost KEEPALIVE.	*/
 
-			if (conn->secSinceRx > 2 * conn->keepalive)
+			if (TCPV4_GET(conn->secSinceRx) > 2 * conn->keepalive)
 			{
 				tick[count].timedOut = 1;
 			}
 		}
 
 		if (e->cfg.idleSec > 0 && conn->state == TCS_ESTABLISHED
-				&& !conn->termSent && !conn->txActive
-				&& !conn->rxActive
-				&& conn->secSinceData >= e->cfg.idleSec)
+				&& !conn->termSent
+				&& !TCPV4_GET(conn->txActive)
+				&& !TCPV4_GET(conn->rxActive)
+				&& TCPV4_GET(conn->secSinceData)
+						>= e->cfg.idleSec)
 		{
 			conn->termSent = 1;
 			conn->state = TCS_ENDING;
@@ -641,7 +643,7 @@ static void *clockThread(void *parm)
 {
 	Tcpv4Engine *e = parm;
 
-	while (e->running)
+	while (TCPV4_GET(e->running))
 	{
 		snooze(1);
 		clockTick(e);
@@ -837,11 +839,11 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
 		}
 	}
 
-	e->running = 1;
+	TCPV4_SET(e->running, 1);
 	if (pthread_begin(&e->acceptThread, NULL, acceptThread, e))
 	{
 		putSysErrmsg("tcpv4cla can't start accept thread", NULL);
-		e->running = 0;
+		TCPV4_SET(e->running, 0);
 		tcpv4EngineStop(e);
 		return NULL;
 	}
@@ -979,13 +981,15 @@ void tcpv4EngineStop(Tcpv4Engine *e)
 	Tcpv4Conn *next;
 	Tcpv4Dial *dial;
 	Tcpv4Dial *nextDial;
+	int	   count = 0;
+	int	   i;
 
 	if (e == NULL)
 	{
 		return;
 	}
 
-	e->running = 0;
+	TCPV4_SET(e->running, 0);
 	if (e->hasClockThread)
 	{
 		pthread_join(e->clockThread, NULL);
@@ -1023,12 +1027,31 @@ void tcpv4EngineStop(Tcpv4Engine *e)
 		tcpv4DeliveryStop(conn);
 	}
 
-	for (conn = e->conns; conn != NULL; conn = conn->next)
+	/*	A receiver thread is still running on each session and sets
+	 *	its state under the engine lock as its peer terminates it,
+	 *	so the sessions still worth a SESS_TERM are collected under
+	 *	that lock and written to outside it: a socket write must not
+	 *	be made to wait on the engine.  The list itself needs no
+	 *	guarding here - only the clock thread ever removes a session
+	 *	from it, and it has been joined.  This is the same snapshot
+	 *	the clock thread takes, and it borrows the same scratch.	*/
+
+	pthread_mutex_lock(&e->mutex);
+	for (conn = e->conns; conn != NULL
+			&& count < e->maxSessions + TCPV4_BUSY_SLACK;
+			conn = conn->next)
 	{
 		if (conn->state == TCS_ESTABLISHED && !conn->failed)
 		{
-			oK(tcpv4SendSessTerm(conn, TMSG_TERM_UNKNOWN, 0));
+			e->ticks[count].conn = conn;
+			count++;
 		}
+	}
+
+	pthread_mutex_unlock(&e->mutex);
+	for (i = 0; i < count; i++)
+	{
+		oK(tcpv4SendSessTerm(e->ticks[i].conn, TMSG_TERM_UNKNOWN, 0));
 	}
 
 	for (conn = e->conns; conn != NULL; conn = conn->next)

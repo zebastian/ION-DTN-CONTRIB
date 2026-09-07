@@ -216,7 +216,7 @@ int tcpv4ConnSend(Tcpv4Conn *conn, const void *data, int len)
 	pthread_mutex_unlock(&conn->sendMutex);
 	if (result == 0)
 	{
-		conn->secSinceTx = 0;
+		TCPV4_SET(conn->secSinceTx, 0);
 	}
 
 	return result;

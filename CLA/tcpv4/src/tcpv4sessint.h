@@ -69,6 +69,21 @@ extern "C" {
  *	small Segment MRU would otherwise cost one write per segment.	*/
 #define TCPV4_TX_SEGS_PER_WRITE	 16
 
+/*	A session's second counters and its two activity flags are written
+ *	by whichever of its own threads sent or received something, and
+ *	read by the clock thread a second at a time.  The two never hold
+ *	the same lock - a sender holds sendMutex or txMutex, the clock
+ *	thread holds the engine lock - and taking the engine lock on every
+ *	send to close that gap would serialise the sends against it.  So
+ *	they are read and written atomically instead.  Relaxed ordering is
+ *	all this needs: nothing is published through these fields, and the
+ *	clock thread is entitled to a value one tick stale - it acts on
+ *	whole seconds.							*/
+#define TCPV4_GET(field)	__atomic_load_n(&(field), __ATOMIC_RELAXED)
+#define TCPV4_SET(field, v)	__atomic_store_n(&(field), (v), __ATOMIC_RELAXED)
+#define TCPV4_BUMP(field)	((void) __atomic_fetch_add(&(field), 1, \
+					__ATOMIC_RELAXED))
+
 /*	TCPCL session states (the subset the engine acts on; RFC 9174 3.3
  *	names more, but they collapse to these for our purposes).	*/
 #define TCS_NEGOTIATING		 0 /* Contact/TLS/SESS_INIT in progress.	*/
@@ -159,9 +174,9 @@ typedef struct Tcpv4Conn
 	uint64_t	nextTxId;
 	uint64_t	txAckedLen;   /* Ack length for the window head.	*/
 	int		txStopped;    /* No further transfers accepted.	*/
-	int		txActive;     /* txCount != 0; read unlocked by
-					 the clock thread, for the idle
-					 timer only.			*/
+	int		txActive;     /* txCount != 0; read by the clock
+					 thread, for the idle timer only.
+					 TCPV4_GET/SET.			*/
 
 	/*	Reception, touched only by this session's receiver thread
 	 *	(plus rxActive, which the clock thread reads).		*/
@@ -173,7 +188,7 @@ typedef struct Tcpv4Conn
 	int	       rxCap;
 	int	       rxLen;
 	uint64_t       rxId;
-	int	       rxActive;
+	int	       rxActive;  /* TCPV4_GET/SET; see txActive.	*/
 	int	       rxRefused; /* Draining a refused transfer.	*/
 
 	/*	Reception hand-off.  A reassembled transfer is left here for
@@ -202,7 +217,8 @@ typedef struct Tcpv4Conn
 	int		dlvStopped;
 	int		dlvFailed;
 
-	/*	Second counters maintained by the clock thread.		*/
+	/*	Second counters advanced by the clock thread and reset by
+	 *	the session's own threads; TCPV4_GET/SET/BUMP.		*/
 	int secSinceTx;	  /* Since any message was sent.		*/
 	int secSinceRx;	  /* Since any message was received.		*/
 	int secSinceData; /* Since any non-KEEPALIVE message either way.	*/
@@ -252,7 +268,9 @@ struct Tcpv4Engine
 	int		hasClockThread;
 	pthread_mutex_t mutex;
 	pthread_cond_t	cond;
-	int		running;
+	int		running;  /* Cleared without the lock at shutdown
+				     and polled by the accept and clock
+				     threads; TCPV4_GET/SET.		*/
 
 	Tcpv4Conn *conns;
 	int	   connCount;

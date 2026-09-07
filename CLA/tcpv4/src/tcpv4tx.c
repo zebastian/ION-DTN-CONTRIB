@@ -96,7 +96,7 @@ Tcpv4Xfer *tcpv4TxFinished(Tcpv4Conn *conn, Tcpv4Xfer *x)
 
 	conn->txCount--;
 	conn->txBytes -= x->length;
-	conn->txActive = (conn->txCount != 0);
+	TCPV4_SET(conn->txActive, conn->txCount != 0);
 	pthread_cond_broadcast(&conn->txCond);
 	return x;
 }
@@ -148,7 +148,7 @@ void tcpv4TxDrain(Tcpv4Conn *conn)
 	conn->txWindowTail = NULL;
 	conn->txCount = 0;
 	conn->txBytes = 0;
-	conn->txActive = 0;
+	TCPV4_SET(conn->txActive, 0);
 	pthread_mutex_unlock(&conn->txMutex);
 
 	while (dead != NULL)
@@ -253,7 +253,7 @@ static int sendSegments(Tcpv4Conn *conn, Tcpv4Xfer *x, const char *data,
 				return -1;
 			}
 
-			conn->secSinceTx = 0;
+			TCPV4_SET(conn->secSinceTx, 0);
 			segs = 0;
 			used = 0;
 		}
@@ -571,8 +571,8 @@ static int queueXfer(Tcpv4Conn *conn, Object bundle, vast length)
 		txAppend(&conn->txQueue, &conn->txQueueTail, x);
 		conn->txCount++;
 		conn->txBytes += length;
-		conn->txActive = 1;
-		conn->secSinceData = 0;
+		TCPV4_SET(conn->txActive, 1);
+		TCPV4_SET(conn->secSinceData, 0);
 		pthread_cond_broadcast(&conn->txCond);
 	}
 
@@ -599,7 +599,7 @@ int tcpv4EngineSendTo(Tcpv4Engine *e, const char *nodeId,
 	pthread_mutex_lock(&e->mutex);
 	for (;;)
 	{
-		if (!e->running)
+		if (!TCPV4_GET(e->running))
 		{
 			pthread_mutex_unlock(&e->mutex);
 			return -1;

@@ -601,9 +601,9 @@ int tcpv4Establish(Tcpv4Conn *conn)
 
 	pthread_mutex_lock(&e->mutex);
 	conn->state = TCS_ESTABLISHED;
-	conn->secSinceRx = 0;
-	conn->secSinceTx = 0;
-	conn->secSinceData = 0;
+	TCPV4_SET(conn->secSinceRx, 0);
+	TCPV4_SET(conn->secSinceTx, 0);
+	TCPV4_SET(conn->secSinceData, 0);
 	pthread_cond_broadcast(&e->cond);
 	pthread_mutex_unlock(&e->mutex);
 
