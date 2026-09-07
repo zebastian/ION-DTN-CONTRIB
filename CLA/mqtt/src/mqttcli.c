@@ -15,6 +15,16 @@ typedef struct
 	MQTTClient_connectOptions *connOpts;
 } ReceiverThreadParms;
 
+/*	The receiver thread reads this flag for as long as it runs, and
+ *	the main thread clears it at shutdown, so both go through a relaxed
+ *	atomic access: the reader acts on a whole poll cycle rather than on
+ *	the instant of the write, and the join that follows is what orders
+ *	everything else.					*/
+
+#define MQTT_GET(field)	__atomic_load_n(&(field), __ATOMIC_RELAXED)
+#define MQTT_SET(field, v)	__atomic_store_n(&(field), (v), \
+				__ATOMIC_RELAXED)
+
 static void	interruptThread(int signum)
 {
 	(void)signum;
@@ -43,7 +53,7 @@ static void	*receiveBundles(void *parm)
 		return NULL;
 	}
 
-	while (rtp->running)
+	while (MQTT_GET(rtp->running))
 	{
 		/*	Check connection and reconnect if needed.	*/
 
@@ -90,7 +100,7 @@ static void	*receiveBundles(void *parm)
 				&msg, 1000);
 		if (rc != MQTTCLIENT_SUCCESS)
 		{
-			if (rtp->running)
+			if (MQTT_GET(rtp->running))
 			{
 				writeMemo("[?] mqttcli: receive error.");
 			}
@@ -116,7 +126,7 @@ static void	*receiveBundles(void *parm)
 				MQTTClient_freeMessage(&msg);
 				MQTTClient_free(topicName);
 				ionKillMainThread(procName);
-				rtp->running = 0;
+				MQTT_SET(rtp->running, 0);
 				continue;
 			}
 		}
@@ -304,7 +314,7 @@ int	main(int argc, char *argv[])
 
 	/*	Start the receiver thread.				*/
 
-	rtp.running = 1;
+	MQTT_SET(rtp.running, 1);
 	if (pthread_begin(&receiverThread, NULL, receiveBundles, &rtp))
 	{
 		putSysErrmsg("mqttcli can't create receiver thread", NULL);
@@ -329,7 +339,7 @@ int	main(int argc, char *argv[])
 
 	/*	Time to shut down.					*/
 
-	rtp.running = 0;
+	MQTT_SET(rtp.running, 0);
 	pthread_join(receiverThread, NULL);
 
 	if (client != NULL)
