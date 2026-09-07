@@ -12,6 +12,16 @@ typedef struct
 	int		 running;
 } ReceiverThreadParms;
 
+/*	The receiver thread reads this flag for as long as it runs, and
+ *	the main thread clears it at shutdown, so both go through a relaxed
+ *	atomic access: the reader acts on a whole poll cycle rather than on
+ *	the instant of the write, and the join that follows is what orders
+ *	everything else.					*/
+
+#define MAIL_GET(field)	__atomic_load_n(&(field), __ATOMIC_RELAXED)
+#define MAIL_SET(field, v)	__atomic_store_n(&(field), (v), \
+				__ATOMIC_RELAXED)
+
 typedef struct
 {
 	AcqWorkArea	*work;
@@ -157,7 +167,7 @@ static void	*receiveBundles(void *parm)
 
 	snooze(1);	/*	Let main thread become interruptible.	*/
 
-	while (rtp->running)
+	while (MAIL_GET(rtp->running))
 	{
 		int	slept;
 
@@ -172,7 +182,8 @@ static void	*receiveBundles(void *parm)
 			writeMemo(memoBuf);
 		}
 
-		for (slept = 0; slept < rtp->cfg->pollSecs && rtp->running;
+		for (slept = 0; slept < rtp->cfg->pollSecs
+				&& MAIL_GET(rtp->running);
 				slept++)
 		{
 			snooze(1);
@@ -263,7 +274,7 @@ int	main(int argc, char *argv[])
 	ionNoteMainThread("mailcli");
 	isignal(SIGTERM, interruptThread);
 
-	rtp.running = 1;
+	MAIL_SET(rtp.running, 1);
 	if (pthread_begin(&receiverThread, NULL, receiveBundles, &rtp))
 	{
 		putSysErrmsg("mailcli can't create receiver thread", NULL);
@@ -285,7 +296,7 @@ int	main(int argc, char *argv[])
 
 	ionPauseMainThread(-1);
 
-	rtp.running = 0;
+	MAIL_SET(rtp.running, 0);
 	pthread_join(receiverThread, NULL);
 	bpReleaseAcqArea(rtp.work);
 	mailCurlGlobalCleanup();
