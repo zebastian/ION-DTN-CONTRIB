@@ -155,6 +155,16 @@ struct QuicSession
 	void	    *cbUser;
 };
 
+/*	The I/O thread reads this flag for as long as it runs, while the
+ *	thread that stops the engine clears it, so both go through a
+ *	relaxed atomic access: the reader acts on a whole poll cycle
+ *	rather than on the instant of the write, and the join that follows
+ *	is what orders everything else.	*/
+
+#define QUIC_GET(field)		__atomic_load_n(&(field), __ATOMIC_RELAXED)
+#define QUIC_SET(field, v)	__atomic_store_n(&(field), (v), \
+				__ATOMIC_RELAXED)
+
 /*	*	*	Time helpers	*	*	*	*	*/
 
 static ngtcp2_tstamp quicNow(void)
@@ -1435,6 +1445,40 @@ static void  wakeIo(QuicSession *s);
 static int   serverFeedPacket(void *user, const uint8_t *pkt, size_t len);
 static void  removeConn(QuicSession *s, QuicConn *dead);
 
+/*	*	*	Walking the connection list	*	*	*	*/
+
+/*	The list is prepended to by a sender thread (quicEngineConnect) and
+ *	by the I/O thread (acceptConn), so every read and write of conns and
+ *	of a node's next link is made under s->mutex.  The work a walk then
+ *	does on a connection is not: it can block for as long as BP takes to
+ *	acquire a bundle, and holding the engine lock across that would stop
+ *	every sender for the duration.  That is safe because only the I/O
+ *	thread removes a connection - a walk cannot have the entry it is
+ *	standing on taken away by anyone but itself.
+ *
+ *	A walk therefore misses a connection prepended after it started,
+ *	which the next pass a millisecond later picks up.		*/
+
+static QuicConn *firstConn(QuicSession *s)
+{
+	QuicConn *qc;
+
+	pthread_mutex_lock(&s->mutex);
+	qc = s->conns;
+	pthread_mutex_unlock(&s->mutex);
+	return qc;
+}
+
+static QuicConn *nextConn(QuicSession *s, QuicConn *qc)
+{
+	QuicConn *next;
+
+	pthread_mutex_lock(&s->mutex);
+	next = qc->next;
+	pthread_mutex_unlock(&s->mutex);
+	return next;
+}
+
 /*	Per-connection bring-up, run each I/O iteration.  The active peer (the
  *	one that opened the connection) opens the signalling stream (stream 0)
  *	and sends its SESS_INIT once the QUIC handshake completes.  Both peers
@@ -1550,7 +1594,7 @@ QuicSession *quicEngineStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 	oK(fcntl(s->fd, F_SETFL, O_NONBLOCK));
 	oK(fcntl(s->wakePipe[0], F_SETFL, O_NONBLOCK));
 	oK(fcntl(s->wakePipe[1], F_SETFL, O_NONBLOCK));
-	s->running = 1;
+	QUIC_SET(s->running, 1);
 
 	if (pthread_begin(&s->ioThread, NULL, engineIo, s))
 	{
@@ -1750,7 +1794,7 @@ static void engineServiceConns(QuicSession *s)
 {
 	QuicConn *qc;
 
-	for (qc = s->conns; qc != NULL; qc = qc->next)
+	for (qc = firstConn(s); qc != NULL; qc = nextConn(s, qc))
 	{
 		if (qc->failed)
 		{
@@ -1770,7 +1814,7 @@ static void *engineIo(void *parm)
 	QuicConn    *qc;
 	QuicConn    *next;
 
-	while (s->running)
+	while (QUIC_GET(s->running))
 	{
 		struct pollfd		pfds[2];
 		uint8_t			buf[QUIC_RX_BUFSZ];
@@ -1795,7 +1839,7 @@ static void *engineIo(void *parm)
 		/*	Wake at the soonest connection expiry (capped at 1s).	*/
 
 		now = quicNow();
-		for (qc = s->conns; qc != NULL; qc = qc->next)
+		for (qc = firstConn(s); qc != NULL; qc = nextConn(s, qc))
 		{
 			ngtcp2_tstamp expiry;
 
@@ -1858,9 +1902,9 @@ static void *engineIo(void *parm)
 		}
 
 		now = quicNow();
-		for (qc = s->conns; qc != NULL; qc = next)
+		for (qc = firstConn(s); qc != NULL; qc = next)
 		{
-			next = qc->next;
+			next = nextConn(s, qc);
 			if (!qc->failed)
 			{
 				if (ngtcp2_conn_handle_expiry(qc->conn, now) != 0)
@@ -1892,7 +1936,7 @@ static void *engineIo(void *parm)
 	/*	Stopping: cleanly terminate each established session with a
 	 *	SESS_TERM, flushed inline, then wake any waiters.		*/
 
-	for (qc = s->conns; qc != NULL; qc = qc->next)
+	for (qc = firstConn(s); qc != NULL; qc = nextConn(s, qc))
 	{
 		if (!qc->failed && qc->sessState == QSS_ESTABLISHED
 				&& !qc->termSent)
@@ -2295,9 +2339,9 @@ void quicEngineStop(QuicSession *s)
 	 *	as it exits (it alone owns the ngtcp2 connections), so callers
 	 *	must stop their sender threads before calling this.		*/
 
-	if (s->running)
+	if (QUIC_GET(s->running))
 	{
-		s->running = 0;
+		QUIC_SET(s->running, 0);
 		wakeIo(s);
 		pthread_join(s->ioThread, NULL);
 	}
@@ -2332,7 +2376,7 @@ static QuicConn *findConn(QuicSession *s, const uint8_t *dcid, size_t dcidlen)
 {
 	QuicConn *qc;
 
-	for (qc = s->conns; qc != NULL; qc = qc->next)
+	for (qc = firstConn(s); qc != NULL; qc = nextConn(s, qc))
 	{
 		if (qc->scid.datalen == dcidlen
 				&& memcmp(qc->scid.data, dcid, dcidlen) == 0)
@@ -2416,8 +2460,10 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 
 	ngtcp2_conn_set_tls_native_handle(qc->conn, quicTlsNativeHandle(qc->tls));
 
+	pthread_mutex_lock(&s->mutex);
 	qc->next = s->conns;
 	s->conns = qc;
+	pthread_mutex_unlock(&s->mutex);
 	return qc;
 }
 
@@ -2425,6 +2471,12 @@ static void removeConn(QuicSession *s, QuicConn *dead)
 {
 	QuicConn **pp;
 
+	/*	The unlink is what a sender's prepend could otherwise
+	 *	undo, leaving the freed connection reachable, so it is made
+	 *	under the lock; the connection itself is beyond anyone's
+	 *	reach once unlinked, and is freed outside it.		*/
+
+	pthread_mutex_lock(&s->mutex);
 	for (pp = &s->conns; *pp != NULL; pp = &(*pp)->next)
 	{
 		if (*pp == dead)
@@ -2434,6 +2486,7 @@ static void removeConn(QuicSession *s, QuicConn *dead)
 		}
 	}
 
+	pthread_mutex_unlock(&s->mutex);
 	freeConn(dead);
 }
 
