@@ -651,13 +651,20 @@ int bpshSessionRun(BpshSession *s, const char *cmdline, const int *running,
 	 *	subshell, not the driver shell.				*/
 	cmdOpen = s->userStdinReq ? "( " : "{ ";
 	cmdClose = s->userStdinReq ? " ) <&3 4>&-" : " ; } <&3 4>&-";
-	postLen = _isprintf(postscript, postCap,
+	postLen = snprintf(postscript, postCap,
 			"%s%s%s\n"
 			"__bpsh_rc=$?\n"
 			"echo \"$__bpsh_rc\" >&4\n"
 			"(exit $__bpsh_rc)\n",
 			cmdOpen, cmdline, cmdClose);
-	if (postLen <= 0 || writeAll(s->stdinFd, postscript, (size_t) postLen) < 0)
+
+	/*	A postscript that did not fit is not one to run: snprintf
+	 *	reports the length it wanted rather than the length it
+	 *	wrote, so writing that many octets would send the shell
+	 *	whatever lay past the buffer.				*/
+
+	if (postLen <= 0 || (size_t) postLen >= postCap
+			|| writeAll(s->stdinFd, postscript, (size_t) postLen) < 0)
 	{
 		MRELEASE(postscript);
 		s->shellAlive = 0;
