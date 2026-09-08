@@ -25,3 +25,7 @@ Makefile.in
 
 # IDE
 /.idea/
+
+# Local test credentials (never committed): the MySQL CLA's loopback test
+# reads MYSQL_* from here.  See CLA/mysql/tests/loopback-mysql.
+/.mysql-test.env
