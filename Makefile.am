@@ -27,4 +27,5 @@ endif
 
 # Vendored ION-DTN private headers, shared by all contributions (see
 # include/README).
-EXTRA_DIST = README.md include/bpP.h include/README
+EXTRA_DIST = README.md include/README include/bpP.h include/bpP-4.1.4.h \
+	include/bpP-4.2.0.h

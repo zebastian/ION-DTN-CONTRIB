@@ -43,6 +43,17 @@ CPPFLAGS="$CPPFLAGS $ION_CFLAGS"
 AC_CHECK_HEADER([bp.h], [],
   [AC_MSG_ERROR([ION-DTN headers not found under ${ion_prefix}/include. Install ION-DTN or pass --with-ion=PREFIX.])])
 
+# ION installs no version header, but its pkg-config file names the release.
+# Only informational: the contributions build against 4.1.4 and 4.2.0 alike,
+# and include/bpP.h picks the private header matching whichever is installed
+# (see include/README).
+ion_version=unknown
+AS_IF([test -r "${ion_prefix}/lib/pkgconfig/ion.pc"],
+  [ion_version=`sed -n 's/^Version:[[ \t]]*//p' "${ion_prefix}/lib/pkgconfig/ion.pc"`
+   test -n "$ion_version" || ion_version=unknown])
+AC_MSG_CHECKING([the installed ION-DTN version])
+AC_MSG_RESULT([$ion_version])
+
 # Recent ION deprecates the "Object" and "Address" aliases of SdrObject and
 # SdrAddress, defining them only under ION_USE_LEGACY_ALIASES.  Every ION API
 # these contributions call still speaks in Object - bpP.h itself is written in
@@ -99,5 +110,6 @@ AC_OUTPUT
 echo
 echo "  ION-DTN-CONTRIB configured"
 echo "    ION prefix ...... ${ion_prefix}"
+echo "    ION version ..... ${ion_version}"
 printf '%s\n' "$contrib_status"
 echo

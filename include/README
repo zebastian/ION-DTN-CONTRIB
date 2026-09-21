@@ -2,16 +2,22 @@ Vendored ION-DTN private headers
 ================================
 
 bpP.h is an internal Bundle Protocol header that ION-DTN does NOT install to
-its include prefix, yet the MQTT CLA sources require it. A verbatim copy is
-kept here so this contribution can be built against an *installed* ION without
-needing an ION source checkout.
+its include prefix, yet the CLA sources (mail, mqtt, mysql, quic, tcpv4)
+require it.  Verbatim copies are kept here so the contributions can be built
+against an *installed* ION without needing an ION source checkout.
 
-Provenance: ION-DTN 4.1.4 (NASA-JPL fork), bpv7/library/bpP.h, re-synced to
-the installed tree.  Note: BpVdb's delDeltas[] is ion_ipc_atomic_t (8 bytes),
-not atomic_uint; a stale copy shifts every field after it and makes daemons
-that read BpVdb (e.g. quiccli) misbehave.
+Provenance (NASA-JPL ION-DTN, bpv7/library/bpP.h, unmodified):
+  bpP-4.1.4.h   tag ion-open-source-4.1.4
+  bpP-4.2.0.h   tag ion-open-source-4.2.0
 
-Keep this copy in sync with the ION-DTN version you have installed. The struct
-layouts it declares must match the installed libbp/libici, or the daemons will
-misbehave at runtime.
-1
+bpP.h itself is a small switch that includes the copy matching the installed
+ION: 4.2.0's ion.h defines ION_IPC_ATOMIC_OPAQUE_DEFINED (with the
+ion_ipc_atomic_t type), 4.1.4's does not.
+
+The struct layouts these headers declare must match the installed
+libbp/libici, or the daemons will misbehave at runtime.  Between 4.1.4 and
+4.2.0, BpVdb's delDeltas[] changed from atomic_uint (4 bytes) to
+ion_ipc_atomic_t (8 bytes) and VEndpoint gained appCookie, shifting every
+field after them (e.g. BpVdb.plans, which tcpv4cla and quiccli read).  When
+adding support for a new ION release, add its bpP.h as another copy and
+extend the switch rather than editing an existing copy.

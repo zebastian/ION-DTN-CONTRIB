@@ -63,6 +63,13 @@ sudo make install
 `/usr/local`) and checks each contribution's own dependencies. Per-contribution
 build notes and dependencies live in each sub-project's `README.md`.
 
+The contributions build against ION-DTN **4.1.4** and **4.2.0**. The two
+releases differ in the layout of one private header they need (`bpP.h`, which
+ION does not install), so a verbatim copy of each release's version is kept
+under `include/` and `include/bpP.h` picks the one matching the installed ION
+at compile time; `configure` reports the version it found. See
+`include/README` for how to add a further release.
+
 Recent ION deprecates the `Object` and `Address` aliases of `SdrObject` and
 `SdrAddress`, defining them only under `ION_USE_LEGACY_ALIASES`. The ION APIs
 these contributions call still speak in `Object` - `bpP.h` itself is written in
