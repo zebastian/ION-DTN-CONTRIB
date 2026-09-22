@@ -60,15 +60,20 @@ sudo make install
 ```
 
 `configure` locates the installed ION headers and libraries (default prefix
-`/usr/local`) and checks each contribution's own dependencies. Per-contribution
+`/usr/local`), passes ION's own platform macros (`-Dlinux -DSPACE_ORDER=3` on
+64-bit Linux, which ION's `platform.h` needs to describe the installed
+libraries correctly) and checks each contribution's own dependencies. Per-contribution
 build notes and dependencies live in each sub-project's `README.md`.
 
-The contributions build against ION-DTN **4.1.4** and **4.2.0**. The two
-releases differ in the layout of one private header they need (`bpP.h`, which
-ION does not install), so a verbatim copy of each release's version is kept
-under `include/` and `include/bpP.h` picks the one matching the installed ION
-at compile time; `configure` reports the version it found. See
-`include/README` for how to add a further release.
+The contributions build against every ION-DTN release from **4.0.0** (2020)
+to **4.2.0**. The releases differ in the layout of one private header the
+CLAs need (`bpP.h`, which ION does not install), in a few public calls that
+arrived with 4.1.4, and in which headers the older releases install; verbatim
+copies of `bpP.h` for each layout, the missing headers and a small shim for
+the missing calls live under `include/`, and `include/bpP.h` picks the copy
+matching the installed ION at compile time. `configure` reports the version it
+found. See `include/README` for the details and for how to add a further
+release.
 
 Recent ION deprecates the `Object` and `Address` aliases of `SdrObject` and
 `SdrAddress`, defining them only under `ION_USE_LEGACY_ALIASES`. The ION APIs

@@ -13,7 +13,7 @@ a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
 
-a protocol mysql 262144 0
+a protocol mysql 1400 100
 
 a induct  mysql DBDUCT 'mysqlcli -d DBNAME -T loopback DBARGS'
 a outduct mysql DBDUCT 'mysqlclo -d DBNAME -T loopback DBARGS'

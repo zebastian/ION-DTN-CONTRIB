@@ -25,7 +25,9 @@ if ENABLE_APP_BPCMD
 SUBDIRS += APP/bpcmd
 endif
 
-# Vendored ION-DTN private headers, shared by all contributions (see
-# include/README).
-EXTRA_DIST = README.md include/README include/bpP.h include/bpP-4.1.4.h \
-	include/bpP-4.2.0.h
+# Vendored ION-DTN private headers and the compatibility shims, shared by all
+# contributions (see include/README).
+EXTRA_DIST = README.md include/README include/bpP.h include/bpP-4.0.1.h \
+	include/bpP-4.0.2.h include/bpP-4.1.3s.h include/bpP-4.1.4.h \
+	include/bpP-4.2.0.h include/ioncompat.h include/compat/cbor.h \
+	include/compat/crc.h

@@ -2,9 +2,10 @@
 #
 # Builds the bpsh (client) / bpshd (daemon) pair against an installed ION-DTN.
 # Only ION's public headers (bp.h, cbor.h) are used, so no private ION header
-# needs to be vendored.
+# needs to be vendored; the top-level include/ supplies the CBOR signed-integer
+# calls that ION before 4.1.4 lacks (see include/README).
 
-AM_CPPFLAGS = $(ION_CFLAGS)
+AM_CPPFLAGS = -I$(top_srcdir)/include $(ION_CFLAGS)
 
 bin_PROGRAMS = bpsh bpshd
 

@@ -1,23 +1,70 @@
-Vendored ION-DTN private headers
-================================
+Vendored ION-DTN headers and compatibility shims
+=================================================
 
-bpP.h is an internal Bundle Protocol header that ION-DTN does NOT install to
-its include prefix, yet the CLA sources (mail, mqtt, mysql, quic, tcpv4)
-require it.  Verbatim copies are kept here so the contributions can be built
-against an *installed* ION without needing an ION source checkout.
+The contributions build against every ION-DTN release from 4.0.0 (June
+2020) to 4.2.0.  What differs between those releases, as far as the
+contributions are concerned, is handled here.
+
+bpP.h - ION's private Bundle Protocol header
+--------------------------------------------
+
+bpP.h is an internal header that ION does NOT install to its include
+prefix, yet the CLA sources (mail, mqtt, mysql, quic, tcpv4) require it.
+Verbatim copies are kept here so the contributions can be built against
+an *installed* ION without needing an ION source checkout.
 
 Provenance (NASA-JPL ION-DTN, bpv7/library/bpP.h, unmodified):
-  bpP-4.1.4.h   tag ion-open-source-4.1.4
-  bpP-4.2.0.h   tag ion-open-source-4.2.0
 
-bpP.h itself is a small switch that includes the copy matching the installed
-ION: 4.2.0's ion.h defines ION_IPC_ATOMIC_OPAQUE_DEFINED (with the
-ion_ipc_atomic_t type), 4.1.4's does not.
+  bpP-4.0.1.h   tag IOS-4.0.1                  serves 4.0.0, 4.0.1
+  bpP-4.0.2.h   tag IOS-4.0.2                  serves 4.0.2
+  bpP-4.1.3s.h  tag ion-open-source-4.1.3s     serves 4.1.0 to 4.1.3s
+  bpP-4.1.4.h   tag ion-open-source-4.1.4      serves 4.1.4
+  bpP-4.2.0.h   tag ion-open-source-4.2.0      serves 4.2.0
+
+bpP.h itself is a small switch that includes the copy matching the
+installed ION, keyed on macros the installed headers are the first to
+define: ION_IPC_ATOMIC_OPAQUE_DEFINED (ion.h, 4.2.0), FQN_MAX_LENGTH
+(ion.h, 4.1.4), BP_VERSION (bp.h, 4.1.0) and BP_BIBE_REQUESTED (bp.h,
+4.0.2).
 
 The struct layouts these headers declare must match the installed
-libbp/libici, or the daemons will misbehave at runtime.  Between 4.1.4 and
-4.2.0, BpVdb's delDeltas[] changed from atomic_uint (4 bytes) to
-ion_ipc_atomic_t (8 bytes) and VEndpoint gained appCookie, shifting every
-field after them (e.g. BpVdb.plans, which tcpv4cla and quiccli read).  When
-adding support for a new ION release, add its bpP.h as another copy and
-extend the switch rather than editing an existing copy.
+libbp/libici, or the daemons will misbehave at runtime.  Between 4.1.4
+and 4.2.0, BpVdb's delDeltas[] changed from atomic_uint (4 bytes) to
+ion_ipc_atomic_t (8 bytes) and VEndpoint gained appCookie, shifting
+every field after them (e.g. BpVdb.plans, which tcpv4cla and quiccli
+read); 4.1.4 grew BpVdb and VPlan, 4.1.0 grew BpVdb, and 4.0.2 shrank
+ClProtocol, which the CLAs allocate.  Where one copy serves several
+releases, those releases differ only in fields of Bundle, which the
+contributions never allocate or read.  When adding support for a new
+ION release, add its bpP.h as another copy and extend the switch rather
+than editing an existing copy.
+
+compat/ - headers ION forgot to install
+---------------------------------------
+
+ION before 4.1.3s does not install cbor.h and crc.h, though its own
+bpP.h includes them and libici exports their functions.  compat/ holds
+verbatim copies from ion-open-source-4.1.3s (identical to 4.1.3's; the
+earlier releases' versions are subsets); configure adds compat/ to the
+include path only when the ION prefix lacks cbor.h.
+
+ioncompat.h - public API the older releases lack
+------------------------------------------------
+
+The few pieces of ION's public API that the contributions use and that
+releases before 4.1.4 do not have, supplied as static inline functions
+for those releases:
+
+  getOwnFqnn(), putFqn()       node numbers before the IPN naming
+                               transition (mysql, quic, tcpv4)
+  cbor_encode_signed_int(),    CBOR major type 1 (bpsh)
+  cbor_decode_signed_int()
+  ion_network.h                parseNetworkEndpoint() and friends and
+                               itcp_connect_dualstack(), getaddrinfo
+                               based as ION's are (tcpv4)
+
+Each piece is keyed on a macro the ION header that introduced it
+defines (FQN_MAX_LENGTH, CborNegativeInteger), except ion_network.h,
+whose presence configure tests in the ION prefix and reports through
+ION_CONTRIB_HAVE_ION_NETWORK_H.  On 4.1.4 and later the header only
+includes ION's own.

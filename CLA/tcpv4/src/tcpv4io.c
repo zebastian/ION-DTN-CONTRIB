@@ -24,7 +24,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include "ion_network.h"
+#include "ioncompat.h"
 
 /*	Read exactly len octets off the stream itself, bypassing the
  *	buffer.  Returns len, 0 at end of stream, or -1 on failure.	*/

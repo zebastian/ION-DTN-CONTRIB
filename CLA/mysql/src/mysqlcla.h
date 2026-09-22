@@ -25,6 +25,7 @@
 #include <mysql.h>
 #include <pthread.h>
 #include "bpP.h"
+#include "ioncompat.h"
 
 #ifdef __cplusplus
 extern "C" {

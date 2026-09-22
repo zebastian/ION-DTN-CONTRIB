@@ -4,7 +4,7 @@
  */
 
 #include "bpsh_proto.h"
-#include "cbor.h"
+#include "ioncompat.h"
 
 int bpsh_encode(const BpshFrame *frame, unsigned char *buf, size_t buflen)
 {

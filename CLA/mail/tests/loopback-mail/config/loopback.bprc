@@ -8,7 +8,7 @@ a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
 
-a protocol mail
+a protocol mail 1400 100
 
 # Induct polls the mock POP3 mailbox; outduct sends via the mock SMTP relay.
 # ION appends the duct name to each command, so it is not repeated here.

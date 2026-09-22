@@ -22,7 +22,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include "ion_network.h"
+#include "ioncompat.h"
 
 /*	*	*	Session lifecycle	*	*	*	*/
 

@@ -15,7 +15,7 @@ a endpoint ipn:1.1 q
 a endpoint ipn:1.2 q
 
 # Add the mqtt protocol.
-a protocol mqtt 262144 0
+a protocol mqtt 1400 100
 
 # Add an induct. (subscribe to loopback topic)
 a induct mqtt BROKER/node1 mqttcli

@@ -21,6 +21,7 @@
 #include "quicmsg.h"
 #include "quictls.h"
 #include "quicudp.h"
+#include "ioncompat.h"
 
 /*	One queued outbound QUIC DATAGRAM (a single XFER_SEGMENT) for the
  *	unreliable service.						*/
