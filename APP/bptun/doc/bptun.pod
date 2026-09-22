@@ -1,0 +1,118 @@
+=head1 NAME
+
+bptun - IP over Bundle Protocol through a TUN interface
+
+=head1 SYNOPSIS
+
+B<bptun> [B<-i> I<interface>] [B<-a> I<address>/I<prefix length>] [B<-m> I<MTU>]
+[B<-l> I<lifetime>] [B<-p> bulk|std|expedited] [B<-c>] [B<-u> I<user>]
+I<own endpoint ID> I<route> [I<route> ...]
+
+=head1 DESCRIPTION
+
+B<bptun> creates a TUN network interface and opens a BP endpoint.  Every IP
+packet the kernel routes into the interface is sent as the payload of one
+bundle to the endpoint of the B<bptun> serving the packet's destination,
+as the route table given on the command line says; every bundle delivered
+to the endpoint is written into the interface as one packet.  Applications
+on either side use the interface like any other IP link: a slow, lossy one
+that keeps working across disruptions for as long as the bundles' lifetime
+allows.
+
+A I<route> is I<address>[/I<prefix length>]B<=>I<EID>: an IPv4 or IPv6
+prefix (a bare address is a host route) and the endpoint of the B<bptun>
+that serves it.  The longest matching prefix wins.  B<default=>I<EID>
+routes everything else, in both families.  A packet no route covers is
+dropped and counted; the first few are also noted in the ION log.
+
+Creating the interface needs CAP_NET_ADMIN, so B<bptun> is usually
+started as root; B<-u> hands the process to an unprivileged user once the
+interface is open.  The interface's address, MTU and state are the
+operator's to set with ip(8), as for any tunnel device, except that
+B<-a> and B<-m> do the common IPv4 case.
+
+One packet is one bundle, so the interface MTU is what bounds the size
+of a bundle.  1400 suits most convergence layers.
+
+=head1 PAYLOAD FORMAT
+
+The first byte of every bundle payload names its format: B<0x01>, one IP
+packet follows.  A payload of a format B<bptun> does not know is dropped
+and counted, never written to the interface, so that the format can grow
+(batching several packets into one bundle) without breaking older peers
+outright.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-i> I<interface>
+
+Name of the TUN interface to create.  By default the kernel picks
+B<bptun0>, B<bptun1>, ..., and the name is reported in the ION log.
+
+=item B<-a> I<address>/I<prefix length>
+
+Configure the interface with this IPv4 address and netmask and bring it
+up.  Without B<-a> the interface is left down and unconfigured.
+
+=item B<-m> I<MTU>
+
+Set the interface MTU (68 to 65535).
+
+=item B<-l> I<lifetime>
+
+Bundle lifetime in seconds.  Default 300.
+
+=item B<-p> bulk|std|expedited
+
+Bundle priority.  Default std.
+
+=item B<-c>
+
+Request custody transfer for every bundle.
+
+=item B<-u> I<user>
+
+Run as this user once the interface is open.  The user must be able to
+attach to ION.
+
+=back
+
+=head1 SIGNALS
+
+SIGUSR1 logs the packet and bundle counters to the ION log; SIGINT and
+SIGTERM stop B<bptun>, which logs the counters once more on the way out.
+
+=head1 EXAMPLE
+
+Two nodes, ipn:1 and ipn:2, already exchanging bundles.  On node 1:
+
+    # bptun -i dtn0 -a 10.42.0.1/24 -m 1400 ipn:1.7 10.42.0.2=ipn:2.7
+
+and on node 2:
+
+    # bptun -i dtn0 -a 10.42.0.2/24 -m 1400 ipn:2.7 10.42.0.1=ipn:1.7
+
+with C<a endpoint ipn:1.7 q> and C<a endpoint ipn:2.7 q> in the nodes'
+bpadmin configurations.  Then, from node 1, C<ping 10.42.0.2>,
+C<ssh 10.42.0.2> and so on run over the bundles.
+
+A gateway pair serving whole subnets behind each node uses prefix routes
+and IP forwarding:
+
+    # bptun -i dtn0 -a 10.42.1.1/24 ipn:1.7 10.42.2.0/24=ipn:2.7
+    # sysctl -w net.ipv4.ip_forward=1
+
+=head1 EXIT STATUS
+
+0 on a clean stop; 1 if the interface could not be created, the endpoint
+could not be opened, or a fatal error stopped the daemon.
+
+=head1 FILES
+
+F</dev/net/tun>
+
+=head1 SEE ALSO
+
+bpadmin(1), ip(8), bpsh(1)

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+for f in bptunA.pid bptunB.pid nsA.pid nsB.pid server.pid; do
+	[ -f "$f" ] && kill "$(cat "$f")" >/dev/null 2>&1
+done
+killm f >/dev/null 2>&1
+rm -f ion.log bptunA.log bptunB.log bptunA.pid bptunB.pid nsA.pid nsB.pid \
+	send.dat recv.dat badformat.dat server.pid ping.log

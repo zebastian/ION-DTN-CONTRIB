@@ -24,6 +24,9 @@ endif
 if ENABLE_APP_BPCMD
 SUBDIRS += APP/bpcmd
 endif
+if ENABLE_APP_BPTUN
+SUBDIRS += APP/bptun
+endif
 
 # Vendored ION-DTN private headers and the compatibility shims, shared by all
 # contributions (see include/README).

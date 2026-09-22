@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+trap 'killm f >/dev/null 2>&1' EXIT
+#
+# Loopback test for bptun (IP over Bundle Protocol through a TUN device).
+#
+# One ION node runs two bptun instances, A on ipn:1.7 and B on ipn:1.8,
+# each routing the other's address to the other's endpoint.  Each runs in
+# its own network namespace, since two addresses of one subnet on one
+# host would reach each other inside the kernel without ever entering
+# the tunnel; from inside namespace A, 10.42.0.2 is reachable only
+# through bptun A -> bundle -> bptun B.
+#
+# The namespaces are unprivileged user+network namespaces (unshare -Urn),
+# in which the caller is root and may create TUN devices, so the test
+# needs no real root; bptun attaches to ION from inside them as usual,
+# since IPC and the filesystem stay shared.  Ubuntu 23.10 and later
+# restrict unprivileged user namespaces through AppArmor by default;
+# the test reports SKIP with the sysctl that lifts it.
+#
+# Validates:
+#   - ICMP echo crosses the tunnel and returns (ping, both directions)
+#   - a TCP stream crosses it intact (a 256 KiB transfer, many packets,
+#     each one bundle, with the kernel's own segmentation to the MTU)
+#   - a destination no route covers is dropped and counted, not sent
+#   - a payload of an unknown format is dropped, never written as a packet
+#   - the counters bptun logs on SIGUSR1 add up
+#
+# Needs unshare, nsenter, ip, ping and python3.
+#
+
+# Allow running against a freshly built, not-yet-installed binary:
+#   BPTUN=../../bptun ./dotest
+BPTUN=${BPTUN:-bptun}
+
+CONFIGFILES="./config/host1.rc"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: bptun — ping and a TCP transfer through two TUN interfaces"
+echo "         in two network namespaces on one ION node; unroutable"
+echo "         packets dropped; counters."
+echo
+echo "CONFIG: single-node loopback"
+echo
+for N in $CONFIGFILES; do
+	echo "$N:"
+	cat "$N"
+	echo "# EOF"
+	echo
+done
+echo "########################################"
+
+for t in "$BPTUN" unshare nsenter ip ping python3 ionstart ionstop; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+if ! unshare -Urn true 2>/dev/null; then
+	echo "SKIP: cannot create an unprivileged user+network namespace here."
+	if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns \
+			2>/dev/null)" = 1 ]; then
+		echo "      (sysctl kernel.apparmor_restrict_unprivileged_userns=0"
+		echo "       lifts Ubuntu's AppArmor restriction)"
+	fi
+	exit 2
+fi
+
+FAIL=0
+fail() { echo "  $1"; CASE_FAIL=1; }
+
+./cleanup
+sleep 1
+
+echo "Starting ION..."
+ionstart -I config/host1.rc
+
+# The MTU keeps each packet, and so each bundle, comfortably small.
+MTU=1400
+
+# A namespace per side, held open by a sleeping process that the rest of
+# the test enters with nsenter; being its creator, we are root inside.
+for X in A B; do
+	unshare -Urn sleep infinity &
+	echo $! > ns$X.pid
+done
+sleep 0.5
+NSENTER_A="nsenter -U --preserve-credentials -n -t $(cat nsA.pid)"
+NSENTER_B="nsenter -U --preserve-credentials -n -t $(cat nsB.pid)"
+in_ns() { if [ "$1" = A ]; then $NSENTER_A "${@:2}"; else $NSENTER_B \
+		"${@:2}"; fi; }
+
+# The daemons are started through nsenter itself, not in_ns: nsenter
+# execs its command, so $! is the daemon's own pid, where a function
+# call in the background would give a subshell's.
+echo "Starting bptun A (ipn:1.7, routes 10.42.0.2 to ipn:1.8)..."
+$NSENTER_A $BPTUN -i bptunA -m $MTU -l 60 ipn:1.7 10.42.0.2=ipn:1.8 \
+	> bptunA.log 2>&1 &
+A_PID=$!
+echo "$A_PID" > bptunA.pid
+
+echo "Starting bptun B (ipn:1.8, routes 10.42.0.1 to ipn:1.7)..."
+$NSENTER_B $BPTUN -i bptunB -m $MTU -l 60 ipn:1.8 10.42.0.1=ipn:1.7 \
+	> bptunB.log 2>&1 &
+B_PID=$!
+echo "$B_PID" > bptunB.pid
+
+# The interfaces exist once the daemons say they are running.
+for i in $(seq 1 50); do
+	if in_ns A ip link show bptunA >/dev/null 2>&1 \
+	&& in_ns B ip link show bptunB >/dev/null 2>&1; then
+		break
+	fi
+
+	sleep 0.1
+done
+
+for X in A B; do
+	if ! in_ns $X ip link show bptun$X >/dev/null 2>&1; then
+		echo "ERROR: bptun $X did not come up"
+		cat bptunA.log bptunB.log
+		tail -20 ion.log
+		ionstop
+		exit 1
+	fi
+done
+
+# Address, MTU and loopback inside each namespace.
+echo "Configuring the interfaces..."
+for X in A B; do
+	if [ $X = A ]; then ADDR=10.42.0.1; else ADDR=10.42.0.2; fi
+	in_ns $X ip addr add $ADDR/24 dev bptun$X
+	in_ns $X ip link set bptun$X up mtu $MTU
+	in_ns $X ip link set lo up
+done
+
+# ----------------------------------------------------------------------
+# Case 1: ping through the tunnel, both directions.
+# ----------------------------------------------------------------------
+echo
+echo "Case 1: ICMP echo through the tunnel, both directions"
+CASE_FAIL=0
+if ! in_ns A ping -c 5 -i 0.3 -W 5 10.42.0.2 > ping.log 2>&1
+then
+	fail "ping A -> B failed"
+	cat ping.log
+fi
+
+if ! in_ns B ping -c 5 -i 0.3 -W 5 10.42.0.1 >> ping.log 2>&1
+then
+	fail "ping B -> A failed"
+	tail -8 ping.log
+fi
+
+if [ $CASE_FAIL -eq 0 ]; then
+	echo "  $(grep -c 'bytes from' ping.log) echo replies"
+	echo "  Case 1 PASS"
+else
+	echo "  Case 1 FAIL"
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 2: a TCP stream through the tunnel.  256 KiB from A to B, which
+# the kernel segments to the MTU; B writes what it gets to a file.
+# ----------------------------------------------------------------------
+echo
+echo "Case 2: 256 KiB TCP transfer through the tunnel"
+CASE_FAIL=0
+head -c 262144 /dev/urandom > send.dat
+rm -f recv.dat
+
+in_ns B python3 - recv.dat <<'EOF' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.42.0.2", 5555))
+s.listen(1)
+s.settimeout(60)
+c, _ = s.accept()
+c.settimeout(60)
+with open(sys.argv[1], "wb") as f:
+    while True:
+        d = c.recv(65536)
+        if not d:
+            break
+        f.write(d)
+EOF
+SERVER_PID=$!
+echo "$SERVER_PID" > server.pid
+sleep 1
+
+if ! in_ns A python3 - send.dat <<'EOF'
+import socket, sys
+s = socket.create_connection(("10.42.0.2", 5555), timeout=30)
+with open(sys.argv[1], "rb") as f:
+    s.sendall(f.read())
+s.close()
+EOF
+then
+	fail "TCP client could not send"
+fi
+
+wait "$SERVER_PID" 2>/dev/null
+if ! cmp -s send.dat recv.dat; then
+	fail "received data differs from sent (got $(stat -c %s recv.dat \
+			2>/dev/null || echo 0) of 262144 bytes)"
+fi
+
+if [ $CASE_FAIL -eq 0 ]; then
+	echo "  Case 2 PASS"
+else
+	echo "  Case 2 FAIL"
+	echo "  --- bptunA.log ---"; cat bptunA.log
+	echo "  --- bptunB.log ---"; cat bptunB.log
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 3: no route.  10.42.0.9 is on the subnet, so the kernel hands it
+# to bptun A, which has no route for it: dropped, noted, counted.
+# ----------------------------------------------------------------------
+echo
+echo "Case 3: a destination without a route is dropped"
+CASE_FAIL=0
+in_ns A ping -c 2 -i 0.3 -W 1 10.42.0.9 >/dev/null 2>&1
+sleep 1
+if ! grep -q "bptun: no route for a packet" ion.log; then
+	fail "no 'no route' note in ion.log"
+fi
+
+if [ $CASE_FAIL -eq 0 ]; then
+	echo "  Case 3 PASS"
+else
+	echo "  Case 3 FAIL"
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 4: unknown payload format.  A bundle whose first byte names no
+# format bptun knows must be dropped and counted, not written to the
+# interface (where the kernel would see garbage).
+# ----------------------------------------------------------------------
+echo
+echo "Case 4: a payload of an unknown format is dropped"
+CASE_FAIL=0
+printf '\177not a bptun payload' > badformat.dat
+bpsendfile ipn:1.9 ipn:1.8 badformat.dat >/dev/null 2>&1
+sleep 2
+
+# ----------------------------------------------------------------------
+# Case 5: counters.  SIGUSR1 makes each daemon log its counters; A must
+# have counted the unroutable packets, B the unknown-format payload,
+# and both must have moved bundles.
+# ----------------------------------------------------------------------
+kill -USR1 "$A_PID" "$B_PID"
+sleep 2
+A_LINE=$(grep "bptun counters" ion.log | grep "bptunA:" | tail -1)
+B_LINE=$(grep "bptun counters" ion.log | grep "bptunB:" | tail -1)
+if [ -z "$A_LINE" ] || [ -z "$B_LINE" ]; then
+	fail "counters not logged by both daemons"
+else
+	echo "  $A_LINE" | sed 's/.*bptun counters: //'
+	echo "  $B_LINE" | sed 's/.*bptun counters: //'
+	A_UNROUTABLE=$(echo "$A_LINE" | sed -n 's/.* \([0-9]*\) unroutable.*/\1/p')
+	A_OUT=$(echo "$A_LINE" | sed -n 's/.*packets -> \([0-9]*\) bundles.*/\1/p')
+	B_IN=$(echo "$B_LINE" | sed -n 's/.*out \([0-9]*\) bundles -> packets.*/\1/p')
+	B_BADFMT=$(echo "$B_LINE" | sed -n 's/.* \([0-9]*\) unknown format.*/\1/p')
+	B_WRFAIL=$(echo "$B_LINE" | sed -n 's/.* \([0-9]*\) write failures.*/\1/p')
+	if [ "${A_UNROUTABLE:-0}" -lt 1 ]; then
+		fail "A counted no unroutable packets"
+	fi
+
+	if [ "${B_BADFMT:-0}" -ne 1 ]; then
+		fail "B counted ${B_BADFMT:-0} unknown-format payloads, want 1"
+	fi
+
+	if [ "${B_WRFAIL:-0}" -ne 0 ]; then
+		fail "B had $B_WRFAIL write failures: something reached the interface"
+	fi
+
+	if [ "${A_OUT:-0}" -lt 10 ] || [ "${B_IN:-0}" -lt 10 ]; then
+		fail "too few bundles moved (A out $A_OUT, B in $B_IN)"
+	fi
+fi
+
+if [ $CASE_FAIL -eq 0 ]; then
+	echo "  Case 4 PASS (dropped, counted)"
+	echo "  Case 5 PASS"
+else
+	echo "  Case 4/5 FAIL"
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Teardown
+# ----------------------------------------------------------------------
+echo
+echo "Stopping bptun..."
+kill "$A_PID" "$B_PID" 2>/dev/null
+wait "$A_PID" 2>/dev/null
+wait "$B_PID" 2>/dev/null
+kill "$(cat nsA.pid)" "$(cat nsB.pid)" 2>/dev/null
+
+echo "Stopping ION..."
+ionstop
+
+exit $FAIL

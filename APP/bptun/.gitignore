@@ -1,0 +1,15 @@
+# Generated man pages
+doc/*.1
+
+# Built daemon and unit test
+bptun
+bptun_route_test
+
+tests/*/*.log
+tests/*/*.pid
+tests/*/*.dat
+tests/*/*.sum
+
+# Automake test output (make check)
+*.log
+*.trs
