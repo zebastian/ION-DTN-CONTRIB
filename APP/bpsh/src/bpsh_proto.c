@@ -167,7 +167,16 @@ int bpsh_decode(unsigned char *buf, size_t buflen, BpshFrame *frame)
 
 		/*	cbor_decode_byte_string with NULL value advances
 		 *	cursor only to the start of the bytes; advance
-		 *	past them manually for correct accounting.	*/
+		 *	past them manually for correct accounting.  It
+		 *	checked the length against what was left before
+		 *	its own header, not that the bytes are all there,
+		 *	so a frame cut short would put the payload past
+		 *	the end of the bundle.				*/
+		if (bsSize > bytesBuffered)
+		{
+			return -1;
+		}
+
 		frame->payload = cursor;
 		frame->payloadLen = bsSize;
 		cursor += bsSize;

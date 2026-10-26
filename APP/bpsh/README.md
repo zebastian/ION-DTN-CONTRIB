@@ -31,7 +31,22 @@ src/bpshd_session.c/.h     per-session shell, pipes, command execution
 src/bpsh_proto.c/.h        shared CBOR protocol, send/receive/attach helpers
 doc/*.pod                  man page sources (bpsh, bpshd)
 tests/bpsh-loopback/       single-node loopback regression (.optional)
+tests/fuzz/                libFuzzer target for the frame codec, and its corpus
 ```
+
+## Testing
+
+- `make check` — replays the frame codec's fuzz corpus. Every bundle
+  `bpshd` takes in is a frame from whoever sent it, so a frame the decoder
+  accepts must lie inside the bundle, its payload included, and decode the
+  same after being encoded again. This links against ION's `libbp` and
+  `libici`, whose CBOR does the decoding.
+- `make fuzz` — fuzzes the frame codec with clang's libFuzzer,
+  AddressSanitizer and UBSan for `FUZZ_TIME` seconds (default 60,
+  `FUZZ_JOBS` workers), starting from the checked-in corpus. A failing
+  input is left in `fuzz-artifacts/` and fails the target; one worth
+  keeping belongs in `tests/fuzz/corpus/`.
+- `tests/bpsh-loopback` — the end-to-end regression on a single node.
 
 ## Security
 

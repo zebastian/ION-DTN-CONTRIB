@@ -12,3 +12,12 @@ doc/*.1
 # Built daemons
 bpsh
 bpshd
+# fuzzing: make check replay and make fuzz artifacts
+fuzz_proto_replay
+fuzz_proto_replay.log
+fuzz_proto_replay.trs
+fuzz-bin/
+fuzz-corpus/
+fuzz-artifacts/
+fuzz-*.log
+test-suite.log
