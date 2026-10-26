@@ -12,8 +12,9 @@
 
 	The interface is left for the operator to configure (address,
 	MTU, up) with "ip", as for any tunnel device, unless -a and -m
-	are given, which do the IPv4 case here.  The MTU is what bounds
-	the size of a bundle: one packet is one bundle.
+	are given, which do the common cases here: one IPv4 address and
+	any number of IPv6 ones.  The MTU is what bounds the size of a
+	bundle: one packet is one bundle.
 
 	Payload format.  The first byte of every payload names its
 	format, so that the format can grow (batching several packets
@@ -50,6 +51,8 @@
 #define	BPTUN_DEFAULT_LIFETIME	(300)
 #define	BPTUN_MAX_PACKET	(65535)
 #define	BPTUN_NO_ROUTE_NOTES	(10)	/*	Then only counted.	*/
+#define	BPTUN_MAX_ADDRS		(8)	/*	-a given this often.	*/
+#define	BPTUN_IPV6_MIN_MTU	(1280)	/*	RFC 8200, section 5.	*/
 
 /*	Payload format bytes (see the header comment).			*/
 #define	BPTUN_FORMAT_PACKET	(0x01)
@@ -62,6 +65,7 @@ typedef struct
 	unsigned long	bundlesOut;
 	unsigned long	bytesOut;
 	unsigned long	noRoute;	/*	Packets without a route.*/
+	unsigned long	linkLocal;	/*	For this link only.	*/
 	unsigned long	sendFailed;
 	unsigned long	bundlesIn;
 	unsigned long	bytesIn;
@@ -69,6 +73,29 @@ typedef struct
 	unsigned long	badFormat;	/*	Payloads of no known format.*/
 	unsigned long	writeFailed;
 } BptunStats;
+
+/*	An interface address from -a.					*/
+typedef struct
+{
+	int		family;		/*	AF_INET or AF_INET6.	*/
+	int		prefixLen;
+	union
+	{
+		struct in_addr	v4;
+		struct in6_addr	v6;
+	} addr;
+	const char	*spec;		/*	As given, for messages.	*/
+} BptunIfAddr;
+
+/*	The kernel's struct in6_ifreq, for SIOCSIFADDR on an AF_INET6
+ *	socket.  Declared here because <linux/ipv6.h>, which has it,
+ *	does not mix well with the libc headers platform.h pulls in.	*/
+typedef struct
+{
+	struct in6_addr	ifr6_addr;
+	uint32_t	ifr6_prefixlen;
+	int		ifr6_ifindex;
+} BptunIn6Ifreq;
 
 static BpSAP		sap;
 static Sdr		sdr;
@@ -95,7 +122,7 @@ static pthread_mutex_t	statsLock = PTHREAD_MUTEX_INITIALIZER;
 				__ATOMIC_RELAXED)
 
 static const char	usage[] =
-"Usage: bptun [-i <interface>] [-a <IPv4 address>/<prefix length>]\n"
+"Usage: bptun [-i <interface>] [-a <address>/<prefix length> ...]\n"
 "             [-m <MTU>] [-l <lifetime>] [-p bulk|std|expedited] [-c]\n"
 "             [-u <user>] <own endpoint ID> <route> [<route> ...]\n"
 "\n"
@@ -105,9 +132,11 @@ static const char	usage[] =
 "\n"
 "  -i  name of the TUN interface to create (default: bptun%d, chosen\n"
 "      by the kernel and reported in the log)\n"
-"  -a  configure the interface with this IPv4 address and bring it up;\n"
-"      without it, configure the interface yourself with ip(8)\n"
-"  -m  set the interface MTU (bounds the size of a bundle)\n"
+"  -a  configure the interface with this IPv4 or IPv6 address and bring\n"
+"      it up; may be given once for IPv4 and repeatedly for IPv6.\n"
+"      Without it, configure the interface yourself with ip(8)\n"
+"  -m  set the interface MTU (bounds the size of a bundle; IPv6 needs\n"
+"      at least 1280)\n"
 "  -l  bundle lifetime in seconds (default 300)\n"
 "  -p  bundle priority (default std)\n"
 "  -c  request custody transfer\n"
@@ -134,17 +163,17 @@ static void	handleStats(int signum)
 static void	logStats(void)
 {
 	BptunStats	s;
-	char		text[256];
+	char		text[384];
 
 	pthread_mutex_lock(&statsLock);
 	s = stats;
 	pthread_mutex_unlock(&statsLock);
 	snprintf(text, sizeof text, "%s: in %lu packets -> %lu bundles "
-			"(%lu bytes, %lu unroutable, %lu send failures); "
-			"out %lu bundles -> packets (%lu bytes, %lu oversize, "
-			"%lu unknown format, %lu write failures)", ifName,
-			s.packetsIn, s.bundlesOut, s.bytesOut, s.noRoute,
-			s.sendFailed, s.bundlesIn, s.bytesIn, s.oversize,
+			"(%lu bytes, %lu unroutable, %lu link-local, %lu send "
+			"failures); out %lu bundles -> packets (%lu bytes, %lu "
+			"oversize, %lu unknown format, %lu write failures)",
+			ifName, s.packetsIn, s.bundlesOut, s.bytesOut,
+			s.noRoute, s.linkLocal, s.sendFailed, s.bundlesIn, s.bytesIn, s.oversize,
 			s.badFormat, s.writeFailed);
 	writeMemoNote("[i] bptun counters", text);
 }
@@ -190,15 +219,153 @@ static int	openTun(const char *wantedName)
 	return fd;
 }
 
-/*	The -a and -m cases: address, netmask, MTU and up, through the
- *	classic ioctls, so that no other tool is needed for the common
- *	IPv4 point-to-point setup.					*/
+/*	Parses an -a argument, "<address>[/<prefix length>]" of either
+ *	family; a bare address gets the host prefix length.  Returns 0,
+ *	or -1 with a reason in *errText.				*/
 
-static int	configureTun(const char *addrSpec, int mtu)
+static int	parseIfAddr(const char *spec, BptunIfAddr *ifAddr,
+			const char **errText)
 {
-	int			sock;
+	char		text[INET6_ADDRSTRLEN];
+	const char	*slash = strchr(spec, '/');
+	size_t		len = slash ? (size_t) (slash - spec) : strlen(spec);
+	int		maxLen;
+	char		*end;
+	long		prefixLen;
+
+	if (len == 0 || len >= sizeof text)
+	{
+		*errText = "wants <address>/<prefix length>";
+		return -1;
+	}
+
+	memcpy(text, spec, len);
+	text[len] = '\0';
+	memset(ifAddr, 0, sizeof *ifAddr);
+	ifAddr->spec = spec;
+	if (inet_pton(AF_INET, text, &ifAddr->addr.v4) == 1)
+	{
+		ifAddr->family = AF_INET;
+		maxLen = 32;
+	}
+	else if (inet_pton(AF_INET6, text, &ifAddr->addr.v6) == 1)
+	{
+		ifAddr->family = AF_INET6;
+		maxLen = 128;
+	}
+	else
+	{
+		*errText = "not an IPv4 or IPv6 address";
+		return -1;
+	}
+
+	if (slash == NULL)
+	{
+		ifAddr->prefixLen = maxLen;
+		return 0;
+	}
+
+	errno = 0;
+	prefixLen = strtol(slash + 1, &end, 10);
+	if (errno != 0 || end == slash + 1 || *end != '\0' || prefixLen < 0
+	|| prefixLen > maxLen)
+	{
+		*errText = "bad prefix length";
+		return -1;
+	}
+
+	ifAddr->prefixLen = (int) prefixLen;
+	return 0;
+}
+
+/*	IPv4: address and netmask through the classic ioctls.		*/
+
+static int	setIpv4Addr(int sock, const BptunIfAddr *ifAddr)
+{
 	struct ifreq		ifr;
 	struct sockaddr_in	*sin;
+	unsigned long		mask;
+
+	memset(&ifr, 0, sizeof ifr);
+	istrcpy(ifr.ifr_name, ifName, IFNAMSIZ);
+	sin = (struct sockaddr_in *) &ifr.ifr_addr;
+	sin->sin_family = AF_INET;
+	sin->sin_addr = ifAddr->addr.v4;
+	if (ioctl(sock, SIOCSIFADDR, &ifr) < 0)
+	{
+		putSysErrmsg("bptun can't set interface address",
+				ifAddr->spec);
+		return -1;
+	}
+
+	mask = ifAddr->prefixLen ? 0xffffffffUL << (32 - ifAddr->prefixLen)
+			: 0;
+	sin = (struct sockaddr_in *) &ifr.ifr_netmask;
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = htonl(mask);
+	if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0)
+	{
+		putSysErrmsg("bptun can't set interface netmask",
+				ifAddr->spec);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*	IPv6: SIOCSIFADDR on an AF_INET6 socket adds the address (it
+ *	does not replace one), with its prefix length, by interface
+ *	index.								*/
+
+static int	setIpv6Addr(const BptunIfAddr *ifAddr)
+{
+	int		sock;
+	struct ifreq	ifr;
+	BptunIn6Ifreq	ifr6;
+
+	sock = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (sock < 0)
+	{
+		putSysErrmsg("bptun can't open an IPv6 socket (is IPv6 "
+				"disabled?)", ifAddr->spec);
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof ifr);
+	istrcpy(ifr.ifr_name, ifName, IFNAMSIZ);
+	if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0)
+	{
+		putSysErrmsg("bptun can't get the interface index", ifName);
+		close(sock);
+		return -1;
+	}
+
+	memset(&ifr6, 0, sizeof ifr6);
+	ifr6.ifr6_addr = ifAddr->addr.v6;
+	ifr6.ifr6_prefixlen = (uint32_t) ifAddr->prefixLen;
+	ifr6.ifr6_ifindex = ifr.ifr_ifindex;
+	if (ioctl(sock, SIOCSIFADDR, &ifr6) < 0)
+	{
+		putSysErrmsg("bptun can't set interface IPv6 address",
+				ifAddr->spec);
+		close(sock);
+		return -1;
+	}
+
+	close(sock);
+	return 0;
+}
+
+/*	The -a and -m cases: MTU, addresses and up, so that no other
+ *	tool is needed for the common setups.  The MTU goes first: the
+ *	kernel turns IPv6 off on an interface whose MTU is below 1280,
+ *	and an IPv6 address could not be added after that.		*/
+
+static int	configureTun(const BptunIfAddr *addrs, int addrCount, int mtu)
+{
+	int		sock;
+	struct ifreq	ifr;
+	int		i;
 
 	sock = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock < 0)
@@ -210,56 +377,6 @@ static int	configureTun(const char *addrSpec, int mtu)
 
 	memset(&ifr, 0, sizeof ifr);
 	istrcpy(ifr.ifr_name, ifName, IFNAMSIZ);
-	if (addrSpec)
-	{
-		char		text[INET_ADDRSTRLEN];
-		const char	*slash = strchr(addrSpec, '/');
-		size_t		len = slash ? (size_t) (slash - addrSpec)
-					    : strlen(addrSpec);
-		int		prefixLen = slash ? atoi(slash + 1) : 32;
-		unsigned long	mask;
-
-		if (len == 0 || len >= sizeof text || prefixLen < 0
-		|| prefixLen > 32)
-		{
-			putErrmsg("bptun: -a wants <IPv4 address>/<prefix "
-					"length>.", addrSpec);
-			close(sock);
-			return -1;
-		}
-
-		memcpy(text, addrSpec, len);
-		text[len] = '\0';
-		sin = (struct sockaddr_in *) &ifr.ifr_addr;
-		sin->sin_family = AF_INET;
-		if (inet_pton(AF_INET, text, &sin->sin_addr) != 1)
-		{
-			putErrmsg("bptun: -a wants an IPv4 address.", text);
-			close(sock);
-			return -1;
-		}
-
-		if (ioctl(sock, SIOCSIFADDR, &ifr) < 0)
-		{
-			putSysErrmsg("bptun can't set interface address",
-					text);
-			close(sock);
-			return -1;
-		}
-
-		mask = prefixLen ? 0xffffffffUL << (32 - prefixLen) : 0;
-		sin = (struct sockaddr_in *) &ifr.ifr_netmask;
-		sin->sin_family = AF_INET;
-		sin->sin_addr.s_addr = htonl(mask);
-		if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0)
-		{
-			putSysErrmsg("bptun can't set interface netmask",
-					addrSpec);
-			close(sock);
-			return -1;
-		}
-	}
-
 	if (mtu > 0)
 	{
 		ifr.ifr_mtu = mtu;
@@ -269,9 +386,27 @@ static int	configureTun(const char *addrSpec, int mtu)
 			close(sock);
 			return -1;
 		}
+
+		if (mtu < BPTUN_IPV6_MIN_MTU)
+		{
+			writeMemoNote("[?] bptun: MTU below 1280, the kernel "
+					"disables IPv6 on the interface",
+					ifName);
+		}
 	}
 
-	if (addrSpec)
+	for (i = 0; i < addrCount; i++)
+	{
+		if ((addrs[i].family == AF_INET
+			? setIpv4Addr(sock, addrs + i)
+			: setIpv6Addr(addrs + i)) < 0)
+		{
+			close(sock);
+			return -1;
+		}
+	}
+
+	if (addrCount > 0)
 	{
 		if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0)
 		{
@@ -420,6 +555,16 @@ static void	forwardPackets(int lifetime, int priority,
 		}
 
 		COUNT(packetsIn, 1);
+
+		/*	Router solicitations, MLD and IGMP reports and the
+		 *	like are for this link, not the far end: dropped
+		 *	quietly, since the kernel sends them on its own.	*/
+		if (bptunIsLinkLocal(packet, (size_t) length))
+		{
+			COUNT(linkLocal, 1);
+			continue;
+		}
+
 		destEid = bptunRouteLookup(&routes, packet, (size_t) length);
 		if (destEid == NULL)
 		{
@@ -573,7 +718,10 @@ static int	parsePriority(const char *text, int *priority)
 int	main(int argc, char **argv)
 {
 	const char	*wantedName = NULL;
-	const char	*addrSpec = NULL;
+	BptunIfAddr	addrs[BPTUN_MAX_ADDRS];
+	int		addrCount = 0;
+	int		ipv4Count = 0;
+	int		ipv6Count = 0;
 	const char	*runAs = NULL;
 	int		mtu = 0;
 	int		lifetime = BPTUN_DEFAULT_LIFETIME;
@@ -594,8 +742,36 @@ int	main(int argc, char **argv)
 			break;
 
 		case 'a':
-			addrSpec = optarg;
+		{
+			const char	*errText;
+
+			if (addrCount == BPTUN_MAX_ADDRS)
+			{
+				fprintf(stderr, "bptun: at most %d -a\n",
+						BPTUN_MAX_ADDRS);
+				return 1;
+			}
+
+			if (parseIfAddr(optarg, addrs + addrCount, &errText)
+					< 0)
+			{
+				fprintf(stderr, "bptun: -a '%s': %s\n", optarg,
+						errText);
+				return 1;
+			}
+
+			if (addrs[addrCount].family == AF_INET)
+			{
+				ipv4Count++;
+			}
+			else
+			{
+				ipv6Count++;
+			}
+
+			addrCount++;
 			break;
+		}
 
 		case 'm':
 			mtu = atoi(optarg);
@@ -648,6 +824,22 @@ int	main(int argc, char **argv)
 		return 1;
 	}
 
+	/*	SIOCSIFADDR replaces an interface's IPv4 address, so a
+	 *	second one would silently undo the first.		*/
+	if (ipv4Count > 1)
+	{
+		fprintf(stderr, "bptun: -a takes one IPv4 address; add "
+				"more with ip(8)\n");
+		return 1;
+	}
+
+	if (ipv6Count > 0 && mtu > 0 && mtu < BPTUN_IPV6_MIN_MTU)
+	{
+		fprintf(stderr, "bptun: an IPv6 address needs -m %d or "
+				"more\n", BPTUN_IPV6_MIN_MTU);
+		return 1;
+	}
+
 	ownEid = argv[optind];
 	for (i = optind + 1; i < argc; i++)
 	{
@@ -670,7 +862,7 @@ int	main(int argc, char **argv)
 	}
 
 	tunFd = openTun(wantedName);
-	if (tunFd < 0 || configureTun(addrSpec, mtu) < 0
+	if (tunFd < 0 || configureTun(addrs, addrCount, mtu) < 0
 	|| (runAs && dropPrivileges(runAs) < 0))
 	{
 		exitCode = 1;

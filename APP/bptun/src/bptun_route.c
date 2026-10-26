@@ -166,14 +166,12 @@ static int	prefixMatches(const unsigned char *a, const unsigned char *b,
 			== 0;
 }
 
-const char	*bptunRouteLookup(const BptunRouteTable *table,
-			const unsigned char *packet, size_t length)
-{
-	int			family;
-	const unsigned char	*dest;
-	const BptunRoute	*best = NULL;
-	int			i;
+/*	Returns the packet's destination address and sets *family, or
+ *	returns NULL for a packet too short or of no IP version.	*/
 
+static const unsigned char	*packetDest(const unsigned char *packet,
+					size_t length, int *family)
+{
 	if (length < 1)
 	{
 		return NULL;
@@ -187,9 +185,8 @@ const char	*bptunRouteLookup(const BptunRouteTable *table,
 			return NULL;
 		}
 
-		family = AF_INET;
-		dest = packet + IPV4_DEST_OFFSET;
-		break;
+		*family = AF_INET;
+		return packet + IPV4_DEST_OFFSET;
 
 	case 6:
 		if (length < IPV6_DEST_OFFSET + 16)
@@ -197,11 +194,46 @@ const char	*bptunRouteLookup(const BptunRouteTable *table,
 			return NULL;
 		}
 
-		family = AF_INET6;
-		dest = packet + IPV6_DEST_OFFSET;
-		break;
+		*family = AF_INET6;
+		return packet + IPV6_DEST_OFFSET;
 
 	default:
+		return NULL;
+	}
+}
+
+int	bptunIsLinkLocal(const unsigned char *packet, size_t length)
+{
+	int			family;
+	const unsigned char	*dest = packetDest(packet, length, &family);
+
+	if (dest == NULL)
+	{
+		return 0;
+	}
+
+	if (family == AF_INET)
+	{
+		/*	224.0.0.0/24, and the limited broadcast.	*/
+		return (dest[0] == 224 && dest[1] == 0 && dest[2] == 0)
+			|| (dest[0] == 255 && dest[1] == 255 && dest[2] == 255
+				&& dest[3] == 255);
+	}
+
+	/*	ff00::/8 with scope 1 (interface) or 2 (link), any flags.	*/
+	return dest[0] == 0xff && (dest[1] & 0x0f) <= 2;
+}
+
+const char	*bptunRouteLookup(const BptunRouteTable *table,
+			const unsigned char *packet, size_t length)
+{
+	int			family;
+	const unsigned char	*dest = packetDest(packet, length, &family);
+	const BptunRoute	*best = NULL;
+	int			i;
+
+	if (dest == NULL)
+	{
 		return NULL;
 	}
 

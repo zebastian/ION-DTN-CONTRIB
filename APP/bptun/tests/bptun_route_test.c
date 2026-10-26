@@ -104,6 +104,29 @@ int	main(void)
 	buf[0] = 0x00;
 	CHECK(bptunRouteLookup(&t, buf, 64) == NULL);	/*	Not IP.	*/
 
+	/*	Link-local destinations: never carried, whatever the
+	 *	route table says.					*/
+
+	CHECK(bptunIsLinkLocal(buf, v6Packet(buf, "ff02::2")));
+	CHECK(bptunIsLinkLocal(buf, v6Packet(buf, "ff02::16")));
+	CHECK(bptunIsLinkLocal(buf, v6Packet(buf, "ff12::1:3")));
+	CHECK(bptunIsLinkLocal(buf, v6Packet(buf, "ff01::1")));
+	CHECK(!bptunIsLinkLocal(buf, v6Packet(buf, "ff05::2")));
+	CHECK(!bptunIsLinkLocal(buf, v6Packet(buf, "ff0e::1")));
+	CHECK(!bptunIsLinkLocal(buf, v6Packet(buf, "fd00:42::2")));
+	CHECK(!bptunIsLinkLocal(buf, v6Packet(buf, "fe80::1")));
+	CHECK(bptunIsLinkLocal(buf, v4Packet(buf, "224.0.0.22")));
+	CHECK(bptunIsLinkLocal(buf, v4Packet(buf, "224.0.0.251")));
+	CHECK(bptunIsLinkLocal(buf, v4Packet(buf,
+			"255.255.255.255")));
+	CHECK(!bptunIsLinkLocal(buf, v4Packet(buf, "224.0.1.1")));
+	CHECK(!bptunIsLinkLocal(buf, v4Packet(buf, "239.1.2.3")));
+	CHECK(!bptunIsLinkLocal(buf, v4Packet(buf, "10.42.0.2")));
+	buf[0] = 0x60;
+	CHECK(!bptunIsLinkLocal(buf, 39));		/*	Short.	*/
+	buf[0] = 0x00;
+	CHECK(!bptunIsLinkLocal(buf, 64));		/*	Not IP.	*/
+
 	/*	Growth past the initial capacity.			*/
 
 	bptunRouteTableFree(&t);

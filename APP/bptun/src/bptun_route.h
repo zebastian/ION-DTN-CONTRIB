@@ -48,6 +48,15 @@ extern int	bptunRouteAdd(BptunRouteTable *table, const char *spec,
 extern const char	*bptunRouteLookup(const BptunRouteTable *table,
 				const unsigned char *packet, size_t length);
 
+/*	Returns 1 if the IP packet at 'packet' is addressed to its own
+ *	link only - IPv4 224.0.0.0/24 or the limited broadcast, IPv6
+ *	multicast of interface or link scope - and so must not be
+ *	carried to another node, whatever the route table says; else 0.
+ *	The kernel sends such packets into the interface on its own
+ *	(router solicitations, MLD and IGMP reports).			*/
+
+extern int	bptunIsLinkLocal(const unsigned char *packet, size_t length);
+
 extern void	bptunRouteTableFree(BptunRouteTable *table);
 
 #endif	/*	BPTUN_ROUTE_H	*/

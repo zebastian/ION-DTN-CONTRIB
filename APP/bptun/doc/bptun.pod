@@ -4,7 +4,7 @@ bptun - IP over Bundle Protocol through a TUN interface
 
 =head1 SYNOPSIS
 
-B<bptun> [B<-i> I<interface>] [B<-a> I<address>/I<prefix length>] [B<-m> I<MTU>]
+B<bptun> [B<-i> I<interface>] [B<-a> I<address>/I<prefix length> ...] [B<-m> I<MTU>]
 [B<-l> I<lifetime>] [B<-p> bulk|std|expedited] [B<-c>] [B<-u> I<user>]
 I<own endpoint ID> I<route> [I<route> ...]
 
@@ -24,12 +24,17 @@ prefix (a bare address is a host route) and the endpoint of the B<bptun>
 that serves it.  The longest matching prefix wins.  B<default=>I<EID>
 routes everything else, in both families.  A packet no route covers is
 dropped and counted; the first few are also noted in the ION log.
+Packets for the local link only (IPv4 224.0.0.0/24 and 255.255.255.255,
+IPv6 multicast of interface or link scope, such as the router
+solicitations the kernel sends on its own) are dropped before the route
+table is consulted, whatever it says, and counted as link-local.
 
 Creating the interface needs CAP_NET_ADMIN, so B<bptun> is usually
 started as root; B<-u> hands the process to an unprivileged user once the
 interface is open.  The interface's address, MTU and state are the
 operator's to set with ip(8), as for any tunnel device, except that
-B<-a> and B<-m> do the common IPv4 case.
+B<-a> and B<-m> do the common cases: one IPv4 address, any number of
+IPv6 ones.
 
 One packet is one bundle, so the interface MTU is what bounds the size
 of a bundle.  1400 suits most convergence layers.
@@ -53,12 +58,17 @@ B<bptun0>, B<bptun1>, ..., and the name is reported in the ION log.
 
 =item B<-a> I<address>/I<prefix length>
 
-Configure the interface with this IPv4 address and netmask and bring it
-up.  Without B<-a> the interface is left down and unconfigured.
+Configure the interface with this IPv4 or IPv6 address and prefix
+length (a bare address gets a host prefix) and bring it up.  May be given
+once for IPv4 and repeatedly for IPv6, e.g. B<-a> 10.42.0.1/24 B<-a>
+fd00:42::1/64 for dual stack.  Without B<-a> the interface is left down
+and unconfigured.
 
 =item B<-m> I<MTU>
 
-Set the interface MTU (68 to 65535).
+Set the interface MTU (68 to 65535).  IPv6 needs at least 1280; below
+that the kernel disables IPv6 on the interface, so a smaller B<-m> is
+refused together with an IPv6 B<-a> and otherwise noted in the ION log.
 
 =item B<-l> I<lifetime>
 

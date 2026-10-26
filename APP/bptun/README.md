@@ -26,20 +26,25 @@ sudo make install
 ## Usage
 
 ```
-bptun [-i interface] [-a address/prefixlen] [-m MTU] [-l lifetime]
+bptun [-i interface] [-a address/prefixlen ...] [-m MTU] [-l lifetime]
       [-p bulk|std|expedited] [-c] [-u user] <own endpoint ID> <route> ...
 ```
 
 A route is `<address>[/<prefix length>]=<EID>`: an IPv4 or IPv6 prefix (a
 bare address is a host route) and the endpoint of the `bptun` that serves
 it. Longest prefix wins; `default=<EID>` catches everything else. A packet
-no route covers is dropped and counted.
+no route covers is dropped and counted. Packets for the local link only —
+IPv4 `224.0.0.0/24` and `255.255.255.255`, IPv6 multicast of interface or
+link scope (`ff02::/16` and the like) — are dropped before the route table
+is consulted and counted as `link-local`: the kernel sends router
+solicitations and MLD/IGMP reports into the interface on its own, and
+these must not be carried to the far end, not even by a default route.
 
 | Option | Meaning |
 |---|---|
 | `-i name` | TUN interface name (default: kernel-chosen `bptunN`, reported in the log) |
-| `-a addr/len` | configure the interface with this IPv4 address and bring it up; otherwise configure it yourself with `ip` |
-| `-m MTU` | interface MTU — one packet is one bundle, so this bounds the bundle size; 1400 suits most CLAs |
+| `-a addr/len` | configure the interface with this IPv4 or IPv6 address and bring it up; once for IPv4, repeatedly for IPv6 (`-a 10.42.0.1/24 -a fd00:42::1/64` for dual stack); otherwise configure it yourself with `ip` |
+| `-m MTU` | interface MTU — one packet is one bundle, so this bounds the bundle size; 1400 suits most CLAs. IPv6 needs at least 1280: below that the kernel disables IPv6 on the interface, so `-m` under 1280 with an IPv6 `-a` is refused, and without one it is noted in `ion.log` |
 | `-l secs` | bundle lifetime (default 300) |
 | `-p prio` | bundle priority: `bulk`, `std` (default), `expedited` |
 | `-c` | request custody transfer |
@@ -118,7 +123,9 @@ small-packet traffic is expensive; see *Roadmap*.
 in its own network namespace (two addresses of one subnet on one host
 would otherwise meet inside the kernel and never enter the tunnel), and
 checks ping both ways, a 256 KiB TCP transfer, that an unroutable
-destination is dropped and noted, and that the `SIGUSR1` counters add up.
+destination is dropped and noted, and that the `SIGUSR1` counters add up;
+then ping and a TCP transfer over IPv6, with both families configured by
+`-a`, and that `-a`/`-m` refuse what cannot work.
 
 The namespaces are unprivileged user+network namespaces (`unshare -Urn`),
 in which the caller is root and may create TUN devices, so the test needs
@@ -159,7 +166,6 @@ namespaces nor ION.
 - **TCP proxy mode**: terminate TCP locally and carry the stream in
   bundles, for interactive use over real delay (the way the ISS e-mail
   gateways worked), next to the raw packet mode.
-- IPv6 address configuration (`-a` is IPv4; use `ip` for IPv6 today).
 - Packet-level statistics per route.
 
 ## Files

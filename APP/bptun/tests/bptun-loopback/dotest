@@ -19,6 +19,10 @@ trap 'killm f >/dev/null 2>&1' EXIT
 #
 # Validates:
 #   - ICMP echo crosses the tunnel and returns (ping, both directions)
+#   - the same over IPv6, with both families configured by -a, and a
+#     TCP stream over IPv6
+#   - -a and -m reject what cannot work: two IPv4 addresses, an IPv6
+#     address on an MTU below 1280
 #   - a TCP stream crosses it intact (a 256 KiB transfer, many packets,
 #     each one bundle, with the kernel's own segmentation to the MTU)
 #   - a destination no route covers is dropped and counted, not sent
@@ -39,8 +43,8 @@ echo
 pwd | sed "s/\/.*\///" | xargs echo "NAME: "
 echo
 echo "PURPOSE: bptun — ping and a TCP transfer through two TUN interfaces"
-echo "         in two network namespaces on one ION node; unroutable"
-echo "         packets dropped; counters."
+echo "         in two network namespaces on one ION node, over IPv4 and"
+echo "         IPv6; unroutable packets dropped; counters; -a/-m checks."
 echo
 echo "CONFIG: single-node loopback"
 echo
@@ -96,22 +100,26 @@ in_ns() { if [ "$1" = A ]; then $NSENTER_A "${@:2}"; else $NSENTER_B \
 # The daemons are started through nsenter itself, not in_ns: nsenter
 # execs its command, so $! is the daemon's own pid, where a function
 # call in the background would give a subshell's.
-echo "Starting bptun A (ipn:1.7, routes 10.42.0.2 to ipn:1.8)..."
-$NSENTER_A $BPTUN -i bptunA -m $MTU -l 60 ipn:1.7 10.42.0.2=ipn:1.8 \
+# Each daemon configures its interface itself, one address per family.
+echo "Starting bptun A (ipn:1.7, routes 10.42.0.2 and fd00:42::2 to ipn:1.8)..."
+$NSENTER_A $BPTUN -i bptunA -a 10.42.0.1/24 -a fd00:42::1/64 -m $MTU \
+	-l 60 ipn:1.7 10.42.0.2=ipn:1.8 fd00:42::2=ipn:1.8 \
 	> bptunA.log 2>&1 &
 A_PID=$!
 echo "$A_PID" > bptunA.pid
 
-echo "Starting bptun B (ipn:1.8, routes 10.42.0.1 to ipn:1.7)..."
-$NSENTER_B $BPTUN -i bptunB -m $MTU -l 60 ipn:1.8 10.42.0.1=ipn:1.7 \
+echo "Starting bptun B (ipn:1.8, routes 10.42.0.1 and fd00:42::1 to ipn:1.7)..."
+$NSENTER_B $BPTUN -i bptunB -a 10.42.0.2/24 -a fd00:42::2/64 -m $MTU \
+	-l 60 ipn:1.8 10.42.0.1=ipn:1.7 fd00:42::1=ipn:1.7 \
 	> bptunB.log 2>&1 &
 B_PID=$!
 echo "$B_PID" > bptunB.pid
 
-# The interfaces exist once the daemons say they are running.
+# The interfaces are ready once each is up, the last thing bptun does
+# when configuring one.
+ready() { in_ns $1 ip link show bptun$1 2>/dev/null | grep -q ',UP'; }
 for i in $(seq 1 50); do
-	if in_ns A ip link show bptunA >/dev/null 2>&1 \
-	&& in_ns B ip link show bptunB >/dev/null 2>&1; then
+	if ready A && ready B; then
 		break
 	fi
 
@@ -119,7 +127,7 @@ for i in $(seq 1 50); do
 done
 
 for X in A B; do
-	if ! in_ns $X ip link show bptun$X >/dev/null 2>&1; then
+	if ! ready $X; then
 		echo "ERROR: bptun $X did not come up"
 		cat bptunA.log bptunB.log
 		tail -20 ion.log
@@ -128,12 +136,8 @@ for X in A B; do
 	fi
 done
 
-# Address, MTU and loopback inside each namespace.
-echo "Configuring the interfaces..."
+# bptun did addresses, MTU and up; loopback is left to us.
 for X in A B; do
-	if [ $X = A ]; then ADDR=10.42.0.1; else ADDR=10.42.0.2; fi
-	in_ns $X ip addr add $ADDR/24 dev bptun$X
-	in_ns $X ip link set bptun$X up mtu $MTU
 	in_ns $X ip link set lo up
 done
 
@@ -270,6 +274,20 @@ else
 	B_IN=$(echo "$B_LINE" | sed -n 's/.*out \([0-9]*\) bundles -> packets.*/\1/p')
 	B_BADFMT=$(echo "$B_LINE" | sed -n 's/.* \([0-9]*\) unknown format.*/\1/p')
 	B_WRFAIL=$(echo "$B_LINE" | sed -n 's/.* \([0-9]*\) write failures.*/\1/p')
+	B_UNROUTABLE=$(echo "$B_LINE" | sed -n 's/.* \([0-9]*\) unroutable.*/\1/p')
+	A_LINKLOCAL=$(echo "$A_LINE" | sed -n 's/.* \([0-9]*\) link-local.*/\1/p')
+	B_LINKLOCAL=$(echo "$B_LINE" | sed -n 's/.* \([0-9]*\) link-local.*/\1/p')
+
+	# With IPv6 up, the kernel sends router solicitations to ff02::2
+	# into each interface; they must be dropped as link-local, never
+	# counted as unroutable (and with a default route, never sent).
+	if [ "${A_LINKLOCAL:-0}" -lt 1 ] || [ "${B_LINKLOCAL:-0}" -lt 1 ]; then
+		fail "link-local packets not counted (A ${A_LINKLOCAL:-0}, B ${B_LINKLOCAL:-0})"
+	fi
+
+	if [ "${B_UNROUTABLE:-0}" -ne 0 ]; then
+		fail "B counted $B_UNROUTABLE unroutable packets, want 0"
+	fi
 	if [ "${A_UNROUTABLE:-0}" -lt 1 ]; then
 		fail "A counted no unroutable packets"
 	fi
@@ -292,6 +310,101 @@ if [ $CASE_FAIL -eq 0 ]; then
 	echo "  Case 5 PASS"
 else
 	echo "  Case 4/5 FAIL"
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 6: IPv6.  Ping both ways, then 64 KiB of TCP from A to B, over
+# the addresses bptun configured itself.
+# ----------------------------------------------------------------------
+echo
+echo "Case 6: IPv6 — ICMPv6 echo both directions and a TCP transfer"
+CASE_FAIL=0
+if ! in_ns A ping -6 -c 3 -i 0.3 -W 5 fd00:42::2 > ping6.log 2>&1
+then
+	fail "ping fd00:42::1 -> fd00:42::2 failed"
+	cat ping6.log
+fi
+
+if ! in_ns B ping -6 -c 3 -i 0.3 -W 5 fd00:42::1 >> ping6.log 2>&1
+then
+	fail "ping fd00:42::2 -> fd00:42::1 failed"
+	tail -8 ping6.log
+fi
+
+head -c 65536 /dev/urandom > send6.dat
+rm -f recv6.dat
+in_ns B python3 - recv6.dat <<'EOF' &
+import socket, sys
+s = socket.socket(socket.AF_INET6)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("fd00:42::2", 5556))
+s.listen(1)
+s.settimeout(60)
+c, _ = s.accept()
+c.settimeout(60)
+with open(sys.argv[1], "wb") as f:
+    while True:
+        d = c.recv(65536)
+        if not d:
+            break
+        f.write(d)
+EOF
+SERVER_PID=$!
+echo "$SERVER_PID" > server.pid
+sleep 1
+
+if ! in_ns A python3 - send6.dat <<'EOF'
+import socket, sys
+s = socket.create_connection(("fd00:42::2", 5556), timeout=30)
+with open(sys.argv[1], "rb") as f:
+    s.sendall(f.read())
+s.close()
+EOF
+then
+	fail "IPv6 TCP client could not send"
+fi
+
+wait "$SERVER_PID" 2>/dev/null
+if ! cmp -s send6.dat recv6.dat; then
+	fail "IPv6: received data differs from sent (got $(stat -c %s \
+			recv6.dat 2>/dev/null || echo 0) of 65536 bytes)"
+fi
+
+if [ $CASE_FAIL -eq 0 ]; then
+	echo "  $(grep -c 'bytes from' ping6.log) echo replies, 64 KiB intact"
+	echo "  Case 6 PASS"
+else
+	echo "  Case 6 FAIL"
+	FAIL=1
+fi
+
+# ----------------------------------------------------------------------
+# Case 7: -a and -m refuse what cannot work, before touching anything:
+# a second IPv4 address (SIOCSIFADDR would replace the first), an IPv6
+# address on an MTU the kernel disables IPv6 for, a bad prefix length.
+# ----------------------------------------------------------------------
+echo
+echo "Case 7: -a/-m argument checks"
+CASE_FAIL=0
+if $BPTUN -a 10.0.0.1/24 -a 10.0.0.2/24 ipn:1.99 default=ipn:1.98 \
+		>/dev/null 2>&1; then
+	fail "two IPv4 -a accepted"
+fi
+
+if $BPTUN -m 1200 -a fd00::1/64 ipn:1.99 default=ipn:1.98 \
+		>/dev/null 2>&1; then
+	fail "IPv6 -a with -m 1200 accepted"
+fi
+
+if $BPTUN -a fd00::1/129 ipn:1.99 default=ipn:1.98 >/dev/null 2>&1; then
+	fail "IPv6 prefix length 129 accepted"
+fi
+
+if [ $CASE_FAIL -eq 0 ]; then
+	echo "  Case 7 PASS"
+else
+	echo "  Case 7 FAIL"
 	FAIL=1
 fi
 
