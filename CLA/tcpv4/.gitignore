@@ -11,6 +11,10 @@ tests/*/bpacq.*
 tests/*/bpdriverAduFile
 tests/*/peer.out
 tests/*/peer.err
+tests/*/client*.out
+tests/*/probe.out
+tests/*/asan.*
+tests/*/ubsan.*
 
 # bench run artifacts
 bench/ion.log
@@ -40,4 +44,15 @@ tcpv4nodeid_test.trs
 tcpv4x509_test
 tcpv4x509_test.log
 tcpv4x509_test.trs
+fuzz_msg_replay
+fuzz_nodeid_replay
+fuzz_x509_replay
+fuzz_*_replay.log
+fuzz_*_replay.trs
 test-suite.log
+
+# make fuzz artifacts
+fuzz-bin/
+fuzz-corpus/
+fuzz-artifacts/
+fuzz-*.log

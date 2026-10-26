@@ -36,6 +36,7 @@ REFUSE_NOT_ACCEPTABLE = 0x04
 REJECT_UNEXPECTED = 0x03
 
 TERM_BUSY = 0x03
+TERM_CONTACT_FAILURE = 0x04
 
 TYPE_NAMES = {
     XFER_SEGMENT: "XFER_SEGMENT",
@@ -109,7 +110,9 @@ class Peer(object):
         return reply[5]
 
     def send_sess_init(self):
-        node = self.node_id.encode()
+        node = self.node_id
+        if not isinstance(node, bytes):
+            node = node.encode()
         self.send(struct.pack("!BHQQH", SESS_INIT, self.keepalive,
                               self.segment_mru, self.transfer_mru, len(node))
                   + node + struct.pack("!I", 0))
@@ -369,6 +372,50 @@ def cmd_nodeid(host, port, node_id, seconds):
     return 0
 
 
+def cmd_badnodeid(host, port):
+    """RFC 9174 4.6: the node ID is a URI.  One that is not - a newline
+    that would forge a line in the log, a NUL that would shorten it to
+    some other node's, octets that are no text at all - ends the session
+    with "Contact Failure" before it becomes anybody's identity; a
+    well-formed one on the next connection is still welcome."""
+    malformed = [b"ipn:2.0\nforged", b"ipn:2.0\x00junk",
+                 b"\xff\xfe\x01\x02", b"ipn:2 0", b"2.0"]
+    refused = 0
+    for node_id in malformed:
+        peer = Peer(host, port, node_id=node_id)
+        peer.contact()
+        peer.send_sess_init()
+        # The node sends its own SESS_INIT without waiting to judge
+        # ours, so the verdict on our node ID comes after it.
+        msg = peer.recv_type(timeout=15)
+        if msg == SESS_INIT:
+            keepalive, seg_mru, xfer_mru, node_len = struct.unpack(
+                "!HQQH", peer.recv(20))
+            peer.recv(node_len)
+            ext_len, = struct.unpack("!I", peer.recv(4))
+            if ext_len:
+                peer.recv(ext_len)
+            msg = peer.recv_type(timeout=15)
+        if msg == SESS_TERM:
+            flags, reason = struct.unpack("!BB", peer.recv(2))
+            if reason == TERM_CONTACT_FAILURE:
+                refused += 1
+            else:
+                result("unexpected_reason", reason)
+        else:
+            result("unexpected_reply", TYPE_NAMES.get(msg, str(msg)))
+        peer.close()
+    result("malformed", len(malformed))
+    result("refused", refused)
+
+    peer = Peer(host, port, node_id="ipn:2.0")
+    peer.establish()
+    result("well_formed_after", "yes")
+    peer.send_sess_term()
+    peer.close()
+    return 0
+
+
 def cmd_listen(port, seconds):
     """A peer that accepts the TCP connection and then goes no further.
 
@@ -416,6 +463,8 @@ def main(argv):
             return cmd_busy(argv[2], int(argv[3]), int(argv[4]))
         if command == "nodeid":
             return cmd_nodeid(argv[2], int(argv[3]), argv[4], int(argv[5]))
+        if command == "badnodeid":
+            return cmd_badnodeid(argv[2], int(argv[3]))
         if command == "listen":
             return cmd_listen(int(argv[2]), int(argv[3]))
     except Fault as fault:

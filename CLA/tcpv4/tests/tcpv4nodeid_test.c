@@ -107,11 +107,49 @@ static void test_unset(void)
 	assert(!tcpv4NodeIdMatches("ipn:5.0", NULL));
 }
 
+/*	The node ID a peer sends in SESS_INIT, as the octets came off the
+ *	wire - not NUL-terminated, so the length is what counts.	*/
+
+static int wellFormed(const char *s, size_t len)
+{
+	return tcpv4NodeIdIsWellFormed((const uint8_t *) s, len);
+}
+
+static void test_well_formed(void)
+{
+	assert(wellFormed("ipn:5.0", 7));
+	assert(wellFormed("ipn:0.5.0", 9));
+	assert(wellFormed("dtn://peer-b/", 13));
+	assert(wellFormed("dtn:none", 8));
+	assert(wellFormed("x-y.z+1:%41", 11));
+
+	/*	No scheme, an empty one, or one that starts with a digit.	*/
+
+	assert(!wellFormed("5.0", 3));
+	assert(!wellFormed(":5.0", 4));
+	assert(!wellFormed("1pn:5.0", 7));
+	assert(!wellFormed("ipn", 3));
+	assert(!wellFormed("", 0));
+	assert(!wellFormed(NULL, 0));
+
+	/*	A NUL would shorten the node ID to "ipn:5.0" once it is a
+	 *	C string; a newline or other control character would reach
+	 *	the log as it stands; a space or non-ASCII is not a URI.	*/
+
+	assert(!wellFormed("ipn:5.0\0junk", 12));
+	assert(!wellFormed("ipn:5.0\nforged", 14));
+	assert(!wellFormed("ipn:5\t0", 7));
+	assert(!wellFormed("dtn://a b/", 10));
+	assert(!wellFormed("dtn://\xc3\xa9/", 9));
+	assert(!wellFormed("ipn:5.0\x7f", 8));
+}
+
 int main(void)
 {
 	test_ipn_parsing();
 	test_ipn_matching();
 	test_other_schemes();
 	test_unset();
+	test_well_formed();
 	return 0;
 }

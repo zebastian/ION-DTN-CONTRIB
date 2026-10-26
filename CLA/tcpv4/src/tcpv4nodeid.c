@@ -144,3 +144,43 @@ int tcpv4NodeIdMatches(const char *a, const char *b)
 
 	return strcmp(a, b) == 0;
 }
+
+int tcpv4NodeIdIsWellFormed(const uint8_t *nodeId, size_t len)
+{
+	size_t i = 0;
+
+	if (nodeId == NULL)
+	{
+		return 0;
+	}
+
+	/*	RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" /
+	 *	"." ), ended by the colon.				*/
+
+	while (i < len && ((nodeId[i] >= 'A' && nodeId[i] <= 'Z')
+			|| (nodeId[i] >= 'a' && nodeId[i] <= 'z')
+			|| (i > 0 && ((nodeId[i] >= '0' && nodeId[i] <= '9')
+				|| nodeId[i] == '+' || nodeId[i] == '-'
+				|| nodeId[i] == '.'))))
+	{
+		i++;
+	}
+
+	if (i == 0 || i == len || nodeId[i] != ':')
+	{
+		return 0;
+	}
+
+	/*	The rest is the scheme-specific part.  A URI is spelled in
+	 *	printable US-ASCII; anything else is percent-encoded.	*/
+
+	for (i++; i < len; i++)
+	{
+		if (nodeId[i] < 0x21 || nodeId[i] > 0x7e)
+		{
+			return 0;
+		}
+	}
+
+	return 1;
+}

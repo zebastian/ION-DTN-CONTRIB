@@ -186,6 +186,19 @@ static int applySessInit(Tcpv4Conn *conn, const Tcpv4SessInit *peer)
 		return -1;
 	}
 
+	/*	RFC 9174 4.6: the node ID is a URI.  A peer may send none,
+	 *	but what it does send has to be one, or it would be the
+	 *	session's identity and the log's text as it stands.	*/
+
+	if (peer->nodeIdLen > 0
+			&& !tcpv4NodeIdIsWellFormed(peer->nodeId, peer->nodeIdLen))
+	{
+		writeMemoNote("[?] tcpv4cla got a malformed node ID from",
+				conn->peerName);
+		oK(tcpv4SendSessTerm(conn, TMSG_TERM_CONTACT_FAILURE, 0));
+		return -1;
+	}
+
 	if (peer->nodeIdLen > 0 && peer->nodeIdLen < TCPV4_MAX_NODEID_LEN)
 	{
 		memcpy(claimed, peer->nodeId, peer->nodeIdLen);

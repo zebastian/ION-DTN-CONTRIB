@@ -22,6 +22,7 @@
 #define TCPV4NODEID_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +43,16 @@ int tcpv4NodeIdMatches(const char *a, const char *b);
 
 /*	Non-zero when nodeId is present and non-empty.			*/
 int tcpv4NodeIdIsSet(const char *nodeId);
+
+/*	Non-zero when the len octets at nodeId, as they came off the wire
+ *	in a SESS_INIT, can be a node ID at all: a URI (RFC 9174 4.6), so
+ *	a scheme name and a colon followed by nothing but the printable
+ *	ASCII that RFC 3986 2 leaves a URI made of.  This is not whether
+ *	the URI names a node - that is the scheme's business - but it
+ *	keeps a NUL, which would silently shorten the node ID, and
+ *	control characters, which would reach the log, out of the
+ *	session's identity.						*/
+int tcpv4NodeIdIsWellFormed(const uint8_t *nodeId, size_t len);
 
 #ifdef __cplusplus
 }

@@ -28,6 +28,8 @@
 #   6  RFC 9174 4.1    the reconnection delay grows after a session that
 #                      failed to establish, not only after a connection
 #                      that was refused.
+#   7  RFC 9174 4.6    a node ID that is not a URI ends the session with
+#                      "Contact Failure" and never reaches the log.
 #
 
 TCP_PORT="${TCPV4_PORT:-4759}"
@@ -292,6 +294,43 @@ if [ "${ATTEMPTS:-99}" -le 10 ] 2>/dev/null; then
 	pass "the node did not spin on the unreachable peer."
 else
 	fail "the node made $ATTEMPTS attempts in 40 s."
+fi
+stop_node
+
+# --- Phase 7: a malformed node ID -------------------------------------
+# The node ID a peer sends becomes the session's identity and is written
+# to the log as it stands, so one that is not a URI - a newline that
+# would forge a log line, a NUL that would shorten it to another node's,
+# octets that are no text at all - is refused before it is either.
+echo
+echo "Phase 7: a node ID that is not a URI is refused..."
+start_node "tcpv4cla -T none -E none" || { stop_node; exit 1; }
+peer_run badnodeid 127.0.0.1 "$TCP_PORT"
+
+if [ "$PEER_RC" != 0 ]; then
+	fail "the peer could not complete the malformed node ID exchange."
+fi
+if [ "$(peer_value refused)" = "$(peer_value malformed)" ]; then
+	pass "all $(peer_value malformed) malformed node IDs were refused \
+with SESS_TERM \"Contact Failure\"."
+else
+	fail "only $(peer_value refused) of $(peer_value malformed) \
+malformed node IDs were refused."
+fi
+if [ "$(peer_value well_formed_after)" = "yes" ]; then
+	pass "a well-formed node ID established a session afterwards."
+else
+	fail "no session could be established after the refusals."
+fi
+if grep -q "got a malformed node ID" ion.log; then
+	pass "the refusals were reported in the log."
+else
+	fail "no malformed node ID was reported in the log."
+fi
+if grep -q "forged" ion.log; then
+	fail "a malformed node ID reached the log."
+else
+	pass "no malformed node ID reached the log."
 fi
 stop_node
 

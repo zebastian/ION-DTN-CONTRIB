@@ -441,7 +441,7 @@ const char *tcpv4MsgTypeName(uint8_t type)
 		return "SESS_INIT";
 
 	default:
-		return "an unknown message";
+		return "message of unknown type";
 	}
 }
 

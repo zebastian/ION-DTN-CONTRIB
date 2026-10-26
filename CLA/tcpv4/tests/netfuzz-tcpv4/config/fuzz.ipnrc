@@ -1,0 +1,3 @@
+# Node 2 is a peer nobody plays: the fuzz clients only ever connect in,
+# so the outduct names a port nothing listens on.
+a plan 2 tcpv4/PEERDUCT

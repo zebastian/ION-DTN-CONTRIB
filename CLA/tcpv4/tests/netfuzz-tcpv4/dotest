@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+#
+# Network fuzz test for the TCPCLv4 CLA: several clients at once open
+# sessions to a live tcpv4cla and feed each a corrupted RFC 9174 stream
+# (netfuzz.py), over a plaintext session (-T none).  The codec has its
+# own fuzz targets (tests/fuzz, `make fuzz`); this is the rest of the
+# receive path - negotiation, reassembly, the message loop, session
+# teardown - with the threads and the session limit in play.
+#
+# Asserted afterwards:
+#
+#   - the daemon is still running;
+#   - it gave back every session slot: a clean session still establishes;
+#   - nothing a peer sent reached ion.log as a control character;
+#   - no sanitizer report was written, when tcpv4cla is a sanitizer build
+#     (put one first on PATH; the ASAN/UBSAN log paths are set here).
+#
+# NETFUZZ_SESSIONS (per client, default 500) and NETFUZZ_SEED (default 1)
+# scale and reproduce a run.  With a sanitizer build, for example:
+#
+#   gcc -g -O1 -fsanitize=address,undefined ... -o /some/dir/tcpv4cla
+#   PATH=/some/dir:$PATH NETFUZZ_SESSIONS=3000 ./dotest
+#
+
+TCP_PORT="${TCPV4_PORT:-4759}"
+PEER_PORT="${TCPV4_PEER_PORT:-4760}"
+TCPDUCT="127.0.0.1:${TCP_PORT}"
+PEERDUCT="127.0.0.1:${PEER_PORT}"
+CONFIGDIR="./config"
+FUZZER="./netfuzz.py"
+CLIENTS=4
+SESSIONS="${NETFUZZ_SESSIONS:-500}"
+SEED="${NETFUZZ_SEED:-1}"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Fuzzing a live TCPCLv4 CLA over the network with corrupted"
+echo "         RFC 9174 sessions from several clients at once."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+pass() { echo "  PASS: $1"; }
+
+for t in tcpv4cla python3; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+pkill -9 -x tcpv4cla 2>/dev/null
+./cleanup 2>/dev/null
+sleep 1
+
+# A sanitizer build writes its report here rather than to a stderr that
+# bpadmin has long since let go of; any other build ignores these.
+export ASAN_OPTIONS="log_path=$PWD/asan,halt_on_error=1,detect_leaks=0"
+export UBSAN_OPTIONS="log_path=$PWD/ubsan,print_stacktrace=1,halt_on_error=1"
+
+sed -e "s|TCPDUCT|${TCPDUCT}|g" -e "s|PEERDUCT|${PEERDUCT}|g" \
+	-e "s|CLICMD|tcpv4cla -T none -E none -L 64|g" \
+	"${CONFIGDIR}/fuzz.bprc" > "${CONFIGDIR}/fuzz_runtime.bprc"
+sed -e "s|PEERDUCT|${PEERDUCT}|g" \
+	"${CONFIGDIR}/fuzz.ipnrc" > "${CONFIGDIR}/fuzz_runtime.ipnrc"
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/fuzz.ionrc" >/dev/null 2>&1
+sleep 1
+bpadmin "${CONFIGDIR}/fuzz_runtime.bprc" >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	pgrep -x tcpv4cla >/dev/null && break
+	sleep 1
+done
+sleep 2
+if ! pgrep -x tcpv4cla >/dev/null; then
+	echo "ERROR: daemon did not start."
+	tail -20 ion.log 2>/dev/null
+	./cleanup
+	exit 1
+fi
+
+echo
+echo "Fuzzing: ${CLIENTS} clients x ${SESSIONS} sessions, seed ${SEED}..."
+pids=""
+for c in $(seq 1 "$CLIENTS"); do
+	python3 "$FUZZER" fuzz 127.0.0.1 "$TCP_PORT" "$SESSIONS" "${SEED}.${c}" \
+		> "client${c}.out" 2>&1 &
+	pids="$pids $!"
+done
+for p in $pids; do
+	wait "$p"
+done
+
+for c in $(seq 1 "$CLIENTS"); do
+	if grep -q "^RESULT: daemon_gone=" "client${c}.out"; then
+		fail "client ${c} lost the daemon at session \
+$(sed -n 's/^RESULT: daemon_gone=//p' "client${c}.out") (seed ${SEED}.${c})."
+	elif ! grep -q "^RESULT: sessions=" "client${c}.out"; then
+		fail "client ${c} did not finish:"
+		sed 's/^/    /' "client${c}.out" | tail -5
+	fi
+done
+
+if pgrep -x tcpv4cla >/dev/null; then
+	pass "the daemon survived the fuzz."
+else
+	fail "the daemon is gone."
+	tail -20 ion.log
+fi
+
+# A session the fuzz never established proves nothing about the receive
+# path, so make sure some did.
+established=$(grep -c "session established" ion.log)
+if [ "$established" -gt 0 ]; then
+	pass "${established} fuzzed sessions were established."
+else
+	fail "no fuzzed session was established; the fuzz tested nothing."
+fi
+
+# Sessions the fuzz left behind have to end - on error, on reset or on
+# the keepalive timeout - and give their slots back.
+sleep 20
+python3 "$FUZZER" probe 127.0.0.1 "$TCP_PORT" > probe.out 2>&1
+if grep -q "^RESULT: probe=SESS_INIT$" probe.out; then
+	pass "a clean session still establishes afterwards."
+else
+	fail "a clean session was turned away afterwards: \
+$(sed -n 's/^RESULT: probe=//p' probe.out)"
+fi
+
+if grep "tcpv4cla" ion.log | LC_ALL=C grep -q '[[:cntrl:]]'; then
+	fail "a control character reached the log:"
+	grep "tcpv4cla" ion.log | LC_ALL=C grep '[[:cntrl:]]' | head -3 | cat -v
+else
+	pass "nothing a peer sent reached the log as a control character."
+fi
+
+if ls asan.* ubsan.* >/dev/null 2>&1; then
+	fail "the sanitizer reported:"
+	head -30 asan.* ubsan.* 2>/dev/null
+else
+	pass "no sanitizer report."
+fi
+
+echo "Stopping ION..."
+pkill -9 -x tcpv4cla 2>/dev/null
+sleep 1
+ionstop >/dev/null 2>&1
+sleep 1
+killm >/dev/null 2>&1
+
+echo "Cleaning up..."
+rm -f client*.out probe.out
+rm -f "${CONFIGDIR}/fuzz_runtime.bprc" "${CONFIGDIR}/fuzz_runtime.ipnrc"
+
+exit $FAIL

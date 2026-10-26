@@ -44,7 +44,9 @@ certificate as RFC 9174 section 4.4.4.3 requires, a NODE-ID being a
 subjectAltName otherName of form id-on-bundleEID naming that node.  A node ID
 that was not authenticated is never used to route bundles to the peer: a
 session B<tcpv4cla> accepted is then usable for reception only, so a peer
-cannot collect another node's traffic by claiming to be it.
+cannot collect another node's traffic by claiming to be it.  A node ID that is
+not a URI at all - no scheme, or a control character, space, NUL or non-ASCII
+octet in it - ends the session with "Contact Failure" (section 4.6).
 
 Note two ION limits on the induct's command text: it is stored as an SDR
 string of at most 255 characters and is truncated past that, and it may

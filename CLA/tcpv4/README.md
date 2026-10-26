@@ -72,7 +72,7 @@ reused for both directions, whether `tcpv4cla` accepted it or opened it.
 | Idle session termination (§6.2) | implemented (`-t`) |
 | Reconnection backoff, contact timeout (§4.1) | implemented (randomized binary backoff, capped at 60 s, reset only by an established session) |
 | Session limit and "Busy" refusal (§6.1, §7.10) | implemented (`-L`, plus a per-address cap on concurrent negotiations) |
-| Peer node ID (§4.6) | any EID scheme; sessions are keyed on the node ID, not on an ipn node number |
+| Peer node ID (§4.6) | any EID scheme; sessions are keyed on the node ID, not on an ipn node number; one that is not a URI ends the session |
 | NODE-ID authentication (§4.4.1, §4.4.4.3, §7.9) | implemented (`-E`); an unauthenticated node ID never attracts egress |
 | Network-level (DNS-ID / IPADDR-ID) authentication (§4.4.4.2) | implemented via the TLS hostname check; not separately configurable |
 | Certificate profile, key usage and EKU (§4.4.2, §4.4.4.1) | implemented; a certificate restricted to other purposes is refused, `-B` applies the §4.4.5 policy |
@@ -324,7 +324,7 @@ these limits before starting ION so the failure is legible.
 ```
 src/tcpv4cla.h          constants and configuration struct
 src/tcpv4cfg.c          duct-name and command-line argument parsing
-src/tcpv4nodeid.{c,h}   node ID comparison (dependency-free)
+src/tcpv4nodeid.{c,h}   node ID comparison and validation (dependency-free)
 src/tcpv4msg.{c,h}      RFC 9174 wire-message codec (dependency-free)
 src/tcpv4tls.h          TLS backend interface
 src/tcpv4tls_gnutls.c   GnuTLS backend (TLS 1.3)
@@ -347,6 +347,9 @@ tests/nodeid-tcpv4/         NODE-ID authentication policy (.optional)
 tests/certprofile-tcpv4/    certificate profile / key usage (.optional)
 tests/revocation-tcpv4/     path validation against a CRL (.optional)
 tests/protocol-tcpv4/       error paths, against a synthetic peer (.optional)
+tests/netfuzz-tcpv4/        a live daemon fuzzed over the network (.optional)
+tests/fuzz/                 libFuzzer targets for the dependency-free units,
+                            and their corpus (replayed by make check)
 bench/bench-tcpv4           throughput benchmark (TLS / plaintext / TCPCLv3)
 bench/bench-tcpv4-impaired  the same sweep over a delayed / lossy link
 ```
@@ -386,20 +389,42 @@ limit while BP was congested.
   message type, and the extension-item TLV walker; node ID comparison, which
   decides which session may carry a node's traffic; and the certificate
   decoding both TLS backends share, which decides who a peer is allowed to
-  be.
+  be. It also replays the fuzz corpus in `tests/fuzz` through the same
+  three units, with every assertion the fuzz targets make.
+- `make fuzz` — builds the targets in `tests/fuzz` with clang's libFuzzer,
+  AddressSanitizer and UBSan, and fuzzes the codec, node ID handling and
+  certificate decoding for `FUZZ_TIME` seconds each (default 60, with
+  `FUZZ_JOBS` workers), starting from the checked-in corpus. Whatever the
+  codec decodes must lie inside its input and encode back to exactly the
+  octets it consumed; node ID comparison must be symmetric; a node ID that
+  passes validation must hold no control character. A failing input is left
+  in `fuzz-artifacts/` and fails the target; one worth keeping belongs in
+  `tests/fuzz/corpus/`.
+- `tests/netfuzz-tcpv4` — the rest of the receive path, which no unit can
+  fuzz: four clients open sessions to a live daemon at once and feed each a
+  corrupted RFC 9174 stream (`netfuzz.py`) — lengths that disagree with what
+  follows, stray Transfer IDs, overrunning extension items, node IDs that
+  are not text, unknown message types, connections cut mid-message or
+  reset. The daemon must survive, give back every session slot (a clean
+  session establishes afterwards) and let no control character from a peer
+  into `ion.log`. Put a sanitizer build of `tcpv4cla` first on `PATH` and
+  any report it writes fails the test; `NETFUZZ_SESSIONS` and
+  `NETFUZZ_SEED` scale and reproduce a run.
 - `tests/protocol-tcpv4` — the error paths, driven by a synthetic RFC 9174
   peer (`peer.py`) that speaks the protocol on a plaintext socket. The bp
   test tools can drive the happy path and no more: they cannot send a
   `MSG_REJECT`, refuse a transfer, stall part way through negotiation or
-  leave a connection unanswered. Six phases, each asserting both what went
+  leave a connection unanswered. Seven phases, each asserting both what went
   over the wire and what `tcpv4cla` wrote to `ion.log`: an inbound
   `MSG_REJECT` is reported and never reflected (§5.1.2) while one naming
   `XFER_SEGMENT` ends the session; a transfer refused as "Completed" counts
   as sent while one refused otherwise comes back (§5.2.4); a peer that names
   itself `dtn://peer-b/` is routable (§4.6); connections left half-negotiated
   are rationed per address (§7.10); a session past `-L` is refused with
-  `SESS_TERM` "Busy" (§6.1); and the reconnection delay grows after a peer
-  that accepts the connection but never establishes a session (§4.1).
+  `SESS_TERM` "Busy" (§6.1); the reconnection delay grows after a peer
+  that accepts the connection but never establishes a session (§4.1); and a
+  node ID that is not a URI — a newline, a NUL, octets that are no text —
+  ends the session with "Contact Failure" and never reaches the log (§4.6).
 - `tests/loopback-tcpv4` — over TLS: session establishment, a single-segment
   transfer, a multi-segment transfer (Segment MRU forced to 2000 with `-S`),
   50 streamed bundles, an idle period survived on KEEPALIVEs, and a graceful
@@ -596,6 +621,7 @@ wording is deliberately stable:
 | `refusing a connection, session limit reached` | past `-L` plus the slack, so not even that far |
 | `has more than one session to node` | two nodes dialled each other; senders settle on one and the other falls idle |
 | `no session took the bundle, will retry` | said once per run of refusals, not once per attempt |
+| `got a malformed node ID from` | the peer's `SESS_INIT` node ID is not a URI - no scheme, or a control character, space, NUL or non-ASCII octet in it - so it is refused with "Contact Failure" before it is anybody's identity or reaches this log (§4.6) |
 | `peer claims an unauthenticated node ID that is not the one dialled` | the session will not be used for egress (§7.9) |
 | `peer's certificate is not valid for this role` | its extended key usage leaves out the purpose this handshake needs (§4.4.2); the session is refused |
 | `peer's certificate carries no extended key usage` | unrestricted, so usable, but not the profile §4.4.2 asks for |
