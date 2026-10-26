@@ -1,0 +1,11 @@
+From: a@example.org
+To: b@example.org
+Subject: From: a@example.org
+To: b@example.orgpart/mixed; boundary="ION-BUNDLE-MAIL-SEPARATOR"
+
+--ION-BUNDLE-MAIL-SEbundles
+MIME-Versiot :1.0
+X-ION-Bundle-Encoding: attach
+X-ION-Bundle-CPARATOR
+Content-Type: appliouncation/octet-stt: 1
+Content-Tyream;pe: multipar t/mi

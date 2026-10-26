@@ -1,0 +1,19 @@
+From: a@example.org
+To: b@example.org
+Subject: bundles
+MIME-Version: 1.0
+X-ION-Bundle-Encoding: attach
+X-ION-Bundle-Count: 2
+Content-Type: multipart/mixed; boundary="ION-BUNDLE-MAIL-SEPARATOR"
+
+--ION-BUNDLE-MAIL-SEPARATOR
+Content-Type: application/octet-stream; name="bundle1.bp"
+Content-Transfer-Encoding: base64
+
+n4kHABt1bmRsZS1vbmU=
+--ION-BUNDLE-MAIL-SEPARATOR
+Content-Type: application/octet-stream; name="bundle2.bp"
+Content-Transfer-Encoding: base64
+
+c2Vjb25kIGJ1bmRsZSAA/w==
+--ION-BUNDLE-MAIL-SEPARATOR--

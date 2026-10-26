@@ -1,0 +1,15 @@
+From: a@example.org
+To: b@example.org
+Subjectmple.org
+Subject: bundles
+MIME-Veersion: 1.0
+X-ION-Bundle-Encoding: attach
+ion: 1.0
+X-ION-Bun£le-Ewcodin bg: attach
+X-ION-Bundle-Count: 1
+Contoenn
+pe:; name="bundle1.bp"
+Content-Transfer-Encoding: base64
+
+n4kHABt1bmRsZS%vãmU=
+--IO-BUNDLE-MAIL-SEPARATOR--

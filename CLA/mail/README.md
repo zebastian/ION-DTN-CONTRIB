@@ -35,6 +35,7 @@ src/mailclo.c       output daemon (SMTP)
 src/mailcli.c       input daemon (POP3)
 doc/*.pod           man page sources (mailcli, mailclo)
 tests/mailmsg_test.c    unit test for the encoding core (make check)
+tests/fuzz/             libFuzzer target for the encoding core, and its corpus
 tests/loopback-mail/    loopback send/receive via a bundled mock server (.optional)
 ```
 
@@ -54,8 +55,23 @@ Requires libcurl (`libcurl4-openssl-dev`).
 ./install-deps.sh            # build prerequisites
 ./configure --enable-cla-mail --with-ion=/usr/local
 make
-make check                   # runs the encoding unit test
+make check                   # runs the encoding unit test and fuzz corpus
+make fuzz                    # fuzzes the encoding core (needs clang)
 ```
+
+A received message is the most exposed input any CLA here takes, so the
+fuzz target parses each input as one, under every encoding, and reads each
+bundle the parser hands back end to end. It also builds the input's bytes
+into a message as up to three bundles and parses it back: under every
+encoding that can carry them, the same bundles must come out. Base64 is
+checked on its own too.
+
+`make fuzz` builds the fuzz target in `tests/fuzz` with clang's libFuzzer,
+AddressSanitizer and UBSan and runs it for `FUZZ_TIME` seconds (default 60,
+with `FUZZ_JOBS` workers), starting from the checked-in corpus; `make check`
+replays that corpus without libFuzzer. A failing input is left in
+`fuzz-artifacts/` and fails the target; one worth keeping belongs in
+`tests/fuzz/corpus/`.
 
 ## Configuration
 

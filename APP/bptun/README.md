@@ -156,7 +156,18 @@ profile unshare /usr/bin/unshare flags=(unconfined) {
 ```
 
 `make check` runs the route table's unit test, which needs neither
-namespaces nor ION.
+namespaces nor ION, and replays the route table's fuzz corpus. The fuzz
+target adds route specs, as an operator would, then looks up a packet,
+which a remote host can shape: lookup and the link-local check must read
+no further than the packet, and a lookup must give back one of the table's
+own EIDs or none.
+
+`make fuzz` builds the fuzz target in `tests/fuzz` with clang's libFuzzer,
+AddressSanitizer and UBSan and runs it for `FUZZ_TIME` seconds (default 60,
+with `FUZZ_JOBS` workers), starting from the checked-in corpus; `make check`
+replays that corpus without libFuzzer. A failing input is left in
+`fuzz-artifacts/` and fails the target; one worth keeping belongs in
+`tests/fuzz/corpus/`.
 
 ## Roadmap
 
@@ -174,6 +185,7 @@ namespaces nor ION.
 src/bptun.c           the daemon
 src/bptun_route.[ch]  the route table (no ION dependency; unit-tested)
 tests/bptun_route_test.c
+tests/fuzz/           libFuzzer target for the route table, and its corpus
 tests/bptun-loopback/ end-to-end test (unprivileged namespaces)
 doc/bptun.pod         man page source
 ```

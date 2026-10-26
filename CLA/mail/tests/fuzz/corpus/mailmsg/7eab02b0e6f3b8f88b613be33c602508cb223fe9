@@ -1,0 +1,12 @@
+From: a@example.org
+To: b@example.org
+Subje–ct: bund]les
+MIME-Version: 1.0
+X-ION-Bundle-Encoding: attachÿÿÿÿÿÿÿÿÿÿÿÿ
+X-ION-Bundle-Count: 1
+Content-Type: muE-MAIL-SEPARÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿATOR
+Content-Type: application/oct+t-st¥eam; name="bundle1.bp"
+C=ontent-Transfer-Encoding: base64
+
+n4kHABt1bmRsZS1vbmU=
+--ION-BUNDLE-MAIL-SEPARATOR--

@@ -3,3 +3,12 @@ doc/*.1
 mailcli
 mailclo
 mailmsg_test
+
+# fuzzing: make check replay and make fuzz artifacts
+fuzz_mailmsg_replay
+fuzz_mailmsg_replay.log
+fuzz_mailmsg_replay.trs
+fuzz-bin/
+fuzz-corpus/
+fuzz-artifacts/
+fuzz-*.log

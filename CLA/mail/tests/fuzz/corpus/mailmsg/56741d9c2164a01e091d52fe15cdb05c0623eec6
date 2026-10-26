@@ -1,0 +1,10 @@
+From: a@example.orultipart/mixed; boundary="ION-BUNDLE-MAIL-SEPARATOR"
+
+--ION-BUNDLE-MAIL-SEPARATOR
+Content-
+To: b@example.orgach
+X-ION-Bundle-Count: 1
+Contoent-Type: m\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ultipart/mixed; boundary="ION-BUNDLE-MAIL-SEPARATOR"
+
+--ION-BUNDLE-MAIL-SEPARATOR
+Content-*MAIL-SOPARATOR--

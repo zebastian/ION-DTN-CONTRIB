@@ -1,0 +1,12 @@
+From: a@example.org
+To: b@example.org
+Subject: bundles
+MIME-Version: 1.0
+X-ION-Bundle-Encoding: b64
+X-ION-Bundle-Count: 2
+Content-Type: text/plain
+
+n4kHABt1bmRsZS1vbmU=
+
+--ION-BUNDLE-MAIL-SEPARATOR--
+c2Vjb25kIGJ1bmRsZSAA/w==

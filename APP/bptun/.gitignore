@@ -13,3 +13,12 @@ tests/*/*.sum
 # Automake test output (make check)
 *.log
 *.trs
+
+# fuzzing: make check replay and make fuzz artifacts
+fuzz_route_replay
+fuzz_route_replay.log
+fuzz_route_replay.trs
+fuzz-bin/
+fuzz-corpus/
+fuzz-artifacts/
+fuzz-*.log

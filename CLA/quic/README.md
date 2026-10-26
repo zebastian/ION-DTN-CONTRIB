@@ -95,12 +95,20 @@ doc/*.pod              man page sources
 tests/loopback-quic/         single-node reliable loopback (.optional)
 tests/loopback-quic-dgram/   single-node unreliable loopback (.optional)
 tests/interop-unibo-bp/      ION <-> Unibo-BP cross-project interop (.optional)
+tests/fuzz/                  libFuzzer target for the codec, and its corpus
 bench/bench-quic             throughput benchmark
 ```
 
 ## Testing
 
-- `make check` — codec round-trip unit tests for every message type.
+- `make check` — codec round-trip unit tests for every message type, and a
+  replay of the fuzz corpus in `tests/fuzz`.
+- `make fuzz` — fuzzes the codec with libFuzzer, AddressSanitizer and UBSan
+  for `FUZZ_TIME` seconds (default 60, `FUZZ_JOBS` workers), starting from
+  the checked-in corpus. Every decoder runs over each input; whatever one
+  accepts must lie inside the input, pointers it hands back included, and
+  encode back to exactly the octets it consumed. A failing input is left in
+  `fuzz-artifacts/` and fails the target.
 - `tests/loopback-quic` — reliable service: single- and multi-segment
   transfers, multiple streamed bundles, priority-to-stream routing
   (a high-ordinal bundle must use stream 4), and graceful SESS_TERM.

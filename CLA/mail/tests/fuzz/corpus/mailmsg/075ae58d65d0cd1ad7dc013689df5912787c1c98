@@ -1,0 +1,12 @@
+From: a@example.org
+To: b@example.org
+Subject: bundles
+MIME-Version: 1.0
+X-ansfer-Encoding: base64le-Count: 2rt/mixed; boundary="ION-BUNDLE-MAIL-SEPARATOR"
+
+--ION-BUNDLE-MAIL-SEPARATOR
+Content-Type: application/octet-stream; name="bu
+
+n4kHABt1bmachransfer-Encoding: base64
+
+n4kHABt1bmRsZS1vbmU=J--ION-BUNDLE-MAIL-SEPARATOR--

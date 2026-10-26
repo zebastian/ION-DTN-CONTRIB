@@ -34,3 +34,12 @@ quicmsg_test
 quicmsg_test.log
 quicmsg_test.trs
 test-suite.log
+
+# fuzzing: make check replay and make fuzz artifacts
+fuzz_quicmsg_replay
+fuzz_quicmsg_replay.log
+fuzz_quicmsg_replay.trs
+fuzz-bin/
+fuzz-corpus/
+fuzz-artifacts/
+fuzz-*.log
