@@ -19,11 +19,11 @@ and routing may reorder - so B<zcli> holds early carriers in a reorder
 buffer until those before them arrive.  Each bundle is passed to BP as
 soon as it has been decompressed.
 
-When a carrier is missing for I<reorder_ms>, or the reorder buffer is
-full, B<zcli> gives it up: the rest of its chunk is discarded and
-decoding continues with the next chunk.  Bundles already delivered from
-that chunk stay delivered; every carrier is checked by CRC-32C before it
-is decoded.
+When the carrier right behind a missing one has waited I<reorder_ms>,
+or the reorder buffer is full, B<zcli> gives the missing one up: the
+rest of its chunk is discarded and decoding continues with the next
+chunk.  Bundles already delivered from that chunk stay delivered; every
+carrier is checked by CRC-32C before it is decoded.
 
 B<zcli> keeps separate state for each sending B<zclo> (each run of one
 picks a random stream ID), so several nodes may send to the same

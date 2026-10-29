@@ -363,6 +363,7 @@ typedef struct pending
 	uint64_t	chunk;
 	uint32_t	seq;
 	int		end;
+	uint64_t	at;		/*	arrival, ms		*/
 	size_t		len;
 	unsigned char	data[];
 } Pending;
@@ -393,8 +394,6 @@ typedef struct
 	Pending		*buf;		/*	sorted by (chunk, seq)	*/
 	unsigned int	bufCount;
 	size_t		bufBytes;
-	int		waiting;	/*	stalled since waitSince	*/
-	uint64_t	waitSince;
 } ZclStream;
 
 struct ZclRx
@@ -738,11 +737,9 @@ static void	syncTo(ZclRx *rx, ZclStream *s, uint64_t chunk)
 	resetChunk(s);
 }
 
-/*	Decodes everything that is next in line.  Returns 1 if any
- *	carrier was taken.						*/
-static int	drain(ZclRx *rx, ZclStream *s)
+/*	Decodes everything that is next in line.			*/
+static void	drain(ZclRx *rx, ZclStream *s)
 {
-	int	progress = 0;
 	Pending	*p;
 
 	while ((p = s->buf) != NULL)
@@ -782,7 +779,6 @@ static int	drain(ZclRx *rx, ZclStream *s)
 		s->buf = p->next;
 		s->bufCount--;
 		s->bufBytes -= p->len;
-		progress = 1;
 		if (decodeCarrier(rx, s, p) < 0)
 		{
 			rx->stats.chunksCorrupt++;
@@ -800,8 +796,6 @@ static int	drain(ZclRx *rx, ZclStream *s)
 
 		free(p);
 	}
-
-	return progress;
 }
 
 /*	Gives up waiting for what is missing at the head of the buffer.	*/
@@ -832,6 +826,13 @@ static void	resolveGap(ZclRx *rx, ZclStream *s)
 	dropBelow(rx, s, s->done + 1);
 }
 
+/*	Decodes what it can and gives up the gaps that have lasted.
+ *	What is missing at a gap was sent before the carrier now at the
+ *	head of the buffer, so the gap is given up once that carrier has
+ *	waited the reorder timeout since it arrived.  Measuring each gap
+ *	from the carrier behind it, not from when the receiver began to
+ *	wait for it, lets gaps that queued up behind one another be given
+ *	up together.							*/
 static void	settle(ZclRx *rx, ZclStream *s, uint64_t nowMs)
 {
 	int	rounds;
@@ -841,37 +842,22 @@ static void	settle(ZclRx *rx, ZclStream *s, uint64_t nowMs)
 
 	for (rounds = 0; rounds < 1000000 && s->buf; rounds++)
 	{
-		if (drain(rx, s))
-		{
-			s->waiting = 0;
-		}
-
+		drain(rx, s);
 		if (s->buf == NULL)
 		{
 			break;
 		}
 
-		if (!s->waiting)
-		{
-			s->waiting = 1;
-			s->waitSince = nowMs;
-		}
-
 		if (s->bufCount > rx->limits.maxCarriers
 		|| s->bufBytes > rx->limits.maxBufBytes
-		|| nowMs - s->waitSince >= rx->limits.reorderMs)
+		|| (nowMs >= s->buf->at
+			&& nowMs - s->buf->at >= rx->limits.reorderMs))
 		{
 			resolveGap(rx, s);
-			s->waiting = 0;
 			continue;
 		}
 
 		break;
-	}
-
-	if (s->buf == NULL)
-	{
-		s->waiting = 0;
 	}
 }
 
@@ -930,6 +916,7 @@ int	zclRxCarrier(ZclRx *rx, const unsigned char *carrier, size_t len,
 	p->chunk = h.chunkId;
 	p->seq = h.seq;
 	p->end = (h.flags & ZCL_FLAG_END) != 0;
+	p->at = nowMs;
 	p->len = h.length;
 	memcpy(p->data, carrier + ZCL_HDR_LEN, h.length);
 	p->next = *link;

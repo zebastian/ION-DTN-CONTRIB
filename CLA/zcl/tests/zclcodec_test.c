@@ -311,6 +311,36 @@ static void	testLoss(void)
 	freeCarriers(&c);
 }
 
+static void	testQueuedGaps(void)
+{
+	Carriers	c;
+	Sink		sk;
+	ZclRx		*rx = newRx(&sk, 500);
+	ZclRxStats	st;
+	int		i;
+
+	/*	Chunks 1 and 2 each lose a carrier.  Both gaps are older
+	 *	than the timeout at the same tick, so both are given up
+	 *	then - not one per timeout.				*/
+
+	encode(&c, 200, 10, 5, 10);	/*	20 carriers, 4 chunks	*/
+	for (i = 0; i < c.n; i++)
+	{
+		if (i != 7 && i != 12)
+		{
+			zclRxCarrier(rx, c.data[i], c.len[i], 0);
+		}
+	}
+
+	CHECK(sk.count == 70, "waiting at the first gap");
+	zclRxTick(rx, 500);
+	CHECK(sk.count == 140, "both gaps given up in one tick");
+	zclRxGetStats(rx, &st);
+	CHECK(st.chunksLost == 2 && st.chunksDone == 2, "two chunks lost");
+	zclRxFree(rx);
+	freeCarriers(&c);
+}
+
 static void	testLostStart(void)
 {
 	Carriers	c;
@@ -480,6 +510,7 @@ int	main(void)
 	testRoundTrip();
 	testReorder();
 	testLoss();
+	testQueuedGaps();
 	testLostStart();
 	testCorruptAndDup();
 	testStreams();

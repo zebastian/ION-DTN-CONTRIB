@@ -171,12 +171,16 @@ of carriers sorted by (chunk_id, seq), bounded by count and bytes.
 * *Decode.*  Synced on chunk `cur`, the carrier `(cur, next)` is fed to
   `ZSTD_decompressStream`; every record completed is injected into ION
   right away (`bpBeginAcq` / `bpContinueAcq` / `bpEndAcq`).
-* *Gap.*  When the oldest buffered carrier has waited the reorder
-  timeout `-r`, or the buffer is full, the gap is declared permanent:
-  the current chunk is given up (its decoded bundles stay delivered, the
-  partial record and the rest are discarded), the receiver resyncs on
-  the lowest buffered `seq 0`, and carriers left without a chunk start
-  are dropped once they are themselves older than the timeout.
+* *Gap.*  What is missing at a gap was sent before the carrier at the
+  head of the buffer, right behind the gap.  When that carrier has
+  waited the reorder timeout `-r` since it arrived, or the buffer is
+  full, the gap is declared permanent: the current chunk is given up
+  (its decoded bundles stay delivered, the partial record and the rest
+  are discarded), the receiver resyncs on the lowest buffered `seq 0`,
+  and carriers left without a chunk start are dropped once they are
+  themselves older than the timeout.  Timing each gap from the carrier
+  behind it, rather than from when the receiver began to wait, lets
+  gaps that queued up behind one another be given up together.
 
 A lost carrier thus costs the rest of its chunk, never more; bundles
 decoded before the gap were verified by the carrier CRCs and are valid.

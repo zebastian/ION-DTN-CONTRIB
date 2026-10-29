@@ -6,14 +6,45 @@
 # carriers addressed to ipn:1.7, a data-label route override sends the
 # carriers over UDP, and zcli decompresses them and hands the bundles
 # back to ION.  Checks delivery, that compression happened, that the
-# carriers took the UDP route, and that a carrier routed back into zcl
-# is dropped rather than wrapped again.
+# carriers took the UDP route, that losing carriers costs only the
+# chunks they belong to, and that a carrier routed back into zcl is
+# dropped rather than wrapped again.
 #
 # Needs the zcl daemons and ION's udpcli/udpclo and bp test tools.
 #
+# The loss phase drops a share of the carrier datagrams with
+# misc/linkimpair, checks that zcli gives up only the chunks hit, and
+# that the stream carries on afterwards.  It runs only if it can get the
+# privilege it needs, and is skipped otherwise:
+#
+#   * iptables, to queue the UDP port: as root, or through "sudo -n".
+#   * CAP_NET_ADMIN for linkimpair, to bind the queue:
+#         sudo setcap cap_net_admin+ep .../misc/linkimpair/linkimpair
+#
+# ION and the zcl daemons stay unprivileged.  The rule carries
+# --queue-bypass, so a linkimpair that dies takes the loss away rather
+# than the link, and it is removed on every exit path.
+#
+# Tunables (env overridable):
+#   ZCL_UDP_PORT     UDP port of the carriers         (default 4758)
+#   ZCL_LOSS_PCT     carriers dropped, percent        (default 25)
+#   ZCL_NFQUEUE      NFQUEUE number                   (default 23)
+#   LINKIMPAIR       path to the linkimpair binary
+#
 
 UDP_PORT="${ZCL_UDP_PORT:-4758}"
+LOSS_PCT="${ZCL_LOSS_PCT:-25}"
+NFQUEUE_NUM="${ZCL_NFQUEUE:-23}"
+LINKIMPAIR="${LINKIMPAIR:-$(cd ../../../../misc/linkimpair 2>/dev/null \
+	&& pwd)/linkimpair}"
+IPTABLES="${IPTABLES:-$(command -v iptables || echo /usr/sbin/iptables)}"
 CONFIGDIR="./config"
+
+if [ "$(id -u)" -eq 0 ]; then
+	SUDO=""
+else
+	SUDO="sudo -n"
+fi
 
 echo "########################################"
 echo
@@ -44,6 +75,52 @@ await()
 
 received_file() { [ -f testfile1 ] && cmp -s sendfile testfile1; }
 logged() { grep -q "$1" ion.log 2>/dev/null; }
+
+# Asks zcli for its counters (SIGUSR1) and sets STATS to the new line.
+zcli_stats()
+{
+	local before
+
+	before=$(grep -c "zcli stats" ion.log 2>/dev/null)
+	pkill -USR1 -x zcli
+	await 5 sh -c "[ \$(grep -c 'zcli stats' ion.log) -gt $before ]"
+	STATS=$(grep "zcli stats" ion.log | tail -1)
+}
+
+# Reads one counter out of STATS: carriers, bad, stale, dropped,
+# bundles, done, lost or corrupt.
+stat()
+{
+	case "$1" in
+	carriers) echo "$STATS" | sed -n 's/.*stats: \([0-9]*\) carriers.*/\1/p' ;;
+	bundles) echo "$STATS" | sed -n 's/.*; \([0-9]*\) bundles,.*/\1/p' ;;
+	done) echo "$STATS" | sed -n 's/.*chunks \([0-9]*\) done.*/\1/p' ;;
+	*) echo "$STATS" | sed -n "s/.*[( ]\([0-9]*\) $1[,);].*/\1/p" ;;
+	esac
+}
+
+IMPAIR_PID=""
+RULE_ON=0
+
+impair_off()
+{
+	if [ "$RULE_ON" -eq 1 ]; then
+		while $SUDO "$IPTABLES" -D OUTPUT -o lo -p udp \
+			--dport "$UDP_PORT" -j NFQUEUE \
+			--queue-num "$NFQUEUE_NUM" --queue-bypass \
+			2>/dev/null; do :; done
+		RULE_ON=0
+	fi
+
+	if [ -n "$IMPAIR_PID" ]; then
+		kill "$IMPAIR_PID" 2>/dev/null
+		wait "$IMPAIR_PID" 2>/dev/null
+		IMPAIR_PID=""
+	fi
+}
+
+trap impair_off EXIT
+trap 'impair_off; ./cleanup; exit 1' INT TERM
 
 for t in zcli zclo udpcli udpclo bpsendfile bprecvfile bpdriver bpcounter; do
 	if ! command -v "$t" >/dev/null 2>&1; then
@@ -102,13 +179,10 @@ else
 		counter.out | tail -1))."
 fi
 
-# zcli logs its counters on SIGUSR1.
-pkill -USR1 -x zcli
-await 5 logged "zcli stats"
-STATS=$(grep "zcli stats" ion.log | tail -1)
+zcli_stats
 echo "  $STATS"
-CARRIERS=$(echo "$STATS" | sed -n 's/.*stats: \([0-9]*\) carriers.*/\1/p')
-BUNDLES=$(echo "$STATS" | sed -n 's/.*; \([0-9]*\) bundles,.*/\1/p')
+CARRIERS=$(stat carriers)
+BUNDLES=$(stat bundles)
 if [ -n "$CARRIERS" ] && [ -n "$BUNDLES" ] && [ "$BUNDLES" -ge 201 ] \
 	&& [ "$CARRIERS" -lt "$BUNDLES" ]; then
 	echo "  PASS: $BUNDLES bundles arrived in $CARRIERS carriers over UDP."
@@ -123,8 +197,84 @@ else
 	fail "receiver saw losses: $STATS"
 fi
 
-# --- Phase 3: loop guard ---------------------------------------------------
-echo "Phase 3: carrier routed back into zcl..."
+# --- Phase 3: carrier loss ------------------------------------------------
+echo "Phase 3: ${LOSS_PCT}% of the carrier datagrams dropped..."
+if [ ! -x "$LINKIMPAIR" ]; then
+	echo "  SKIP: linkimpair not built at '$LINKIMPAIR' (set LINKIMPAIR)."
+elif ! $SUDO "$IPTABLES" -I OUTPUT -o lo -p udp --dport "$UDP_PORT" \
+	-j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass 2>/dev/null; then
+	echo "  SKIP: can't install the iptables rule; allow '$IPTABLES' via sudo."
+else
+	RULE_ON=1
+	"$LINKIMPAIR" -q "$NFQUEUE_NUM" -l "$LOSS_PCT" -s 7 -v \
+		> impair.log 2>&1 & IMPAIR_PID=$!
+	sleep 1
+	if ! kill -0 "$IMPAIR_PID" 2>/dev/null; then
+		IMPAIR_PID=""
+		impair_off
+		echo "  SKIP: linkimpair can't bind the queue (CAP_NET_ADMIN?):"
+		sed 's/^/    /' impair.log
+	else
+		zcli_stats
+		B0=$(stat bundles); D0=$(stat done); L0=$(stat lost)
+
+		# 1200 bundles in carriers of about 16 bundles and chunks of
+		# about 65: dozens of carriers, many chunks.  bpcounter takes
+		# them off ipn:1.2, so they don't queue there for the
+		# recovery check below.
+		bpcounter ipn:1.2 1201 > counter.out 2>&1 & CP=$!
+		sleep 1
+		bpdriver 1200 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+
+		# Let zcli give up the gaps: reorder timeout 2 s, ticks of 1 s.
+		sleep 5
+		kill -9 $CP 2>/dev/null; wait $CP 2>/dev/null
+		impair_off
+		IMPAIRED=$(grep -h 'dropped' impair.log | tail -1)
+		DROPPED=$(echo "$IMPAIRED" | sed -n 's/.*dropped \([0-9]*\).*/\1/p')
+		echo "  $IMPAIRED"
+
+		# The stream must carry on once the link is clean again.  The
+		# file's carrier also follows any carrier dropped last, so
+		# every drop has opened a gap by the time it is in.
+		rm -f testfile*
+		bprecvfile ipn:1.2 & RP=$!
+		sleep 1
+		bpsendfile ipn:1.1 ipn:1.2 sendfile
+		if await 10 received_file; then
+			echo "  PASS: stream recovered after the losses."
+		else
+			fail "nothing delivered after the losses."
+		fi
+
+		zcli_stats
+		echo "  $STATS"
+		GOT=$(( $(stat bundles) - B0 - 1 ))
+		DONE=$(( $(stat done) - D0 ))
+		LOST=$(( $(stat lost) - L0 ))
+		if [ "${DROPPED:-0}" -eq 0 ]; then
+			fail "linkimpair dropped nothing; the phase proves nothing."
+		elif [ "$LOST" -ge 1 ] && [ "$GOT" -gt 0 ] \
+			&& [ "$GOT" -lt 1201 ]; then
+			echo "  PASS: $DROPPED carriers dropped: $LOST chunk(s)" \
+				"given up, $DONE completed, $GOT of 1201 bundles" \
+				"delivered."
+		else
+			fail "loss not handled as expected (lost $LOST," \
+				"done $DONE, delivered $GOT of 1201)."
+		fi
+
+		if [ "$(stat bad)" = 0 ] && [ "$(stat corrupt)" = 0 ]; then
+			echo "  PASS: no carrier refused, no chunk corrupt."
+		else
+			fail "loss led to refused carriers or corrupt chunks."
+		fi
+		kill $RP 2>/dev/null; wait $RP 2>/dev/null
+	fi
+fi
+
+# --- Phase 4: loop guard ---------------------------------------------------
+echo "Phase 4: carrier routed back into zcl..."
 echo "d ovrd 8020844 1 0" | ipnadmin >/dev/null
 bpsendfile ipn:1.1 ipn:1.2 sendfile
 if await 10 logged "carrier routed into its own outduct"; then
