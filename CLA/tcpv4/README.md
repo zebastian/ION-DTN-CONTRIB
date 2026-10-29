@@ -414,7 +414,7 @@ limit while BP was congested.
   peer (`peer.py`) that speaks the protocol on a plaintext socket. The bp
   test tools can drive the happy path and no more: they cannot send a
   `MSG_REJECT`, refuse a transfer, stall part way through negotiation or
-  leave a connection unanswered. Seven phases, each asserting both what went
+  leave a connection unanswered. Eight phases, each asserting both what went
   over the wire and what `tcpv4cla` wrote to `ion.log`: an inbound
   `MSG_REJECT` is reported and never reflected (§5.1.2) while one naming
   `XFER_SEGMENT` ends the session; a transfer refused as "Completed" counts
@@ -424,7 +424,10 @@ limit while BP was congested.
   `SESS_TERM` "Busy" (§6.1); the reconnection delay grows after a peer
   that accepts the connection but never establishes a session (§4.1); and a
   node ID that is not a URI — a newline, a NUL, octets that are no text —
-  ends the session with "Contact Failure" and never reaches the log (§4.6).
+  ends the session with "Contact Failure" and never reaches the log (§4.6);
+  and a transfer that carries no data, alone or as empty segments, is
+  refused as "Not Acceptable" without reaching BP — whose acquisition
+  asserts on it and aborts the daemon — while the session goes on (§5.2.2).
 - `tests/loopback-tcpv4` — over TLS: session establishment, a single-segment
   transfer, a multi-segment transfer (Segment MRU forced to 2000 with `-S`),
   50 streamed bundles, an idle period survived on KEEPALIVEs, and a graceful

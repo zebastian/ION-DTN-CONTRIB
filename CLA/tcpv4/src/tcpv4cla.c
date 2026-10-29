@@ -113,8 +113,17 @@ static int rxDeliver(void *parm, unsigned char *bundle, int len)
 	if (bpBeginAcq(rx->work, 0, NULL) < 0
 			|| bpContinueAcq(rx->work, (char *) bundle, len,
 					   &rx->attendant, 0)
-					< 0
-			|| bpEndAcq(rx->work) < 0)
+					< 0)
+	{
+		/*	Give back whatever ZCO space the acquisition has
+		 *	taken so far, which the next bpBeginAcq would not.	*/
+
+		bpCancelAcq(rx->work);
+		putErrmsg("tcpv4cla: can't acquire bundle.", NULL);
+		return -1;
+	}
+
+	if (bpEndAcq(rx->work) < 0)
 	{
 		putErrmsg("tcpv4cla: can't acquire bundle.", NULL);
 		return -1;

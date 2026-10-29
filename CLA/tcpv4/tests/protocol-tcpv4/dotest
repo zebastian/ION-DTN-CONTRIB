@@ -30,6 +30,9 @@
 #                      that was refused.
 #   7  RFC 9174 4.6    a node ID that is not a URI ends the session with
 #                      "Contact Failure" and never reaches the log.
+#   8  RFC 9174 5.2.2  a transfer with no data is refused as "Not
+#                      Acceptable", not handed to BP, and the daemon and
+#                      the session survive it.
 #
 
 TCP_PORT="${TCPV4_PORT:-4759}"
@@ -331,6 +334,55 @@ if grep -q "forged" ion.log; then
 	fail "a malformed node ID reached the log."
 else
 	pass "no malformed node ID reached the log."
+fi
+stop_node
+
+# --- Phase 8: an empty transfer ---------------------------------------
+# A transfer that carries no data is no bundle.  Handed to BP it fails
+# bpContinueAcq's assertion, which by default aborts the whole daemon:
+# one peer could take down every session on the node with a 30-octet
+# message.  It is refused instead, and the session goes on.
+echo
+echo "Phase 8: a transfer with no data is refused..."
+start_node "tcpv4cla -T none -E none" || { stop_node; exit 1; }
+peer_run empty 127.0.0.1 "$TCP_PORT"
+
+# XFER_REFUSE reason 4 is "Not Acceptable".
+if [ "$(peer_value single_empty)" = "refused-4" ]; then
+	pass "an empty first transfer was refused as Not Acceptable."
+else
+	fail "an empty first transfer got '$(peer_value single_empty)'."
+fi
+if [ "$(peer_value split_empty)" = "refused-4" ]; then
+	pass "a transfer of empty segments was refused as Not Acceptable."
+else
+	fail "a transfer of empty segments got '$(peer_value split_empty)'."
+fi
+if [ "$(peer_value after)" = "acked-32" ]; then
+	pass "the session took a transfer with data afterwards."
+else
+	fail "a transfer after the refusals got '$(peer_value after)'."
+fi
+if [ "$(peer_value term_reply)" = "SESS_TERM" ]; then
+	pass "the session ended cleanly."
+else
+	fail "the session did not end cleanly ($(peer_value term_reply))."
+fi
+if pgrep -x tcpv4cla >/dev/null; then
+	pass "the daemon survived."
+else
+	fail "the daemon is gone."
+	tail -20 ion.log
+fi
+if grep -q "Assertion failed" ion.log; then
+	fail "an empty transfer reached BP."
+else
+	pass "no empty transfer reached BP."
+fi
+if grep -q "got an empty transfer" ion.log; then
+	pass "the refusals were reported in the log."
+else
+	fail "no empty transfer was reported in the log."
 fi
 stop_node
 

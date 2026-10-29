@@ -395,6 +395,21 @@ static int handleXferSegment(Tcpv4Conn *conn)
 		TCPV4_SET(conn->rxActive, 0);
 		pthread_mutex_unlock(&e->mutex);
 
+		if (!conn->rxRefused && conn->rxLen == 0)
+		{
+			/*	RFC 9174 5.2.2: a transfer carries a bundle,
+			 *	and a bundle is never empty.  Handed to BP,
+			 *	an empty one fails an assertion in
+			 *	bpContinueAcq that by default aborts the
+			 *	whole daemon; refuse it instead.	*/
+
+			writeMemoNote("[?] tcpv4cla got an empty transfer from",
+					conn->peerName);
+			oK(rxSendRefuse(conn, TMSG_REFUSE_NOT_ACCEPTABLE,
+					seg.transferId));
+			return 0;
+		}
+
 		if (!conn->rxRefused)
 		{
 			/*	RFC 9174 5.2.3 acknowledges a segment only

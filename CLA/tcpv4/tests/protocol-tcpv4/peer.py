@@ -416,6 +416,75 @@ def cmd_badnodeid(host, port):
     return 0
 
 
+def cmd_empty(host, port):
+    """RFC 9174 5.2.2: a transfer carries a bundle, and a bundle is never
+    empty.  A transfer whose segments hold no data at all - a lone
+    START|END segment of length 0, or a START and an END that are both
+    empty - is refused as "Not Acceptable" rather than handed to BP,
+    and the session goes on: the next transfer is taken as usual.
+
+    The first transfer of the session is the empty one on purpose: the
+    node has not yet allocated a reassembly buffer for it then."""
+    peer = Peer(host, port)
+    peer.establish()
+
+    def send_segment(flags, transfer_id, data=b""):
+        head = struct.pack("!BBQ", XFER_SEGMENT, flags, transfer_id)
+        if flags & FLAG_START:
+            head += struct.pack("!I", 0)
+        peer.send(head + struct.pack("!Q", len(data)) + data)
+
+    def answer(transfer_id, timeout=10):
+        """What the node said about the transfer: refused-<reason>,
+        acked-<length>, or how the session ended."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = peer.recv_type(timeout=max(1, deadline - time.time()))
+            if msg is None:
+                continue
+            if msg == "closed":
+                return "closed"
+            if msg == KEEPALIVE:
+                continue
+            if msg == XFER_REFUSE:
+                reason, tid = struct.unpack("!BQ", peer.recv(9))
+                if tid == transfer_id:
+                    return "refused-%d" % reason
+                continue
+            if msg == XFER_ACK:
+                flags, tid, length = struct.unpack("!BQQ", peer.recv(17))
+                if tid == transfer_id and flags & FLAG_END:
+                    return "acked-%d" % length
+                continue
+            if msg == SESS_TERM:
+                peer.recv(2)
+                return "SESS_TERM"
+            if msg == MSG_REJECT:
+                peer.recv(2)
+                return "MSG_REJECT"
+            return TYPE_NAMES.get(msg, str(msg))
+        return "none"
+
+    send_segment(FLAG_START | FLAG_END, 1)
+    result("single_empty", answer(1))
+
+    send_segment(FLAG_START, 2)
+    send_segment(FLAG_END, 2)
+    result("split_empty", answer(2))
+
+    # A transfer with data still goes through after the refusals.  It is
+    # no bundle, so BP discards it once acquired, but the CLA has taken
+    # and acknowledged it, which is all that is asked of it here.
+    payload = b"\x9f" + b"\x00" * 31
+    send_segment(FLAG_START | FLAG_END, 3, payload)
+    result("after", answer(3))
+
+    peer.send_sess_term()
+    result("term_reply", answer(0))
+    peer.close()
+    return 0
+
+
 def cmd_listen(port, seconds):
     """A peer that accepts the TCP connection and then goes no further.
 
@@ -465,6 +534,8 @@ def main(argv):
             return cmd_nodeid(argv[2], int(argv[3]), argv[4], int(argv[5]))
         if command == "badnodeid":
             return cmd_badnodeid(argv[2], int(argv[3]))
+        if command == "empty":
+            return cmd_empty(argv[2], int(argv[3]))
         if command == "listen":
             return cmd_listen(int(argv[2]), int(argv[3]))
     except Fault as fault:
