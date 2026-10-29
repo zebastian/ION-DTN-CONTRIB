@@ -1,0 +1,24 @@
+# bprc for the zcl CLA loopback test.  UDPPORT substituted by dotest.
+1
+m heapmax 262144
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+
+# zcli receives the carriers on ipn:1.7.
+a endpoint ipn:1.7 q
+a protocol zcl
+a induct  zcl ipn:1.7 'zcli -r 2000'
+a outduct zcl ipn:1.7 'zclo -w 50 -b 16384 -c 65536'
+
+# UDP carries the carriers.
+a protocol udp
+a induct  udp 127.0.0.1:UDPPORT udpcli
+a outduct udp 127.0.0.1:UDPPORT udpclo
+
+r 'ipnadmin config/loopback_runtime.ipnrc'
+
+# The plan for node 1 egresses via zcl first; udp is attached as a
+# second duct for the carrier route override to name.
+a planduct ipn:1.0 udp 127.0.0.1:UDPPORT
+s

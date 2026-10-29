@@ -1,0 +1,154 @@
+=head1 NAME
+
+zclo - DTN zstd compressing tunnel convergence layer output task
+
+=head1 SYNOPSIS
+
+B<zclo> [B<-w> I<window_ms>] [B<-b> I<flush_bytes>] [B<-c> I<chunk_bytes>]
+[B<-C> I<chunk_ms>] [B<-l> I<level>] [B<-W> I<window_log>]
+[B<-L> I<lifetime>] [B<-p> bulk|std|exp] [B<-D> I<data_label>] I<peer_EID>
+
+=head1 DESCRIPTION
+
+B<zclo> is a background "daemon" task that compresses the bundles queued
+on a "zcl" outduct and sends them to the B<zcli> task that receives on
+I<peer_EID>.  The outduct's name is that endpoint ID.
+
+The bundles are taken in as records of one zstd stream.  The stream is
+cut into I<carriers> - each the payload of an ordinary bundle sent to
+I<peer_EID> - when the oldest pending bundle is I<window_ms> old or
+I<flush_bytes> of bundles are pending.  Every carrier can be decoded as
+soon as it arrives.  The stream is divided into I<chunks>, each one zstd
+frame whose compression history starts empty; a chunk ends at the first
+carrier cut after it has taken in I<chunk_bytes> or has been open
+I<chunk_ms>.  A carrier lost on the way costs the rest of its chunk at
+the receiver, never more.
+
+Each bundle is reported transmitted once the carrier holding it has been
+handed to BP.  If that fails, the open chunk is abandoned and every
+bundle in it that was not yet sent is handed back to ION for
+re-forwarding.
+
+Carriers are sent anonymously with the data label I<data_label>.  Since
+the peer's node is normally reached through this very outduct, a routing
+override must send that label over a real convergence layer (see
+EXAMPLES); a carrier that nevertheless comes back to B<zclo> is dropped
+with a log message rather than wrapped again.  Overrides that name an
+outduct need ION 4.1.4 or later.
+
+B<zclo> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the command text is provided when the "zcl"
+convergence layer protocol outduct is added to the BP database.  The
+task is terminated by B<bpadmin> in response to an 'x' (STOP) command,
+after it has sent what is pending and ended the chunk.
+
+See F<doc/design.md> for the carrier format and the receiver's rules.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-w> I<window_ms>
+
+Longest time a bundle waits before its carrier is cut.  Default 20; 0
+cuts a carrier for every bundle.
+
+=item B<-b> I<flush_bytes>
+
+Cut a carrier as soon as this many bytes of bundles are pending.  Default
+65536.
+
+=item B<-c> I<chunk_bytes>
+
+End the chunk once it has taken in this many bytes of bundles.  Default
+524288.
+
+=item B<-C> I<chunk_ms>
+
+End the chunk once it has been open this long.  Default 5000.
+
+=item B<-l> I<level>
+
+zstd compression level; negative levels are zstd's fast modes.  Default
+3.
+
+=item B<-W> I<window_log>
+
+log2 of the zstd window (10 to 27).  The receiver must accept it: see
+B<zcli -W>.  Default 23 (8 MiB).
+
+=item B<-L> I<lifetime>
+
+Carrier bundle lifetime in seconds.  Default 86400.
+
+=item B<-p> bulk|std|exp
+
+Carrier bundle priority.  Default std.
+
+=item B<-D> I<data_label>
+
+Data label of the carriers.  Default 8020844 (ASCII "zcl").
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<zclo> terminated normally, typically because of a STOP command.
+
+=item "-1"
+
+B<zclo> could not start: bad arguments, BP not running, or no such
+outduct.
+
+=back
+
+=head1 EXAMPLES
+
+Compress all traffic from node 10 to node 20, carrying the carriers over
+LTP:
+
+  # bprc on node 10
+  a protocol zcl
+  a outduct zcl ipn:20.7 'zclo -w 20 -c 262144'
+  r 'ipnadmin node10.ipnrc'
+  a planduct ipn:20.0 ltp 20
+
+  # node10.ipnrc
+  a plan 20 zcl/ipn:20.7
+  a rtovrd 8020844 20 0 20 ltp/20
+
+=head1 FILES
+
+No configuration files are needed.
+
+=head1 ENVIRONMENT
+
+No environment variables apply.
+
+=head1 DIAGNOSTICS
+
+Diagnostics are written to the ION log file F<ion.log>.  On exit B<zclo>
+logs how many bundles and bytes it took in and how many carriers and
+bytes it sent.
+
+=over 4
+
+=item zclo: carrier routed into its own outduct, dropped
+
+A carrier was forwarded to the zcl outduct.  Add the route override for
+the carrier data label.
+
+=item zclo carrier not sent; chunk abandoned.
+
+B<bp_send> failed, usually for lack of storage.  The bundles concerned
+are re-forwarded.
+
+=back
+
+=head1 SEE ALSO
+
+zcli(1), bpadmin(1), bprc(5), ipnrc(5)

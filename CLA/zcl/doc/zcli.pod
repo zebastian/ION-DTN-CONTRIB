@@ -1,0 +1,116 @@
+=head1 NAME
+
+zcli - DTN zstd compressing tunnel convergence layer input task
+
+=head1 SYNOPSIS
+
+B<zcli> [B<-r> I<reorder_ms>] [B<-B> I<max_bundle>] [B<-X> I<max_chunk_bytes>]
+[B<-W> I<window_log_max>] [B<-S> I<max_streams>] I<own_EID>
+
+=head1 DESCRIPTION
+
+B<zcli> is a background "daemon" task that receives the carrier bundles
+B<zclo> sends to I<own_EID>, decompresses them and passes the bundles
+inside to the local BP node as if a neighbor had sent them.  The induct's
+name is that endpoint ID, which must be declared with B<a endpoint>.
+
+Carriers may arrive out of order - LTP sessions complete out of order,
+and routing may reorder - so B<zcli> holds early carriers in a reorder
+buffer until those before them arrive.  Each bundle is passed to BP as
+soon as it has been decompressed.
+
+When a carrier is missing for I<reorder_ms>, or the reorder buffer is
+full, B<zcli> gives it up: the rest of its chunk is discarded and
+decoding continues with the next chunk.  Bundles already delivered from
+that chunk stay delivered; every carrier is checked by CRC-32C before it
+is decoded.
+
+B<zcli> keeps separate state for each sending B<zclo> (each run of one
+picks a random stream ID), so several nodes may send to the same
+endpoint.
+
+B<zcli> is spawned automatically by B<bpadmin> in response to the 's'
+(START) command; the command text is provided when the "zcl"
+convergence layer protocol induct is added to the BP database.  The task
+is terminated by B<bpadmin> in response to an 'x' (STOP) command.
+
+See F<doc/design.md> for the carrier format and the receiver's rules.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-r> I<reorder_ms>
+
+How long a gap may stay open before the carriers missing are given up.
+Default 10000.
+
+=item B<-B> I<max_bundle>
+
+Largest bundle accepted; a longer record makes its chunk corrupt.
+Default 67108864.
+
+=item B<-X> I<max_chunk_bytes>
+
+Most bytes one chunk may decompress to.  Default 1073741824.
+
+=item B<-W> I<window_log_max>
+
+Largest zstd window accepted, as log2 (10 to 31).  Must be at least the
+sender's B<zclo -W>.  Default 23.
+
+=item B<-S> I<max_streams>
+
+Most senders tracked at once; the least recently heard is dropped.
+Default 16.
+
+=back
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<zcli> terminated normally, typically because of a STOP command.
+
+=item "-1"
+
+B<zcli> could not start: bad arguments, BP not running, no such induct,
+or the endpoint is not declared.
+
+=back
+
+=head1 EXAMPLES
+
+  # bprc on node 20
+  a protocol zcl
+  a endpoint ipn:20.7 q
+  a induct zcl ipn:20.7 'zcli -r 5000'
+
+=head1 FILES
+
+No configuration files are needed.
+
+=head1 ENVIRONMENT
+
+No environment variables apply.
+
+=head1 DIAGNOSTICS
+
+Diagnostics are written to the ION log file F<ion.log>.  SIGUSR1, and
+exit, log counters: carriers received, refused (bad), stale or
+duplicate, and dropped undecoded; bundles delivered; chunks completed,
+lost to a gap, and corrupt.
+
+=over 4
+
+=item zcli can't open its endpoint.
+
+I<own_EID> is not declared on this node, or another task has it open.
+
+=back
+
+=head1 SEE ALSO
+
+zclo(1), bpadmin(1), bprc(5)

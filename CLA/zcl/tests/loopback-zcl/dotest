@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# Loopback test for the zcl compressing tunnel CLA.
+#
+# Node 1 sends to itself through zcl: zclo compresses the bundles into
+# carriers addressed to ipn:1.7, a data-label route override sends the
+# carriers over UDP, and zcli decompresses them and hands the bundles
+# back to ION.  Checks delivery, that compression happened, that the
+# carriers took the UDP route, and that a carrier routed back into zcl
+# is dropped rather than wrapped again.
+#
+# Needs the zcl daemons and ION's udpcli/udpclo and bp test tools.
+#
+
+UDP_PORT="${ZCL_UDP_PORT:-4758}"
+CONFIGDIR="./config"
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the zcl CLA (zstd tunnel over UDP) in loopback."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+# Polls for a condition instead of sleeping a fixed span.  $1 is the
+# cap in seconds, the rest the command to try.
+await()
+{
+	local cap="$1"
+	local i
+
+	shift
+	for i in $(seq 1 $((cap * 10))); do
+		"$@" && return 0
+		sleep 0.1
+	done
+
+	return 1
+}
+
+received_file() { [ -f testfile1 ] && cmp -s sendfile testfile1; }
+logged() { grep -q "$1" ion.log 2>/dev/null; }
+
+for t in zcli zclo udpcli udpclo bpsendfile bprecvfile bpdriver bpcounter; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+./cleanup 2>/dev/null
+sleep 1
+
+for f in bprc ipnrc; do
+	sed -e "s|UDPPORT|${UDP_PORT}|g" "${CONFIGDIR}/loopback.$f" \
+		> "${CONFIGDIR}/loopback_runtime.$f"
+done
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+
+if ! await 10 logged "zcli is running" || ! await 10 logged "zclo is running"
+then
+	echo "ERROR: zcl daemons did not start."
+	tail -30 ion.log 2>/dev/null
+	./cleanup
+	exit 1
+fi
+
+# --- Phase 1: one bundle --------------------------------------------------
+echo "Phase 1: a file through the tunnel..."
+head -c 3000 /dev/urandom | base64 > sendfile
+bprecvfile ipn:1.2 & RP=$!
+sleep 1
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+if await 10 received_file; then
+	echo "  PASS: file delivered through zcl."
+else
+	fail "file not delivered through zcl."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+# --- Phase 2: a burst, batched into few carriers ----------------------------
+echo "Phase 2: 200 bundles..."
+bpcounter ipn:1.2 200 > counter.out 2>&1 & CP=$!
+sleep 1
+bpdriver 200 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+await 20 grep -q "bundles received: 200" counter.out
+kill -9 $CP 2>/dev/null; wait $CP 2>/dev/null
+if grep -q "bundles received: 200" counter.out; then
+	echo "  PASS: 200 bundles received."
+else
+	fail "did not receive 200 bundles ($(grep -o 'received: [0-9]*' \
+		counter.out | tail -1))."
+fi
+
+# zcli logs its counters on SIGUSR1.
+pkill -USR1 -x zcli
+await 5 logged "zcli stats"
+STATS=$(grep "zcli stats" ion.log | tail -1)
+echo "  $STATS"
+CARRIERS=$(echo "$STATS" | sed -n 's/.*stats: \([0-9]*\) carriers.*/\1/p')
+BUNDLES=$(echo "$STATS" | sed -n 's/.*; \([0-9]*\) bundles,.*/\1/p')
+if [ -n "$CARRIERS" ] && [ -n "$BUNDLES" ] && [ "$BUNDLES" -ge 201 ] \
+	&& [ "$CARRIERS" -lt "$BUNDLES" ]; then
+	echo "  PASS: $BUNDLES bundles arrived in $CARRIERS carriers over UDP."
+else
+	fail "carriers did not batch bundles (stats: $STATS)."
+fi
+
+if echo "$STATS" | grep -q "0 bad, 0 stale, 0 dropped" \
+	&& echo "$STATS" | grep -q "0 lost, 0 corrupt"; then
+	echo "  PASS: no carrier lost or refused."
+else
+	fail "receiver saw losses: $STATS"
+fi
+
+# --- Phase 3: loop guard ---------------------------------------------------
+echo "Phase 3: carrier routed back into zcl..."
+echo "d ovrd 8020844 1 0" | ipnadmin >/dev/null
+bpsendfile ipn:1.1 ipn:1.2 sendfile
+if await 10 logged "carrier routed into its own outduct"; then
+	echo "  PASS: looping carrier dropped and logged."
+else
+	fail "looping carrier not detected."
+fi
+
+# --- Shutdown: zclo reports compression on exit -----------------------------
+echo "Stopping ION..."
+bpadmin . >/dev/null 2>&1
+await 10 logged "zclo stats"
+CLO=$(grep "zclo stats" ion.log | tail -1)
+echo "  $CLO"
+IN=$(echo "$CLO" | sed -n 's/.*bundles, \([0-9]*\) bytes in.*/\1/p')
+OUT=$(echo "$CLO" | sed -n 's/.*carriers, \([0-9]*\) bytes out.*/\1/p')
+if [ -n "$IN" ] && [ -n "$OUT" ] && [ "$OUT" -lt "$IN" ]; then
+	echo "  PASS: $IN bytes of bundles sent as $OUT bytes of carriers."
+else
+	fail "no compression reported ($CLO)."
+fi
+
+if [ $FAIL -ne 0 ]; then
+	echo "ion.log tail:"
+	tail -30 ion.log
+fi
+
+./cleanup
+exit $FAIL
