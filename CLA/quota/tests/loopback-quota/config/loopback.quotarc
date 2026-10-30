@@ -1,0 +1,4 @@
+# Producer ipn:1.1 is shaped; ipn:1.3 matches no rule.
+1
+a rule cam quota/1 src ipn:1.1
+a quota cam bundles 5/1s

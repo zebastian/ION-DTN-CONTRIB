@@ -9,7 +9,8 @@ bpP.h - ION's private Bundle Protocol header
 --------------------------------------------
 
 bpP.h is an internal header that ION does NOT install to its include
-prefix, yet the CLA sources (mail, mqtt, mysql, quic, tcpv4) require it.
+prefix, yet the CLA sources (mail, mqtt, mysql, quic, quota, tcpv4)
+require it.
 Verbatim copies are kept here so the contributions can be built against
 an *installed* ION without needing an ION source checkout.
 
@@ -35,7 +36,10 @@ every field after them (e.g. BpVdb.plans, which tcpv4cla and quiccli
 read); 4.1.4 grew BpVdb and VPlan, 4.1.0 grew BpVdb, and 4.0.2 shrank
 ClProtocol, which the CLAs allocate.  Where one copy serves several
 releases, those releases differ only in fields of Bundle, which the
-contributions never allocate or read.  When adding support for a new
+contributions never allocate or read - except quotaclo (CLA/quota),
+which reads and rewrites queued bundles and so is right only on the
+releases a copy is taken from: 4.0.1, 4.0.2, 4.1.3s, 4.1.4 and 4.2.0.
+When adding support for a new
 ION release, add its bpP.h as another copy and extend the switch rather
 than editing an existing copy.
 

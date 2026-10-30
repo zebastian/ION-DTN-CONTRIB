@@ -15,6 +15,9 @@ endif
 if ENABLE_CLA_QUIC
 SUBDIRS += CLA/quic
 endif
+if ENABLE_CLA_QUOTA
+SUBDIRS += CLA/quota
+endif
 if ENABLE_CLA_TCPV4
 SUBDIRS += CLA/tcpv4
 endif

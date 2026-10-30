@@ -1,0 +1,125 @@
+=head1 NAME
+
+quotaclo - DTN traffic shaping convergence layer output task
+
+=head1 SYNOPSIS
+
+B<quotaclo> I<target_protocol>/I<target_duct>
+
+=head1 DESCRIPTION
+
+B<quotaclo> is a background "daemon" task that shapes the bundles queued
+on a "quota" outduct and moves those that pass, unchanged, onto the
+outduct I<target_protocol>/I<target_duct>, whose own output task sends
+them.  It matches every bundle against the rules that B<quotaadmin>
+keeps for this duct - by source, destination or previous-hop endpoint -
+and lets it through only while every quota of every matching rule has
+room.  A bundle that matches no rule passes.
+
+Each quota is a token bucket: I<count>/I<timeframe> bytes or bundles,
+refilling continuously, with I<count> as the burst.  A bundle over quota
+stays in this duct's queue, in ION's storage, until it fits; it expires
+there like any queued bundle.  A rule may bound how much it holds and
+name what happens beyond that bound: drop the bundle (with a "traffic
+pared" deletion report when one was requested), stall the whole duct,
+or re-forward the bundle.  A bundle larger than a quota's capacity
+passes once that quota is full, leaving it in debt.
+
+Rule changes take effect at once: B<quotaadmin> wakes B<quotaclo>,
+which reloads its rules and looks at every held bundle again.
+
+B<quotaclo> keeps its quota levels and counters in
+F<quota->I<duct>F<.state> in ION's working directory, written every
+10 seconds, at exit and when B<quotaadmin> asks for them; at start it
+reads them back and refills each quota for the time it was down.
+
+The duct this task serves must be the only duct of its plan, and the
+target duct must be in no plan, or bundles could reach it past the
+quotas.  B<quotaclo> refuses to start when the target is in a plan, is
+another quota duct, or allows smaller bundles than this duct (bundles
+are fragmented to this duct's limit, not the target's).  Add the
+protocol with class 26 ("any"), so that every bundle for the neighbor
+goes through this duct whatever reliability it asks for.
+
+B<quotaclo> is spawned automatically by B<bpadmin> in response to the
+'s' (START) command; the command text is provided when the "quota"
+convergence layer protocol outduct is added to the BP database.  The
+task is terminated by B<bpadmin> in response to an 'x' (STOP) command.
+Held bundles stay queued on the duct while it is stopped.
+
+See F<doc/design.md> for why the shaper works this way.
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+B<quotaclo> terminated normally, typically because of a STOP command.
+
+=item "-1"
+
+B<quotaclo> could not start: bad arguments, BP not running, no such
+outduct, or a target duct that fails the checks above.
+
+=back
+
+=head1 EXAMPLES
+
+Rate limit the producer ipn:7.1 to 1 MB/s on the LTP link to node 20:
+
+  # bprc on node 10
+  a protocol quota 26
+  a outduct ltp 20 ltpclo
+  a outduct quota 20 'quotaclo ltp/20'
+  a plan ipn:20.0
+  a planduct ipn:20.0 quota 20
+  r 'quotaadmin node10.quotarc'
+
+  # node10.quotarc
+  1
+  a rule cam quota/20 src ipn:7.1
+  a quota cam bytes 1M/1s
+
+=head1 FILES
+
+=over 4
+
+=item F<quota->I<duct>F<.state>
+
+Quota levels and counters, in ION's working directory (ionconfig
+B<pathName>, F</tmp> by default).  Set B<pathName> to a directory that
+survives a reboot where long budgets matter.
+
+=back
+
+=head1 ENVIRONMENT
+
+No environment variables apply.
+
+=head1 DIAGNOSTICS
+
+Diagnostics are written to the ION log file F<ion.log>.  On exit
+B<quotaclo> logs how many bundles passed under rules, passed unmatched,
+were dropped and were re-forwarded.
+
+=over 4
+
+=item quotaclo: target duct is attached to a plan
+
+Detach the target from the plan (B<bpadmin> 'd planduct'), and do not
+use the "a plan ipn:N.0 proto/duct" shorthand for it.
+
+=item quotaclo: this duct's max payload length must not exceed the target's
+
+Give the quota duct a max payload length no larger than the target's.
+
+=item quotaclo: no rules (quotaadmin not initialized)
+
+Every bundle passes until B<quotaadmin> '1' creates the rules database.
+
+=back
+
+=head1 SEE ALSO
+
+quotaadmin(1), bpadmin(1), bprc(5)

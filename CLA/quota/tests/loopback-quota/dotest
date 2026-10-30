@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+#
+# Loopback test for the quota shaping CLA.
+#
+# Node 1 sends to itself.  Its plan's only duct is the quota duct;
+# quotaclo hands the bundles that pass to a UDP duct that is in no plan.
+# Producer ipn:1.1 is shaped by rule "cam"; ipn:1.3 matches no rule.
+# Checks that unmatched bundles pass, that the rate holds, that a held
+# backlog does not block other traffic, that a quota change frees the
+# backlog at once, that the hold bound drops, that a reset refills,
+# that the state file is written and read back after a restart, that a
+# stall holds up the duct, and that a target duct in a plan is refused.
+#
+# Needs quotaclo and quotaadmin (installed, or built in this tree) and
+# ION's udpcli/udpclo and bp test tools.
+#
+# Tunables (env overridable):
+#   QUOTA_UDP_PORT   UDP port of the target duct      (default 4759)
+#
+
+UDP_PORT="${QUOTA_UDP_PORT:-4759}"
+UDP_PORT2=$((UDP_PORT + 1))
+CONFIGDIR="./config"
+
+# Prefer the daemons built in this tree.
+BUILT=$(cd ../.. 2>/dev/null && pwd)
+if [ -x "$BUILT/quotaclo" ] && [ -x "$BUILT/quotaadmin" ]; then
+	PATH="$BUILT:$PATH"
+	export PATH
+fi
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing the quota CLA (shaping onto UDP) in loopback."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+# Polls for a condition instead of sleeping a fixed span.  $1 is the
+# cap in seconds, the rest the command to try.
+await()
+{
+	local cap="$1"
+	local i
+
+	shift
+	for i in $(seq 1 $((cap * 10))); do
+		"$@" && return 0
+		sleep 0.1
+	done
+
+	return 1
+}
+
+received_file() { [ -f testfile1 ] && cmp -s sendfile testfile1; }
+logged() { grep -q "$1" ion.log 2>/dev/null; }
+counted() { grep -q "bundles received: $1\$" counter.out 2>/dev/null; }
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
+# Prints "i rule cam" and sets INFO to it.
+info()
+{
+	INFO=$(echo "i rule cam" | quotaadmin)
+}
+
+# Reads one counter of INFO: passed, held, dropped.
+counter()
+{
+	echo "$INFO" | sed -n "s/.*$1 \([0-9]*\) (.*/\1/p"
+}
+
+# Starts bpcounter on ipn:1.2 for $1 bundles.
+start_counter()
+{
+	rm -f counter.out
+	bpcounter ipn:1.2 "$1" > counter.out 2>&1 &
+	CP=$!
+	sleep 1
+}
+
+stop_counter()
+{
+	kill -INT "$CP" 2>/dev/null
+	await 5 sh -c "! kill -0 $CP 2>/dev/null"
+	kill -9 "$CP" 2>/dev/null
+	wait "$CP" 2>/dev/null
+}
+
+received() { sed -n 's/.*bundles received: \([0-9]*\).*/\1/p' counter.out \
+	| tail -1; }
+
+for t in quotaclo quotaadmin udpcli udpclo bpsendfile bprecvfile bpdriver \
+	bpcounter; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+echo "Killing old ION..."
+killm >/dev/null 2>&1
+./cleanup 2>/dev/null
+sleep 1
+
+sed -e "s|UDPPORT|${UDP_PORT}|g" "${CONFIGDIR}/loopback.bprc" \
+	> "${CONFIGDIR}/loopback_runtime.bprc"
+sed -e "s|TESTDIR|$(pwd)|g" "${CONFIGDIR}/loopback.ionconfig" \
+	> "${CONFIGDIR}/loopback_runtime.ionconfig"
+
+echo "Starting ION..."
+ionadmin "${CONFIGDIR}/loopback.ionrc"
+sleep 1
+bpadmin "${CONFIGDIR}/loopback_runtime.bprc"
+if ! quotaadmin "${CONFIGDIR}/loopback.quotarc"; then
+	fail "quotaadmin rejected the rules."
+fi
+
+if ! await 10 logged "quotaclo is running"; then
+	echo "ERROR: quotaclo did not start."
+	tail -30 ion.log 2>/dev/null
+	./cleanup
+	exit 1
+fi
+
+head -c 3000 /dev/urandom | base64 > sendfile
+
+# --- Phase 1: a producer no rule matches ------------------------------------
+echo "Phase 1: unmatched producer..."
+bprecvfile ipn:1.4 & RP=$!
+sleep 1
+bpsendfile ipn:1.3 ipn:1.4 sendfile
+if await 10 received_file; then
+	echo "  PASS: file from ipn:1.3 passed unshaped."
+else
+	fail "file from ipn:1.3 not delivered."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+rm -f testfile*
+
+# --- Phase 2: the rate ----------------------------------------------------
+# 5 bundles per second, burst 5: bpdriver's pilot and 4 bundles go at
+# once, the other 11 at 5/s, so about 2.2 s.
+echo "Phase 2: 15 bundles at 5 bundles/s..."
+start_counter 15
+T0=$(now_ms)
+bpdriver 15 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+await 20 counted 15
+T1=$(now_ms)
+stop_counter
+ELAPSED=$((T1 - T0))
+if [ "$(received)" = 15 ] && [ "$ELAPSED" -ge 1600 ] \
+	&& [ "$ELAPSED" -le 8000 ]; then
+	echo "  PASS: 15 bundles in $ELAPSED ms."
+else
+	fail "rate not held: $(received) bundles in $ELAPSED ms."
+fi
+
+# --- Phase 3: a backlog blocks nobody else; a change frees it ----------------
+echo "Phase 3: backlog at 1 bundle/s..."
+printf 'c quota cam bundles 1/1s\n' | quotaadmin
+start_counter 30
+bpdriver 30 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+sleep 2
+
+bprecvfile ipn:1.4 & RP=$!
+sleep 1
+T0=$(now_ms)
+bpsendfile ipn:1.3 ipn:1.4 sendfile
+if await 5 received_file; then
+	echo "  PASS: ipn:1.3 got through past the backlog in" \
+		"$(( $(now_ms) - T0 )) ms."
+else
+	fail "ipn:1.3 blocked behind the held backlog."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+rm -f testfile*
+
+info
+echo "$INFO" | sed 's/^/  | /'
+HELD=$(counter held)
+if [ -n "$HELD" ] && [ "$HELD" -ge 10 ]; then
+	echo "  PASS: $HELD bundles held."
+else
+	fail "backlog not held (held '$HELD')."
+fi
+
+T0=$(now_ms)
+printf 'c quota cam bundles 1000/1s\n' | quotaadmin
+if await 5 counted 30; then
+	echo "  PASS: raising the quota freed the backlog in" \
+		"$(( $(now_ms) - T0 )) ms."
+else
+	fail "backlog not freed by the change ($(received) of 30)."
+fi
+stop_counter
+
+# --- Phase 4: the hold bound drops -------------------------------------------
+echo "Phase 4: hold 0, 2 bundles/hour, 10 bundles..."
+info
+P0=$(counter passed); D0=$(counter dropped)
+quotaadmin <<EOF
+c rule cam quota/1 src ipn:1.1 hold 0 drop
+d quota cam bundles 1s
+a quota cam bundles 2/1h
+EOF
+start_counter 10
+bpdriver 10 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+sleep 2
+stop_counter
+info
+PASSED=$(( $(counter passed) - P0 ))
+DROPPED=$(( $(counter dropped) - D0 ))
+if [ "$PASSED" -eq 2 ] && [ "$DROPPED" -eq 9 ] && [ "$(received)" -le 1 ]
+then
+	echo "  PASS: 2 passed (the pilot and 1 bundle), 9 dropped."
+else
+	fail "hold bound: $PASSED passed, $DROPPED dropped, $(received)" \
+		"received."
+fi
+
+# --- Phase 5: a reset refills --------------------------------------------------
+echo "Phase 5: reset, then 3 bundles..."
+P0=$(counter passed)
+printf 'r rule cam\n' | quotaadmin
+bpdriver 3 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+sleep 2
+info
+PASSED=$(( $(counter passed) - P0 ))
+if [ "$PASSED" -eq 2 ]; then
+	echo "  PASS: the reset gave 2 bundles again."
+else
+	fail "reset: $PASSED passed."
+fi
+
+# --- Phase 6: the state file -------------------------------------------------
+echo "Phase 6: state file..."
+if grep -q "^b cam bundles 3600 " quota-1.state 2>/dev/null \
+	&& grep -q "^quota-state 1 1 " quota-1.state; then
+	echo "  PASS: quota-1.state holds the bucket."
+else
+	fail "no usable quota-1.state."
+fi
+
+# --- Phase 7: the state survives a restart -----------------------------------
+# The bucket is empty (2 per hour, both spent), so after a restart the
+# next bundles are still over quota.
+echo "Phase 7: quotaclo restart..."
+echo "x outduct quota 1" | bpadmin >/dev/null 2>&1
+await 10 logged "quotaclo duct has ended"
+echo "s outduct quota 1" | bpadmin >/dev/null 2>&1
+await 10 sh -c '[ $(grep -c "quotaclo is running" ion.log) -ge 2 ]'
+info
+P0=$(counter passed); D0=$(counter dropped)
+bpdriver 2 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+sleep 2
+info
+PASSED=$(( $(counter passed) - P0 ))
+DROPPED=$(( $(counter dropped) - D0 ))
+if [ "$P0" -ge 40 ] && [ "$PASSED" -eq 0 ] && [ "$DROPPED" -eq 3 ]; then
+	echo "  PASS: level and counters restored ($P0 passed before)."
+else
+	fail "restart: $P0 passed before, then $PASSED passed, $DROPPED" \
+		"dropped."
+fi
+
+# --- Phase 8: stall holds up the whole duct ----------------------------------
+echo "Phase 8: hold 0 stall..."
+printf 'c rule cam quota/1 src ipn:1.1 hold 0 stall\n' | quotaadmin
+bpdriver 1 ipn:1.1 ipn:1.2 -1000 >/dev/null 2>&1
+sleep 1
+bprecvfile ipn:1.4 & RP=$!
+sleep 1
+bpsendfile ipn:1.3 ipn:1.4 sendfile
+if await 3 received_file; then
+	fail "a stalled duct let ipn:1.3 through."
+else
+	echo "  PASS: ipn:1.3 waits behind the stall."
+fi
+
+printf 'r rule cam\n' | quotaadmin
+if await 5 received_file; then
+	echo "  PASS: the reset ended the stall."
+else
+	fail "stall did not end."
+fi
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+rm -f testfile*
+info
+if [ "$(echo "$INFO" | sed -n 's/.*stalled \([0-9]*\) ms.*/\1/p')" -ge 1000 ]
+then
+	echo "  PASS: stall time counted."
+else
+	fail "stall time not counted: $INFO"
+fi
+
+# --- Phase 9: a target in a plan is refused ----------------------------------
+echo "Phase 9: target duct in a plan..."
+bpadmin <<EOF >/dev/null 2>&1
+a outduct udp 127.0.0.1:$UDP_PORT2 udpclo
+a outduct quota 9 'quotaclo udp/127.0.0.1:$UDP_PORT2'
+EOF
+echo "a plan 9 udp/127.0.0.1:$UDP_PORT2" | ipnadmin >/dev/null 2>&1
+echo "s outduct quota 9" | bpadmin >/dev/null 2>&1
+if await 10 logged "target duct is attached to a plan"; then
+	echo "  PASS: quotaclo refused a bypassable target."
+else
+	fail "quotaclo started on a target in a plan."
+fi
+
+# --- Shutdown -----------------------------------------------------------------
+echo "Stopping ION..."
+bpadmin . >/dev/null 2>&1
+await 10 logged "quotaclo stats"
+CLO=$(grep "quotaclo stats" ion.log | tail -1)
+echo "  $CLO"
+# Since the restart: the ipn:1.3 file, and phase 7's drops.
+if echo "$CLO" | grep -q " 1 unmatched, 3 dropped"; then
+	echo "  PASS: quotaclo accounted for every bundle."
+else
+	fail "unexpected quotaclo stats."
+fi
+
+if [ $FAIL -ne 0 ]; then
+	echo "ion.log tail:"
+	tail -30 ion.log
+fi
+
+./cleanup
+exit $FAIL

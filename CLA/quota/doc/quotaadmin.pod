@@ -1,0 +1,177 @@
+=head1 NAME
+
+quotaadmin - administration of the quota CLA's shaping rules
+
+=head1 SYNOPSIS
+
+B<quotaadmin> [ I<commands_filename> | . ]
+
+=head1 DESCRIPTION
+
+B<quotaadmin> configures the rules by which B<quotaclo> shapes the
+bundles on "quota" outducts.  It reads commands from
+I<commands_filename>, or from standard input when no file is named or
+the name is '.'; at a terminal it prompts for each.  The rules are kept
+in ION's SDR and take effect at once: each change wakes the
+B<quotaclo> of the ducts concerned.
+
+A rule belongs to one quota duct and matches bundles by source
+endpoint, destination endpoint and previous-hop endpoint; the fields
+given are ANDed, and a rule with none matches every bundle on its duct.
+A bundle passes only if every quota of every rule it matches has room,
+and is then charged to all of them.  A bundle that matches no rule
+passes.
+
+=head1 COMMANDS
+
+=over 4
+
+=item B<1>
+
+Initialize the rules database.  Must come first, once per node.
+
+=item B<a rule> I<name> B<quota/>I<duct> [B<src> I<P>] [B<dst> I<P>] [B<prev> I<P>] [B<hold> I<bytes> [B<drop>|B<stall>|B<reforward>]]
+
+Add a rule.  Names are up to 31 of A-Z a-z 0-9 _ . - and unique per
+node.  Without B<hold> the rule holds over-quota bundles without bound;
+with it, a bundle that would take the rule's held bytes past I<bytes>
+is dropped (the default), stalls the duct, or is re-forwarded.
+
+=item B<c rule> I<name> B<quota/>I<duct> ...
+
+Change a rule's duct, fields and hold, as for B<a rule>.  Its quotas and
+their levels are kept.
+
+=item B<d rule> I<name>
+
+Delete a rule.
+
+=item B<a quota> I<rule> B<bytes>|B<bundles> I<count>/I<timeframe>
+
+Add a quota to a rule (up to 8): a token bucket of capacity I<count>
+refilling I<count> per I<timeframe>.  B<1M/1s> and B<60M/60s> have the
+same rate; the second allows a burst of 60 MB.  Bytes are payload
+bytes.
+
+=item B<c quota> I<rule> B<bytes>|B<bundles> I<count>/I<timeframe>
+
+Change the count of the rule's quota of that kind and timeframe; its
+level is kept, clipped to the new capacity.  A different timeframe is a
+different quota: delete and add.
+
+=item B<d quota> I<rule> B<bytes>|B<bundles> I<timeframe>
+
+Delete a quota.
+
+=item B<i rule> I<name>
+
+Print the rule, the level of each quota and the rule's counters, as
+B<quotaclo> reports them; waits up to 3 seconds for a fresh report.
+
+=item B<l rule> [B<quota/>I<duct>]
+
+List the rules, of one duct or all, as the commands that recreate them.
+
+=item B<r rule> I<name>
+
+Reset: every quota of the rule back to full.  Counters are kept.
+
+=item B<e> { B<0> | B<1> }
+
+Echo printed output to the ION log, or not.
+
+=item B<h>, B<?>
+
+Print a summary of the commands.
+
+=item B<v>
+
+Print the version.
+
+=item B<q>
+
+Quit.
+
+=item B<#> I<text>
+
+Comment.
+
+=back
+
+Counts take the suffixes B<k>, B<M> and B<G> (powers of ten);
+timeframes B<s>, B<m>, B<h> and B<d>, up to 366 days.
+
+=head1 EID PATTERNS
+
+=over 4
+
+=item B<*>
+
+Any endpoint.
+
+=item B<ipn:>I<N>B<.>I<S>, B<ipn:>I<N>B<.*>
+
+That endpoint; any service on node I<N>.
+
+=item B<ipn:>I<A>B<->I<B>B<.*>, B<ipn:>I<A>B<->I<B>B<.>I<S>
+
+Nodes I<A> to I<B> inclusive.
+
+=item B<ipn:*.*>, B<ipn:*.>I<S>
+
+Any node.
+
+=item I<prefix>B<*>
+
+Any endpoint whose ID starts with I<prefix>, e.g. B<dtn://host/*>.
+
+=item I<EID>
+
+Exactly that endpoint.
+
+=back
+
+ipn patterns match two-element ipn endpoint IDs; only B<ipn:*.*> also
+matches the three-element form.  A bundle produced on this node has no
+previous hop, so a B<prev> pattern never matches it.
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item "0"
+
+Successful completion, or an interactive session.
+
+=item "1"
+
+A command read from a file or a pipe failed, or B<quotaadmin> could not
+attach to BP.
+
+=back
+
+=head1 EXAMPLES
+
+  1
+  a rule cam quota/20 src ipn:7.* hold 10M drop
+  a quota cam bytes 1M/1s
+  a quota cam bundles 50000/1d
+  a rule gw quota/20 prev ipn:30.0 dst ipn:20-29.*
+  a quota gw bytes 10G/1d
+
+=head1 FILES
+
+No configuration files are needed.
+
+=head1 ENVIRONMENT
+
+No environment variables apply.
+
+=head1 DIAGNOSTICS
+
+Problems with a command are printed as "quotaadmin: ..." with the
+reason.
+
+=head1 SEE ALSO
+
+quotaclo(1), bpadmin(1)

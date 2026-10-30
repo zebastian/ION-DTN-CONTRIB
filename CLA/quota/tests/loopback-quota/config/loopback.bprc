@@ -1,0 +1,20 @@
+# bprc for the quota CLA loopback test.  UDPPORT substituted by dotest.
+1
+m heapmax 262144
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+a endpoint ipn:1.3 q
+a endpoint ipn:1.4 q
+
+# UDP carries everything, but is in no plan: only quotaclo feeds it.
+a protocol udp
+a induct  udp 127.0.0.1:UDPPORT udpcli
+a outduct udp 127.0.0.1:UDPPORT udpclo
+
+# The shaper; class 26 so that every bundle for node 1 takes it.
+a protocol quota 26
+a outduct quota 1 'quotaclo udp/127.0.0.1:UDPPORT'
+
+r 'ipnadmin config/loopback.ipnrc'
+s

@@ -1,0 +1,1 @@
+cam quota/20 src ipn:7.* dst ipn:20-29.* prev ipn:30.0 hold 10M stall
