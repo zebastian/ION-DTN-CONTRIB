@@ -6,7 +6,8 @@ zclo - DTN zstd compressing tunnel convergence layer output task
 
 B<zclo> [B<-w> I<window_ms>] [B<-b> I<flush_bytes>] [B<-c> I<chunk_bytes>]
 [B<-C> I<chunk_ms>] [B<-l> I<level>] [B<-W> I<window_log>]
-[B<-L> I<lifetime>] [B<-p> bulk|std|exp] [B<-D> I<data_label>] I<peer_EID>
+[B<-L> I<lifetime>] [B<-p> bulk|std|exp] B<-T> I<protocol>/I<duct>
+I<peer_EID>
 
 =head1 DESCRIPTION
 
@@ -29,12 +30,18 @@ handed to BP.  If that fails, the open chunk is abandoned and every
 bundle in it that was not yet sent is handed back to ION for
 re-forwarding.
 
-Carriers are sent anonymously with the data label I<data_label>.  Since
-the peer's node is normally reached through this very outduct, a routing
-override must send that label over a real convergence layer (see
-EXAMPLES); a carrier that nevertheless comes back to B<zclo> is dropped
-with a log message rather than wrapped again.  Overrides that name an
-outduct need ION 4.1.4 or later.
+Carriers are sent anonymously.  The peer's node is normally reached
+through this very outduct, so the carriers come back into it; B<zclo>
+moves them, unchanged, onto the outduct I<protocol>/I<duct> given with
+B<-T>, which must be in no plan.  B<zclo> gives this outduct the
+target's max payload length.  Needs ION 4.1.4 or later.
+
+Each carrier lives as long as the bundles inside need, and travels at
+their priority, both read from the bundles (primary block, bundle age
+block, ION's QoS block).  All carriers of a chunk share one lifetime and
+one priority, because the later ones depend on the earlier: a bundle of
+another priority, or one that must outlive carriers already sent, starts
+a new chunk.  An expedited bundle's carrier is cut at once.
 
 B<zclo> is spawned automatically by B<bpadmin> in response to the 's'
 (START) command; the command text is provided when the "zcl"
@@ -79,15 +86,17 @@ B<zcli -W>.  Default 23 (8 MiB).
 
 =item B<-L> I<lifetime>
 
-Carrier bundle lifetime in seconds.  Default 86400.
+Longest carrier lifetime in seconds, and the lifetime assumed for a
+bundle whose own can't be read.  Default 86400.
 
 =item B<-p> bulk|std|exp
 
-Carrier bundle priority.  Default std.
+Carrier priority for bundles without ION's QoS block, e.g. from other
+implementations.  Default std.
 
-=item B<-D> I<data_label>
+=item B<-T> I<protocol>/I<duct>
 
-Data label of the carriers.  Default 8020844 (ASCII "zcl").
+The outduct the carriers go out on.  Required; it must be in no plan.
 
 =back
 
@@ -113,13 +122,12 @@ LTP:
 
   # bprc on node 10
   a protocol zcl
-  a outduct zcl ipn:20.7 'zclo -w 20 -c 262144'
+  a outduct ltp 20 ltpclo
+  a outduct zcl ipn:20.7 'zclo -w 20 -c 262144 -T ltp/20'
   r 'ipnadmin node10.ipnrc'
-  a planduct ipn:20.0 ltp 20
 
   # node10.ipnrc
   a plan 20 zcl/ipn:20.7
-  a rtovrd 8020844 20 0 20 ltp/20
 
 =head1 FILES
 
@@ -132,15 +140,21 @@ No environment variables apply.
 =head1 DIAGNOSTICS
 
 Diagnostics are written to the ION log file F<ion.log>.  On exit B<zclo>
-logs how many bundles and bytes it took in and how many carriers and
-bytes it sent.
+logs how many bundles and bytes it took in, how many carriers and bytes
+it sent, how many chunks a bundle's priority or lifetime ended early,
+the range of carrier lifetimes, and how many carriers it handed off.
 
 =over 4
 
-=item zclo: carrier routed into its own outduct, dropped
+=item zclo: -T duct is attached to a plan; detach it.
 
-A carrier was forwarded to the zcl outduct.  Add the route override for
-the carrier data label.
+bpclm could send bundles to the target directly, past the tunnel.
+Remove it from the plan, and don't use the "a plan N proto/duct"
+shorthand for it.
+
+=item zclo needs -T <protocol>/<duct>
+
+Name the outduct the carriers go out on.
 
 =item zclo carrier not sent; chunk abandoned.
 

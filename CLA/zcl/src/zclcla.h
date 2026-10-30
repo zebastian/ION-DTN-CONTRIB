@@ -9,6 +9,14 @@
 #include <stdlib.h>
 #include <time.h>
 
+/*	zclo moves carriers by reading ION's Bundle record, whose layout
+ *	include/bpP.h knows exactly only for some releases; of those,
+ *	the ones with BP_VERSION are 4.1.4 and later.			*/
+
+#if !defined (BPP_BUNDLE_LAYOUT_EXACT) || !defined (BP_VERSION)
+#error "The zcl CLA needs ION-DTN 4.1.4 or later."
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,6 +36,18 @@ static inline uint64_t	zclNowMs(void)
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
 }
+
+/*	Wall-clock milliseconds since 1970, for bundle expiry.		*/
+static inline uint64_t	zclWallMs(void)
+{
+	struct timespec	ts;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
+}
+
+/*	The DTN epoch, 2000-01-01T00:00:00Z, in Unix milliseconds.	*/
+#define	ZCL_DTN_EPOCH_MS	946684800000ULL
 
 /*	Reads a non-negative decimal option value; -1 if it is not one.	*/
 static inline long long	zclParseCount(const char *text)

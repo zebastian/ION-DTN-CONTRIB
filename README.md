@@ -75,6 +75,9 @@ matching the installed ION at compile time. `configure` reports the version it
 found. See `include/README` for the details and for how to add a further
 release.
 
+`CLA/zcl` is the exception: it needs ION 4.1.4 or later, and configure
+leaves it out on older releases.
+
 Recent ION deprecates the `Object` and `Address` aliases of `SdrObject` and
 `SdrAddress`, defining them only under `ION_USE_LEGACY_ALIASES`. The ION APIs
 these contributions call still speak in `Object` - `bpP.h` itself is written in

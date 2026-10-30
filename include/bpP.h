@@ -16,18 +16,25 @@
  *	  BP_BIBE_REQUESTED              bp.h   4.0.2
  *
  *	and anything older is 4.0.0 or 4.0.1, which share the layouts.
+ *
+ *	Releases that share a copy differ in Bundle.  Where the copy is
+ *	known to be the installed release's own - 4.0.2, 4.1.4, 4.2.0 -
+ *	BPP_BUNDLE_LAYOUT_EXACT is defined, for code that reads Bundle.
  */
 #ifndef BPP_H
 #include "ion.h"
 #include "bp.h"
 #if defined(ION_IPC_ATOMIC_OPAQUE_DEFINED)
 #include "bpP-4.2.0.h"
+#define	BPP_BUNDLE_LAYOUT_EXACT	1
 #elif defined(FQN_MAX_LENGTH)
 #include "bpP-4.1.4.h"
+#define	BPP_BUNDLE_LAYOUT_EXACT	1
 #elif defined(BP_VERSION)
 #include "bpP-4.1.3s.h"		/*	4.1.0 through 4.1.3s.	*/
 #elif defined(BP_BIBE_REQUESTED)
 #include "bpP-4.0.2.h"
+#define	BPP_BUNDLE_LAYOUT_EXACT	1
 #else
 #include "bpP-4.0.1.h"		/*	4.0.0 and 4.0.1.	*/
 #endif

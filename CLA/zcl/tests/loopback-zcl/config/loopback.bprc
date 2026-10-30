@@ -9,16 +9,12 @@ a endpoint ipn:1.2 q
 a endpoint ipn:1.7 q
 a protocol zcl
 a induct  zcl ipn:1.7 'zcli -r 2000'
-a outduct zcl ipn:1.7 'zclo -w 50 -b 16384 -c 65536'
+a outduct zcl ipn:1.7 'zclo -w 2000 -b 16384 -c 65536 -T udp/127.0.0.1:UDPPORT'
 
-# UDP carries the carriers.
+# UDP carries the carriers, but is in no plan: zclo alone feeds it.
 a protocol udp
 a induct  udp 127.0.0.1:UDPPORT udpcli
 a outduct udp 127.0.0.1:UDPPORT udpclo
 
 r 'ipnadmin config/loopback_runtime.ipnrc'
-
-# The plan for node 1 egresses via zcl first; udp is attached as a
-# second duct for the carrier route override to name.
-a planduct ipn:1.0 udp 127.0.0.1:UDPPORT
 s

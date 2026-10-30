@@ -28,12 +28,13 @@ zclcodec_test_LDADD = $(ZSTD_LIBS)
 
 # --- fuzzing --- #
 # tests/fuzz/fuzz_zclrx.c is a libFuzzer entry point over the receive
-# side of src/zclcodec.c.  Under `make check` it is linked with a plain
-# driver that replays its checked-in corpus, so the inputs the fuzzer
-# once found interesting keep passing whatever the compiler.  `make
-# fuzz` builds it with clang's libFuzzer and sanitizers and runs it for
-# FUZZ_TIME seconds, starting from that corpus; anything it finds is
-# left in fuzz-artifacts/.
+# side of src/zclcodec.c, tests/fuzz/fuzz_zclinfo.c one over the bundle
+# inspection zclo does on what other nodes built.  Under `make check`
+# each is linked with a plain driver that replays its checked-in
+# corpus, so the inputs the fuzzer once found interesting keep passing
+# whatever the compiler.  `make fuzz` builds them with clang's
+# libFuzzer and sanitizers and runs each for FUZZ_TIME seconds,
+# starting from that corpus; anything found is left in fuzz-artifacts/.
 
 FUZZ_DIR = $(srcdir)/tests/fuzz
 check_PROGRAMS += fuzz_zclrx_replay
@@ -44,21 +45,35 @@ fuzz_zclrx_replay_CPPFLAGS = -I$(srcdir)/src $(ZSTD_CFLAGS) \
 	-DFUZZ_CORPUS=\"$(FUZZ_DIR)/corpus/zclrx\"
 fuzz_zclrx_replay_LDADD = $(ZSTD_LIBS)
 
+check_PROGRAMS += fuzz_zclinfo_replay
+TESTS += fuzz_zclinfo_replay
+fuzz_zclinfo_replay_SOURCES = tests/fuzz/fuzz_replay.c \
+	tests/fuzz/fuzz_zclinfo.c src/zclcodec.c
+fuzz_zclinfo_replay_CPPFLAGS = -I$(srcdir)/src $(ZSTD_CFLAGS) \
+	-DFUZZ_CORPUS=\"$(FUZZ_DIR)/corpus/zclinfo\"
+fuzz_zclinfo_replay_LDADD = $(ZSTD_LIBS)
+
 FUZZ_CC = clang
 FUZZ_TIME = 60
 FUZZ_JOBS = 4
 FUZZ_CFLAGS = -g -O1 -fsanitize=fuzzer,address,undefined \
 	-fno-sanitize-recover=undefined -I$(srcdir)/src $(ZSTD_CFLAGS)
 
+FUZZ_TARGETS = zclrx zclinfo
+
 fuzz:
-	$(MKDIR_P) fuzz-bin fuzz-corpus/zclrx fuzz-artifacts
-	$(FUZZ_CC) $(FUZZ_CFLAGS) $(FUZZ_DIR)/fuzz_zclrx.c \
-		$(srcdir)/src/zclcodec.c $(ZSTD_LIBS) -o fuzz-bin/fuzz_zclrx
-	@echo "fuzzing zclrx for $(FUZZ_TIME) s..."
-	@fuzz-bin/fuzz_zclrx fuzz-corpus/zclrx $(FUZZ_DIR)/corpus/zclrx \
-		-max_total_time=$(FUZZ_TIME) -fork=$(FUZZ_JOBS) \
-		-max_len=16384 -artifact_prefix=fuzz-artifacts/zclrx- \
-		> fuzz-zclrx.log 2>&1; rc=$$?; tail -1 fuzz-zclrx.log; \
+	$(MKDIR_P) fuzz-bin fuzz-artifacts
+	@rc=0; for t in $(FUZZ_TARGETS); do \
+		$(MKDIR_P) fuzz-corpus/$$t; \
+		$(FUZZ_CC) $(FUZZ_CFLAGS) $(FUZZ_DIR)/fuzz_$$t.c \
+			$(srcdir)/src/zclcodec.c $(ZSTD_LIBS) \
+			-o fuzz-bin/fuzz_$$t || exit 1; \
+		echo "fuzzing $$t for $(FUZZ_TIME) s..."; \
+		fuzz-bin/fuzz_$$t fuzz-corpus/$$t $(FUZZ_DIR)/corpus/$$t \
+			-max_total_time=$(FUZZ_TIME) -fork=$(FUZZ_JOBS) \
+			-max_len=16384 -artifact_prefix=fuzz-artifacts/$$t- \
+			> fuzz-$$t.log 2>&1 || rc=1; tail -1 fuzz-$$t.log; \
+	done; \
 	if ls fuzz-artifacts/* >/dev/null 2>&1; then \
 		echo "fuzzing found inputs, see fuzz-artifacts/:"; \
 		ls fuzz-artifacts; exit 1; \

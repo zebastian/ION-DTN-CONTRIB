@@ -1,4 +1,2 @@
-# Bundles to node 1 are compressed through zcl ...
+# Bundles to node 1 - carriers included - go to the zcl duct.
 a plan 1 zcl/ipn:1.7
-# ... except the carriers (data label 8020844), which go over UDP.
-a rtovrd 8020844 1 0 1 udp/127.0.0.1:UDPPORT

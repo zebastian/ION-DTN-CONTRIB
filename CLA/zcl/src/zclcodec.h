@@ -18,9 +18,6 @@ extern "C" {
 #define	ZCL_FLAG_END		0x01
 #define	ZCL_REC_HDR_LEN		4
 
-/*	The data label carriers are sent with: ASCII "zcl".		*/
-#define	ZCL_DEFAULT_LABEL	8020844
-
 #define	ZCL_DEFAULT_LEVEL	3
 #define	ZCL_DEFAULT_WINDOWLOG	23
 #define	ZCL_MAX_CARRIER		(64 * 1024 * 1024)
@@ -79,6 +76,28 @@ extern int	zclEncCut(ZclEnc *enc, int endChunk,
 
 /*	Drops the open chunk; what is added next starts a new one.	*/
 extern void	zclEncAbort(ZclEnc *enc);
+
+/*	*	*	Bundle inspection	*	*	*	*/
+
+/*	What zclo needs to know of a serialized BPv7 bundle to give its
+ *	carrier a fitting lifetime and priority.			*/
+typedef struct
+{
+	uint64_t	creationMs;	/*	DTN time; 0 = no clock	*/
+	uint64_t	lifetimeMs;
+	int		hasAge;		/*	bundle age block	*/
+	uint64_t	ageMs;
+	int		priority;	/*	ION QoS block; -1 none	*/
+} ZclBundleInfo;
+
+#define	ZCL_QOS_BLOCK		193	/*	ION's QualityOfServiceBlk	*/
+#define	ZCL_AGE_BLOCK		7
+
+/*	Reads the primary block and the age and QoS blocks of 'bundle'.
+ *	0 on success, -1 if it is not a well-formed BPv7 bundle as far
+ *	as read.							*/
+extern int	zclBundleInfo(const unsigned char *bundle, size_t len,
+			ZclBundleInfo *info);
 
 /*	*	*	Receiver	*	*	*	*	*/
 

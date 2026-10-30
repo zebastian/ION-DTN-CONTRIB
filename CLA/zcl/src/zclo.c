@@ -17,9 +17,9 @@ typedef struct
 	long long	chunkMs;	/*	-C			*/
 	int		level;		/*	-l			*/
 	int		windowLog;	/*	-W			*/
-	int		lifetime;	/*	-L			*/
-	int		priority;	/*	-p			*/
-	unsigned int	label;		/*	-D			*/
+	int		lifetime;	/*	-L: the most, and default	*/
+	int		priority;	/*	-p: when a bundle has none	*/
+	char		*target;	/*	-T: carriers go here	*/
 } ZclCloConfig;
 
 typedef struct
@@ -36,16 +36,34 @@ typedef struct
 	uint64_t	firstPendingMs;
 	uint64_t	chunkStartMs;
 
+	/*	Every carrier of a chunk shares one priority and one
+	 *	absolute expiry: a carrier that expired sooner, or was
+	 *	overtaken by a later one, would cost the rest of the
+	 *	chunk.  The expiry may still grow until the first carrier
+	 *	of the chunk is out (chunkFixed).			*/
+
+	int		chunkPriority;
+	uint64_t	chunkExpiryMs;	/*	wall clock		*/
+	int		chunkFixed;
+	int		endRequested;	/*	main asks for END	*/
+	int		flushNow;	/*	expedited bundle in	*/
+
 	int		shutdown;
 	pthread_mutex_t	mtx;
-	pthread_cond_t	cv;
+	pthread_cond_t	cv;		/*	wakes the flusher	*/
+	pthread_cond_t	cvMain;		/*	wakes the main thread	*/
+
+	VOutduct	*target;	/*	handoff mode		*/
 
 	uint64_t	bundles;
 	uint64_t	bytesIn;
 	uint64_t	carriers;
 	uint64_t	bytesOut;
 	uint64_t	chunksAbandoned;
-	uint64_t	loopsRefused;
+	uint64_t	chunksSplit;
+	uint64_t	handedOff;
+	int		lifeMinS;
+	int		lifeMaxS;
 } CloState;
 
 static ReqAttendant	attendant;
@@ -105,7 +123,7 @@ static int	parseCloArgs(int argc, char *argv[], ZclCloConfig *cfg)
 	cfg->windowLog = ZCL_DEFAULT_WINDOWLOG;
 	cfg->lifetime = ZCL_DEFAULT_LIFETIME;
 	cfg->priority = BP_STD_PRIORITY;
-	cfg->label = ZCL_DEFAULT_LABEL;
+	cfg->target = NULL;
 
 	/*	argv[argc - 1] is the duct name appended by ION.	*/
 	for (i = 1; i < argc - 1; i++)
@@ -142,6 +160,13 @@ static int	parseCloArgs(int argc, char *argv[], ZclCloConfig *cfg)
 			continue;
 		}
 
+		if (strcmp(opt, "-T") == 0 && arg)
+		{
+			cfg->target = (char *) arg;
+			i++;
+			continue;
+		}
+
 		v = zclParseCount(arg);
 		if (arg == NULL || v < 0)
 		{
@@ -172,10 +197,6 @@ static int	parseCloArgs(int argc, char *argv[], ZclCloConfig *cfg)
 		else if (strcmp(opt, "-L") == 0 && v >= 1 && v <= 0x7fffffff)
 		{
 			cfg->lifetime = (int) v;
-		}
-		else if (strcmp(opt, "-D") == 0 && v >= 1 && v <= 0xffffffffLL)
-		{
-			cfg->label = (unsigned int) v;
 		}
 		else
 		{
@@ -216,7 +237,8 @@ static uint64_t	newStreamId(void)
 
 /*	*	*	Sending carriers	*	*	*	*/
 
-static int	sendCarrier(CloState *st, unsigned char *carrier, size_t len)
+static int	sendCarrier(CloState *st, unsigned char *carrier, size_t len,
+			int lifetime, int priority)
 {
 	Sdr		sdr = getIonsdr();
 	BpAncillaryData	ancillary;
@@ -240,8 +262,7 @@ static int	sendCarrier(CloState *st, unsigned char *carrier, size_t len)
 	/*	Waits for ZCO space rather than failing for want of it.	*/
 
 	zco = ionCreateZco(ZcoSdrSource, payload, 0, len,
-			(unsigned char) st->cfg->priority, 0, ZcoOutbound,
-			&attendant);
+			(unsigned char) priority, 0, ZcoOutbound, &attendant);
 	if (zco == 0 || zco == (Object) ERROR)
 	{
 		putErrmsg("zclo can't create carrier ZCO.", NULL);
@@ -251,11 +272,12 @@ static int	sendCarrier(CloState *st, unsigned char *carrier, size_t len)
 		return -1;
 	}
 
+	/*	No data label: zclo knows its carriers by destination.	*/
+
 	memset(&ancillary, 0, sizeof ancillary);
-	ancillary.dataLabel = st->cfg->label;
-	if (bp_send(NULL, st->peer, NULL, st->cfg->lifetime,
-			st->cfg->priority, NoCustodyRequested, 0, 0,
-			&ancillary, zco, &newBundle) <= 0)
+	if (bp_send(NULL, st->peer, NULL, lifetime, priority,
+			NoCustodyRequested, 0, 0, &ancillary, zco,
+			&newBundle) <= 0)
 	{
 		putErrmsg("zclo can't send carrier.", st->peer);
 		CHKERR(sdr_begin_xn(sdr));
@@ -319,6 +341,7 @@ static void	abandonChunk(CloState *st)
 	int	n;
 
 	zclEncAbort(&st->enc);
+	st->chunkFixed = 0;
 	st->chunksAbandoned++;
 	zcos = takeZcos(st, &n);
 	if (zcos)
@@ -337,6 +360,9 @@ static void	cutAndSend(CloState *st, int endChunk)
 	unsigned char	*carrier;
 	size_t		len;
 	Object		*zcos;
+	uint64_t	now;
+	int		lifetime;
+	int		priority;
 	int		n;
 	int		rc;
 
@@ -353,9 +379,44 @@ static void	cutAndSend(CloState *st, int endChunk)
 		return;
 	}
 
+	/*	The chunk's expiry is final from its first carrier on.
+	 *	It gets the chunk's longest duration as headroom: bundles
+	 *	of a steady stream, added later, expire later by about as
+	 *	much, and must not each end the chunk.			*/
+
+	if (!st->chunkFixed && !endChunk)
+	{
+		st->chunkExpiryMs += (uint64_t) st->cfg->chunkMs;
+	}
+
+	now = zclWallMs();
+	lifetime = st->chunkExpiryMs > now
+		? (int) ((st->chunkExpiryMs - now + 999) / 1000) : 1;
+	if (lifetime < 1)
+	{
+		lifetime = 1;
+	}
+
+	if (lifetime > st->cfg->lifetime)
+	{
+		lifetime = st->cfg->lifetime;
+	}
+
+	priority = st->chunkPriority;
+	st->chunkFixed = !endChunk;
+	if (st->lifeMinS == 0 || lifetime < st->lifeMinS)
+	{
+		st->lifeMinS = lifetime;
+	}
+
+	if (lifetime > st->lifeMaxS)
+	{
+		st->lifeMaxS = lifetime;
+	}
+
 	zcos = takeZcos(st, &n);
 	pthread_mutex_unlock(&st->mtx);
-	rc = sendCarrier(st, carrier, len);
+	rc = sendCarrier(st, carrier, len, lifetime, priority);
 	free(carrier);
 	pthread_mutex_lock(&st->mtx);
 	if (rc < 0)
@@ -398,6 +459,17 @@ static void	*flushThread(void *parm)
 	pthread_mutex_lock(&st->mtx);
 	while (1)
 	{
+		/*	The main thread has a bundle that must not join
+		 *	the open chunk: end it, then let main go on.	*/
+
+		if (st->endRequested)
+		{
+			cutAndSend(st, 1);
+			st->endRequested = 0;
+			pthread_cond_broadcast(&st->cvMain);
+			continue;
+		}
+
 		if (st->enc.pendingIn == 0)
 		{
 			if (st->shutdown)
@@ -410,7 +482,7 @@ static void	*flushThread(void *parm)
 		}
 
 		now = zclNowMs();
-		if (!st->shutdown
+		if (!st->shutdown && !st->flushNow
 		&& (long long) st->enc.pendingIn < cfg->flushBytes
 		&& now < st->firstPendingMs + cfg->windowMs)
 		{
@@ -418,6 +490,7 @@ static void	*flushThread(void *parm)
 			continue;
 		}
 
+		st->flushNow = 0;
 		end = st->shutdown
 			|| (long long) st->enc.chunkIn >= cfg->chunkBytes
 			|| (long long) (now - st->chunkStartMs) >= cfg->chunkMs;
@@ -465,14 +538,97 @@ static unsigned char	*extractBundle(Sdr sdr, Object bundleZco, size_t *len)
 	return buf;
 }
 
+/*	The priority and wall-clock expiry a bundle asks of its carrier:
+ *	from its QoS block and primary block, else from -p and -L.  The
+ *	expiry is capped at -L from now.				*/
+static void	carrierNeeds(ZclCloConfig *cfg, const unsigned char *bytes,
+			size_t len, int *priority, uint64_t *expiryMs,
+			int *capped)
+{
+	ZclBundleInfo	info;
+	uint64_t	now = zclWallMs();
+	uint64_t	cap = now + (uint64_t) cfg->lifetime * 1000;
+	uint64_t	expiry = cap;
+
+	*priority = cfg->priority;
+	if (zclBundleInfo(bytes, len, &info) == 0)
+	{
+		if (info.priority >= 0)
+		{
+			*priority = info.priority;
+		}
+
+		/*	A creation time means a clock to trust; without
+		 *	one, the age block says how much life is left.	*/
+
+		if (info.creationMs > 0
+		&& info.creationMs < UINT64_MAX / 2
+		&& info.lifetimeMs < UINT64_MAX / 4)
+		{
+			expiry = info.creationMs + ZCL_DTN_EPOCH_MS
+					+ info.lifetimeMs;
+		}
+		else if (info.creationMs == 0 && info.hasAge
+		&& info.lifetimeMs >= info.ageMs
+		&& info.lifetimeMs - info.ageMs < cap - now)
+		{
+			expiry = now + (info.lifetimeMs - info.ageMs);
+		}
+	}
+
+	*capped = expiry >= cap;
+	*expiryMs = *capped ? cap : expiry;
+}
+
 /*	Compresses one bundle into the open chunk.  0 when it is in,
  *	-1 if it must go back to ION.					*/
 static int	addBundle(CloState *st, Object zco, const unsigned char *bytes,
 			size_t len)
 {
 	uint64_t	now = zclNowMs();
+	uint64_t	expiry;
+	int		priority;
+	int		capped;
 
+	carrierNeeds(st->cfg, bytes, len, &priority, &expiry, &capped);
 	pthread_mutex_lock(&st->mtx);
+
+	/*	A bundle of another priority, or one that must outlive
+	 *	carriers already out, starts a chunk of its own.  One
+	 *	whose life -L caps fits any chunk: no carrier lives
+	 *	longer than that anyway.				*/
+
+	if (st->enc.inChunk && (priority != st->chunkPriority
+			|| (st->chunkFixed && !capped
+				&& expiry > st->chunkExpiryMs)))
+	{
+		st->endRequested = 1;
+		st->chunksSplit++;
+		pthread_cond_signal(&st->cv);
+		while (st->endRequested)
+		{
+			pthread_cond_wait(&st->cvMain, &st->mtx);
+		}
+
+		now = zclNowMs();
+	}
+
+	if (!st->enc.inChunk)
+	{
+		st->chunkPriority = priority;
+		st->chunkExpiryMs = expiry;
+		st->chunkFixed = 0;
+	}
+	else if (!st->chunkFixed && expiry > st->chunkExpiryMs)
+	{
+		st->chunkExpiryMs = expiry;
+	}
+
+	if (priority == BP_EXPEDITED_PRIORITY)
+	{
+		st->flushNow = 1;	/*	No window for these.	*/
+	}
+
 	if (st->zcoCount == st->zcoCap)
 	{
 		int	cap = st->zcoCap ? st->zcoCap * 2 : 64;
@@ -520,6 +676,168 @@ static int	addBundle(CloState *st, Object zco, const unsigned char *bytes,
 	return 0;
 }
 
+/*	*	*	Duct handoff	*	*	*	*	*/
+
+/*	The carriers are routed to the peer's node like everything
+ *	else, come back into this duct, and are moved - unchanged -
+ *	onto the target duct (-T), which is in no plan, as bpclm would
+ *	move them (see the quota CLA).				*/
+
+static int	findTarget(CloState *st, char *ductName, const char *expr)
+{
+	Sdr		sdr = getIonsdr();
+	char		protocol[MAX_CL_PROTOCOL_NAME_LEN + 1];
+	char		cloCmd[SDRSTRING_BUFSZ];
+	const char	*slash = strchr(expr, '/');
+	VOutduct	*own;
+	PsmAddress	elt;
+	Outduct		ownDuct;
+	Outduct		target;
+	size_t		len;
+
+	if (slash == NULL || slash == expr || slash[1] == '\0'
+	|| (len = (size_t) (slash - expr)) > MAX_CL_PROTOCOL_NAME_LEN
+	|| strlen(slash + 1) > MAX_CL_DUCT_NAME_LEN)
+	{
+		putErrmsg("zclo: -T takes <protocol>/<duct>.", expr);
+		return -1;
+	}
+
+	memcpy(protocol, expr, len);
+	protocol[len] = '\0';
+	if (strcmp(protocol, ZCL_PROTOCOL) == 0)
+	{
+		putErrmsg("zclo: -T names another zcl duct.", expr);
+		return -1;
+	}
+
+	findOutduct(protocol, (char *) slash + 1, &st->target, &elt);
+	if (elt == 0)
+	{
+		putErrmsg("zclo: no such target duct.", expr);
+		return -1;
+	}
+
+	findOutduct(ZCL_PROTOCOL, ductName, &own, &elt);
+	CHKERR(elt);
+	CHKERR(sdr_begin_xn(sdr));
+	sdr_read(sdr, (char *) &ownDuct, sdr_list_data(sdr, own->outductElt),
+			sizeof(Outduct));
+	sdr_read(sdr, (char *) &target, sdr_list_data(sdr,
+			st->target->outductElt), sizeof(Outduct));
+	cloCmd[0] = '\0';
+	if (ownDuct.cloCmd)
+	{
+		oK(sdr_string_read(sdr, cloCmd, ownDuct.cloCmd));
+	}
+
+	sdr_exit_xn(sdr);
+
+	/*	bpclm could hand bundles to a planned target directly,
+	 *	past the tunnel.					*/
+
+	if (target.planDuctListElt != 0)
+	{
+		putErrmsg("zclo: -T duct is attached to a plan; detach it.",
+				expr);
+		return -1;
+	}
+
+	/*	Carriers reach this duct through bpclm, which fragments
+	 *	them to this duct's limit: it takes the target's.
+	 *	updateOutduct replaces the CLO command too, so it gets
+	 *	back the one it has.					*/
+
+	if (target.maxPayloadLen > 0 && (ownDuct.maxPayloadLen == 0
+			|| ownDuct.maxPayloadLen > target.maxPayloadLen))
+	{
+		if (updateOutduct(ZCL_PROTOCOL, ductName, cloCmd,
+				target.maxPayloadLen) <= 0)
+		{
+			putErrmsg("zclo can't take the target's max payload \
+length.", itoa((int) target.maxPayloadLen));
+			return -1;
+		}
+
+		writeMemoNote("[i] zclo: max payload length set to the \
+target's", itoa((int) target.maxPayloadLen));
+	}
+
+	return 0;
+}
+
+/*	Moves the carriers at the head of this duct's buffer onto the
+ *	target duct, so that bpDequeue gets a bundle to compress.
+ *	Returns 1 if one is at the head, 0 if the buffer is empty, -1
+ *	on failure.  A carrier that slips in between is compressed like
+ *	any bundle: the peer unwraps it twice, which costs bytes, not
+ *	data.								*/
+static int	clearHead(CloState *st, VOutduct *vduct)
+{
+	Sdr		sdr = getIonsdr();
+	Outduct		own;
+	Outduct		target;
+	Object		elt;
+	Object		bundleObj;
+	Bundle		bundle;
+	char		*dest;
+	int		moved = 0;
+	int		result = 0;
+
+	CHKERR(sdr_begin_xn(sdr));
+	sdr_read(sdr, (char *) &own, sdr_list_data(sdr, vduct->outductElt),
+			sizeof(Outduct));
+	sdr_read(sdr, (char *) &target, sdr_list_data(sdr,
+			st->target->outductElt), sizeof(Outduct));
+	while ((elt = sdr_list_first(sdr, own.xmitBuffer)) != 0)
+	{
+		bundleObj = sdr_list_data(sdr, elt);
+		if (bundleObj == 0)
+		{
+			result = 1;	/*	bpDequeue's business.	*/
+			break;
+		}
+
+		sdr_stage(sdr, (char *) &bundle, bundleObj, sizeof(Bundle));
+		readEid(&bundle.destination, &dest);
+		if (dest == NULL || strcmp(dest, st->peer) != 0
+		|| bundle.ductXmitElt != elt)
+		{
+			if (dest)
+			{
+				MRELEASE(dest);
+			}
+
+			result = 1;
+			break;
+		}
+
+		MRELEASE(dest);
+		sdr_list_delete(sdr, elt, NULL, NULL);
+		bundle.ductXmitElt = sdr_list_insert_last(sdr,
+				target.xmitBuffer, bundleObj);
+		sdr_write(sdr, bundleObj, (char *) &bundle, sizeof(Bundle));
+		moved++;
+	}
+
+	if (sdr_end_xn(sdr) < 0)
+	{
+		putErrmsg("zclo can't hand off carriers.", NULL);
+		return -1;
+	}
+
+	if (moved)
+	{
+		st->target->timeOfLastXmit = getCtime();
+		sm_SemGive(st->target->semaphore);
+		pthread_mutex_lock(&st->mtx);
+		st->handedOff += moved;
+		pthread_mutex_unlock(&st->mtx);
+	}
+
+	return result;
+}
+
 /*	*	*	Main thread	*	*	*	*	*/
 
 #if defined (ION_LWT)
@@ -554,13 +872,20 @@ int	main(int argc, char *argv[])
 		PUTS("Usage: zclo [-w window_ms] [-b flush_bytes] "
 			"[-c chunk_bytes] [-C chunk_ms] [-l level] "
 			"[-W window_log] [-L lifetime_s] [-p bulk|std|exp] "
-			"[-D data_label] <peer EID>");
+			"-T protocol/duct <peer EID>");
 		return 0;
 	}
 
 	if (parseCloArgs(largc, largv, &cfg) < 0)
 	{
 		putErrmsg("zclo: invalid arguments.", NULL);
+		return -1;
+	}
+
+	if (cfg.target == NULL)
+	{
+		putErrmsg("zclo needs -T <protocol>/<duct>, the outduct that \
+carries the carriers.", ductName);
 		return -1;
 	}
 
@@ -593,6 +918,13 @@ int	main(int argc, char *argv[])
 	memset(&st, 0, sizeof st);
 	st.cfg = &cfg;
 	st.peer = ductName;
+	if (findTarget(&st, ductName, cfg.target) < 0)
+	{
+		ionStopAttendant(&attendant);
+		writeErrmsgMemos();
+		return -1;
+	}
+
 	if (zclEncInit(&st.enc, cfg.level, cfg.windowLog, newStreamId()) < 0)
 	{
 		putErrmsg("zclo can't create zstd compressor.", NULL);
@@ -605,6 +937,7 @@ int	main(int argc, char *argv[])
 	pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
 	pthread_cond_init(&st.cv, &cattr);
 	pthread_condattr_destroy(&cattr);
+	pthread_cond_init(&st.cvMain, NULL);
 
 	sdr = getIonsdr();
 	oK(zcloSemaphore(&(vduct->semaphore)));
@@ -618,13 +951,13 @@ int	main(int argc, char *argv[])
 	}
 
 	{
-		char	memoBuf[512];
+		char	memoBuf[600];
 
 		isprintf(memoBuf, sizeof(memoBuf),
 			"[i] zclo is running, peer '%s', window %d ms / %lld "
-			"bytes, chunk %lld bytes / %lld ms, level %d, label %u.",
-			ductName, cfg.windowMs, cfg.flushBytes, cfg.chunkBytes,
-			cfg.chunkMs, cfg.level, cfg.label);
+			"bytes, chunk %lld bytes / %lld ms, level %d, carriers "
+			"handed to %s.", ductName, cfg.windowMs, cfg.flushBytes,
+			cfg.chunkBytes, cfg.chunkMs, cfg.level, cfg.target);
 		writeMemo(memoBuf);
 	}
 
@@ -632,6 +965,28 @@ int	main(int argc, char *argv[])
 	{
 		unsigned char	*bytes;
 		size_t		len;
+		int		head;
+
+		/*	Carriers at the head go to the target, so that
+		 *	bpDequeue gets a bundle to compress.		*/
+
+		head = clearHead(&st, vduct);
+		if (head < 0)
+		{
+			break;
+		}
+
+		if (head == 0)		/*	Empty: wait for bpclm.	*/
+		{
+			if (sm_SemTake(vduct->semaphore) < 0)
+			{
+				putErrmsg("zclo can't take duct semaphore.",
+						ductName);
+				break;
+			}
+
+			continue;
+		}
 
 		if (bpDequeue(vduct, &bundleZco, &ancillaryData, -1) < 0)
 		{
@@ -648,27 +1003,6 @@ int	main(int argc, char *argv[])
 
 		if (bundleZco == 1)	/*	Got a corrupt bundle.	*/
 		{
-			continue;
-		}
-
-		/*	A carrier routed back into the tunnel would be
-		 *	wrapped again, and again: the route override for
-		 *	the carrier label is missing.  Drop it.		*/
-
-		if (ancillaryData.dataLabel == cfg.label)
-		{
-			pthread_mutex_lock(&st.mtx);
-			st.loopsRefused++;
-			pthread_mutex_unlock(&st.mtx);
-			writeMemoNote("[?] zclo: carrier routed into its own \
-outduct, dropped; add a route override for the carrier label",
-					itoa(cfg.label));
-			if (bpHandleXmitSuccess(bundleZco) < 0)
-			{
-				putErrmsg("Can't handle xmit success.", NULL);
-				break;
-			}
-
 			continue;
 		}
 
@@ -702,13 +1036,17 @@ outduct, dropped; add a route override for the carrier label",
 		isprintf(memoBuf, sizeof(memoBuf),
 			"[i] zclo stats: %llu bundles, %llu bytes in; %llu "
 			"carriers, %llu bytes out; %llu chunks abandoned, "
-			"%llu looped carriers dropped.",
+			"%llu chunks split, "
+			"carrier lifetime %d to %d s, %llu carriers handed "
+			"off.",
 			(unsigned long long) st.bundles,
 			(unsigned long long) st.bytesIn,
 			(unsigned long long) st.carriers,
 			(unsigned long long) st.bytesOut,
 			(unsigned long long) st.chunksAbandoned,
-			(unsigned long long) st.loopsRefused);
+			(unsigned long long) st.chunksSplit,
+			st.lifeMinS, st.lifeMaxS,
+			(unsigned long long) st.handedOff);
 		writeMemo(memoBuf);
 	}
 
@@ -720,6 +1058,7 @@ outduct, dropped; add a route override for the carrier label",
 	zclEncFree(&st.enc);
 	pthread_mutex_destroy(&st.mtx);
 	pthread_cond_destroy(&st.cv);
+	pthread_cond_destroy(&st.cvMain);
 	ionStopAttendant(&attendant);
 	writeErrmsgMemos();
 	writeMemo("[i] zclo duct has ended.");

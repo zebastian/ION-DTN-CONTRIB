@@ -39,9 +39,12 @@ releases, those releases differ only in fields of Bundle, which the
 contributions never allocate or read - except quotaclo (CLA/quota),
 which reads and rewrites queued bundles and so is right only on the
 releases a copy is taken from: 4.0.1, 4.0.2, 4.1.3s, 4.1.4 and 4.2.0.
-When adding support for a new
-ION release, add its bpP.h as another copy and extend the switch rather
-than editing an existing copy.
+Of those, the switch can tell 4.0.2, 4.1.4 and 4.2.0 from the releases
+that share their copy's macros, and defines BPP_BUNDLE_LAYOUT_EXACT for
+them; the zcl CLA, whose zclo reads Bundle to hand carriers on, is
+built only on 4.1.4 and later.  When adding support for a new ION release, add its bpP.h as
+another copy and extend the switch rather than editing an existing
+copy.
 
 compat/ - headers ION forgot to install
 ---------------------------------------

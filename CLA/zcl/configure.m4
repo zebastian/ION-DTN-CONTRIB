@@ -5,6 +5,19 @@ AC_ARG_ENABLE([cla-zcl],
   [enable_cla_zcl=$enableval], [enable_cla_zcl=])
 test -z "$enable_cla_zcl" && enable_cla_zcl=$contrib_default
 
+# zcl reads ION's Bundle record and needs 4.1.4 or later, the first
+# release to install ion.pc; elsewhere it is left out of --enable-all.
+AS_IF([test "x$enable_cla_zcl" = xyes],
+  [zcl_ion_ok=no
+   AS_IF([test -r "${ion_prefix}/lib/pkgconfig/ion.pc"],
+     [AS_VERSION_COMPARE([$ion_version], [4.1.4], [], [zcl_ion_ok=yes],
+        [zcl_ion_ok=yes])])
+   AS_IF([test "x$zcl_ion_ok" = xno],
+     [AS_IF([test "x$enable_all" = xyes],
+        [AC_MSG_WARN([ION $ion_version is older than 4.1.4; not building CLA/zcl])
+         enable_cla_zcl=no],
+        [AC_MSG_ERROR([CLA/zcl needs ION 4.1.4 or later (found $ion_version).])])])])
+
 AS_IF([test "x$enable_cla_zcl" = xyes], [
   contrib_selected=yes
   AC_CHECK_PROG([PKG_CONFIG], [pkg-config], [pkg-config], [no])

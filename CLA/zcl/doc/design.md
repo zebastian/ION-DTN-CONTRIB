@@ -13,9 +13,9 @@ app -> bp_send -> ipnfw --(plan B: zcl/ipn:B.7)--> zclo
                                                      | window / byte cap
                                                      | zstd stream
                                                      v
-                                    bp_send(ipn:B.7, label L) carrier
+                                    bp_send(ipn:B.7) carrier
                                                      |
-                     (rtovrd L -> ltp/B)  ltpclo --- any CLA(s), any hops ---
+       (back into zclo, moved to ltp/B)   ltpclo --- any CLA(s), any hops ---
                                                                    |
                                                     ipn:B.7 <- bp_receive
                                                        zcli
@@ -48,21 +48,45 @@ history catches.
 ### Keeping carriers out of the tunnel
 
 The carrier's destination (`ipn:B.7`) is on node B, whose egress plan is
-the zcl duct itself; plain routing would feed carriers back into zclo.
-Carriers therefore carry a data label (default `8020844`, ASCII "zcl"),
-and a routing override sends that label over the real duct:
+the zcl duct itself, so carriers are routed into the zcl duct like
+everything else.  Before each `bpDequeue`, zclo looks at the head of its
+duct's buffer: a bundle addressed to the peer (`ipn:B.7`) is a carrier,
+and zclo moves it, unchanged, onto the target duct (`-T`) - unlinks it,
+appends it to the target's `xmitBuffer`, sets `bundle.ductXmitElt`, then
+gives the target's semaphore, exactly as bpclm hands a bundle to a duct.
+The target is in no plan, so bpclm can never pick it directly; zclo
+refuses a target that is.  `bpDequeue` finds the neighbor's plan through
+the bundle's `proxNodeEid`, not the duct, and every outduct's CLO is
+started whether planned or not, so the target works as usual (the quota
+CLA relies on the same; see its design).
 
 ```
+# bprc on A
+a outduct ltp B ltpclo                  # in no plan
+a outduct zcl ipn:B.7 'zclo -T ltp/B'
 # ipnrc on A
-a plan B zcl/ipn:B.7                    # everything to B is compressed
-a rtovrd 8020844 B 0 B ltp/B            # except the carriers themselves
-# bprc on A: make ltp/B a duct of plan B as well
-a planduct ipn:B.0 ltp B
+a plan B zcl/ipn:B.7                    # everything to B, carriers too
 ```
 
-The duct named in an override is honored by `bpclm` from ION 4.1.4
-on.  zclo refuses (and drops, with a memo) a carrier that reaches its own
-outduct, so a configuration mistake ends in a log line, not in a loop.
+Carriers reach zclo through bpclm, which fragments them to the zcl
+duct's max payload length; zclo gives that duct the target's.  A carrier
+that slips into `bpDequeue` between the look and the dequeue is
+compressed like any bundle; B then unwraps it twice, which costs bytes,
+not data.  The carrier cut when zclo stops waits in the duct for the
+next zclo.
+
+Reading the `Bundle` record needs the installed release's own layout,
+which `include/bpP.h` vouches for on 4.0.2, 4.1.4 and 4.2.0
+(`BPP_BUNDLE_LAYOUT_EXACT`); zcl requires 4.1.4 or later, and configure
+and `zclcla.h` enforce it.
+
+Earlier versions routed carriers by a data label and a routing override
+instead.  That needed the override's duct expression (ION 4.1.4 or
+later anyway), a loop guard for a missing override, and a label that is
+not local: ION serializes it into its QoS extension block and every node
+that receives the carrier adopts it, so tunnels sharing a label could
+capture each other's carriers on multi-hop paths.  Handoff needs none of
+that.
 
 ## Wire format
 
@@ -123,8 +147,8 @@ it has taken in `-c` bytes or has been open `-C` ms.
   ZCO and appends it as a record to the open chunk
   (`ZSTD_compressStream2(ZSTD_e_continue)`).
 * A flusher thread applies the window: it cuts a carrier, sends it with
-  `bp_send` (anonymous source, label L, configured lifetime and priority),
-  and then reports every bundle in that carrier to ION with
+  `bp_send` (anonymous source, no label, the chunk's lifetime and
+  priority), and then reports every bundle in that carrier to ION with
   `bpHandleXmitSuccess`.  From that point the carrier is BP's
   responsibility, as with BIBE without custody.
 * If `bp_send` fails, the receiver can no longer decode the rest of the
@@ -136,6 +160,37 @@ it has taken in `-c` bytes or has been open `-C` ms.
 
 stream_id is random per zclo run, so a restarted zclo is a new stream to
 the receiver and chunk numbering may begin at 0 again.
+
+### Carrier lifetime and priority
+
+zclo reads what it needs from the serialized bundle it already holds
+(`zclBundleInfo`, plain CBOR, so on every release): the creation time
+and lifetime from the primary block, the bundle age block, and the
+priority from ION's QoS extension block (type 193; ION's class of
+service is the bundle's priority).  A bundle's expiry is creation time
+plus lifetime; with no clock (creation time 0) it is now plus lifetime
+minus age; unknown, it is now plus `-L`.  Expiries are capped at `-L`
+from now.  A bundle without a QoS block gets `-p`.
+
+A carrier cannot simply take its own bundles' values: later carriers of
+a chunk depend on the earlier ones, so an earlier carrier that expired
+sooner, or a later one sent at higher priority that overtook it, would
+cost the rest of the chunk.  Every carrier of a chunk therefore shares
+one priority and one absolute expiry:
+
+* The chunk takes its first bundle's priority; a bundle of another
+  priority ends the chunk and starts its own.
+* The chunk's expiry is the latest of its bundles' while nothing of it
+  is sent; with the first carrier it is fixed, plus the chunk's longest
+  duration (`-C`) as headroom, so that a steady stream of bundles with
+  one lifetime - each expiring a little later - does not end the chunk
+  at every carrier.  A bundle that must outlive that ends the chunk; one
+  capped by `-L` fits any chunk.
+* An expedited bundle cuts its carrier at once instead of waiting for
+  the window.
+
+Ending a chunk for a bundle is asked of the flusher thread, which alone
+cuts carriers, so carriers leave in order; the main thread waits for it.
 
 ## Receiver (zcli)
 
@@ -217,10 +272,10 @@ data; account for it in LTP's timers if it is large.
 
 ## Not done (yet)
 
-* The carrier lifetime is a fixed `-l`; it is not derived from the inner
-  bundles' remaining lifetimes.
-* Bundle priority is not visible to a CLO through `bpDequeue`, so
-  expedited bundles wait for the window like any other.
+* Traffic that changes priority often ends chunks often and compresses
+  less; a chunk per priority class, open side by side, would avoid it at
+  the cost of a stream per class.
+* Bundles from implementations without ION's QoS block travel at `-p`.
 * No custody on carriers; run it over a reliable CL, or use BP custody
   on the path, when loss matters.
 * Compression happens after BPSec: encrypted payloads do not compress.

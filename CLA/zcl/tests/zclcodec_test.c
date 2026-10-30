@@ -504,9 +504,201 @@ static void	testAbort(void)
 	zclEncFree(&enc);
 }
 
+/*	*	*	Bundle inspection	*	*	*	*/
+
+/*	A tiny CBOR writer for building test bundles.			*/
+typedef struct
+{
+	unsigned char	b[512];
+	size_t		n;
+} Buf;
+
+static void	put(Buf *w, unsigned char c)
+{
+	if (w->n < sizeof w->b)
+	{
+		w->b[w->n++] = c;
+	}
+}
+
+static void	head(Buf *w, int major, uint64_t v)
+{
+	int	bytes;
+	int	i;
+
+	if (v < 24)
+	{
+		put(w, (unsigned char) ((major << 5) | v));
+		return;
+	}
+
+	bytes = v < 0x100 ? 1 : v < 0x10000 ? 2 : v < 0x100000000ULL ? 4 : 8;
+	put(w, (unsigned char) ((major << 5)
+			| (bytes == 1 ? 24 : bytes == 2 ? 25 : bytes == 4 ? 26
+			: 27)));
+	for (i = bytes - 1; i >= 0; i--)
+	{
+		put(w, (unsigned char) (v >> (8 * i)));
+	}
+}
+
+static void	ipnEid(Buf *w, uint64_t node, uint64_t service)
+{
+	head(w, 4, 2);
+	head(w, 0, 2);
+	head(w, 4, 2);
+	head(w, 0, node);
+	head(w, 0, service);
+}
+
+/*	Appends a canonical block with 'data' as its content.		*/
+static void	block(Buf *w, uint64_t type, uint64_t number, const Buf *data,
+			int crc)
+{
+	size_t	i;
+
+	head(w, 4, crc ? 6 : 5);
+	head(w, 0, type);
+	head(w, 0, number);
+	head(w, 0, 0);
+	head(w, 0, crc ? 1 : 0);
+	head(w, 2, data->n);
+	for (i = 0; i < data->n; i++)
+	{
+		put(w, data->b[i]);
+	}
+
+	if (crc)
+	{
+		head(w, 2, 2);
+		put(w, 0xab);
+		put(w, 0xcd);
+	}
+}
+
+/*	A bundle from ipn:1.1 to ipn:20.1: primary block (with CRC and
+ *	fragment fields when asked), then the given blocks, a payload
+ *	and the break.							*/
+static void	bundle(Buf *w, uint64_t creation, uint64_t lifetime,
+			int fragment, int ageMs, int priority)
+{
+	Buf	data;
+
+	memset(w, 0, sizeof *w);
+	put(w, 0x9f);
+	head(w, 4, 8 + (fragment ? 2 : 0) + 1);
+	head(w, 0, 7);
+	head(w, 0, fragment ? 1 : 0);
+	head(w, 0, 1);			/*	CRC-16		*/
+	ipnEid(w, 20, 1);
+	ipnEid(w, 1, 1);
+	ipnEid(w, 1, 1);
+	head(w, 4, 2);
+	head(w, 0, creation);
+	head(w, 0, 42);
+	head(w, 0, lifetime);
+	if (fragment)
+	{
+		head(w, 0, 1000);
+		head(w, 0, 5000);
+	}
+
+	head(w, 2, 2);
+	put(w, 0x12);
+	put(w, 0x34);
+	if (ageMs >= 0)
+	{
+		memset(&data, 0, sizeof data);
+		head(&data, 0, (uint64_t) ageMs);
+		block(w, ZCL_AGE_BLOCK, 2, &data, 0);
+	}
+
+	if (priority >= 0)
+	{
+		memset(&data, 0, sizeof data);
+		head(&data, 4, 4);
+		head(&data, 0, 0);
+		head(&data, 0, (uint64_t) priority);
+		head(&data, 0, 0);
+		head(&data, 0, 8020844);
+		block(w, ZCL_QOS_BLOCK, 3, &data, 1);
+	}
+
+	memset(&data, 0, sizeof data);
+	put(&data, 'h');
+	put(&data, 'i');
+	block(w, 1, 1, &data, 0);
+	put(w, 0xff);
+}
+
+static void	testBundleInfo(void)
+{
+	ZclBundleInfo	info;
+	Buf		w;
+	size_t		n;
+
+	bundle(&w, 815000000000ULL, 3600000, 0, -1, 2);
+	CHECK(zclBundleInfo(w.b, w.n, &info) == 0, "plain bundle");
+	CHECK(info.creationMs == 815000000000ULL, "creation time");
+	CHECK(info.lifetimeMs == 3600000, "lifetime");
+	CHECK(!info.hasAge, "no age block");
+	CHECK(info.priority == 2, "QoS priority");
+
+	bundle(&w, 815000000000ULL, 86400000ULL * 400, 1, -1, -1);
+	CHECK(zclBundleInfo(w.b, w.n, &info) == 0, "fragment");
+	CHECK(info.lifetimeMs == 86400000ULL * 400, "long lifetime");
+	CHECK(info.priority == -1, "no QoS block");
+
+	bundle(&w, 0, 60000, 0, 5000, 0);
+	CHECK(zclBundleInfo(w.b, w.n, &info) == 0, "no clock");
+	CHECK(info.creationMs == 0 && info.hasAge && info.ageMs == 5000,
+			"age block");
+	CHECK(info.priority == 0, "bulk");
+
+	/*	Anything cut short, or not a bundle, is refused.	*/
+
+	bundle(&w, 815000000000ULL, 3600000, 0, 5000, 1);
+	for (n = 0; n < w.n; n++)
+	{
+		if (zclBundleInfo(w.b, n, &info) == 0)
+		{
+			CHECK(0, "truncated bundle accepted");
+			break;
+		}
+	}
+
+	w.b[0] = 0x9e;
+	CHECK(zclBundleInfo(w.b, w.n, &info) < 0, "not an indefinite array");
+	bundle(&w, 815000000000ULL, 3600000, 0, -1, -1);
+	w.b[2] = 6;			/*	Version 6.	*/
+	CHECK(zclBundleInfo(w.b, w.n, &info) < 0, "BPv6 refused");
+	CHECK(zclBundleInfo(NULL, 0, &info) < 0, "nothing");
+
+	/*	A QoS block that is not ION's shape is ignored.	*/
+
+	{
+		Buf	data;
+
+		memset(&w, 0, sizeof w);
+		bundle(&w, 815000000000ULL, 3600000, 0, -1, -1);
+		w.n--;			/*	Drop the break.	*/
+		memset(&data, 0, sizeof data);
+		head(&data, 4, 4);
+		head(&data, 0, 0);
+		head(&data, 0, 9);	/*	No such priority.	*/
+		head(&data, 0, 0);
+		head(&data, 0, 0);
+		block(&w, ZCL_QOS_BLOCK, 3, &data, 0);
+		put(&w, 0xff);
+		CHECK(zclBundleInfo(w.b, w.n, &info) == 0
+				&& info.priority == -1, "odd QoS ignored");
+	}
+}
+
 int	main(void)
 {
 	testHeader();
+	testBundleInfo();
 	testRoundTrip();
 	testReorder();
 	testLoss();

@@ -355,6 +355,350 @@ void	zclEncAbort(ZclEnc *enc)
 	enc->pendingIn = 0;
 }
 
+/*	*	*	Bundle inspection	*	*	*	*/
+
+/*	Just enough CBOR (RFC 8949) to walk a BPv7 bundle: item heads,
+ *	and skipping whatever is not looked at.  Every read is bounded
+ *	by the end of the input; nesting by CBOR_MAX_DEPTH.		*/
+
+#define	CBOR_MAX_DEPTH	16
+#define	CBOR_INDEFINITE	(-1)
+
+typedef struct
+{
+	const unsigned char	*p;
+	const unsigned char	*end;
+} Cbor;
+
+/*	Reads one item head: major type, and argument or length.
+ *	*indefinite is set for an indefinite length (and for a break,
+ *	major 7).  -1 on a malformed or truncated head.			*/
+static int	cborHead(Cbor *c, int *major, uint64_t *arg, int *indefinite)
+{
+	unsigned char	ib;
+	int		ai;
+	int		n;
+	int		i;
+
+	if (c->p >= c->end)
+	{
+		return -1;
+	}
+
+	ib = *c->p++;
+	*major = ib >> 5;
+	ai = ib & 0x1f;
+	*indefinite = 0;
+	if (ai < 24)
+	{
+		*arg = (uint64_t) ai;
+		return 0;
+	}
+
+	if (ai == 31)
+	{
+		if (*major < 2 || *major == 6)
+		{
+			return -1;
+		}
+
+		*indefinite = 1;
+		*arg = 0;
+		return 0;
+	}
+
+	if (ai > 27)
+	{
+		return -1;
+	}
+
+	n = 1 << (ai - 24);
+	if (c->end - c->p < n)
+	{
+		return -1;
+	}
+
+	*arg = 0;
+	for (i = 0; i < n; i++)
+	{
+		*arg = (*arg << 8) | *c->p++;
+	}
+
+	return 0;
+}
+
+static int	cborSkip(Cbor *c, int depth);
+
+/*	Skips the content of an item whose head has been read.		*/
+static int	cborSkipBody(Cbor *c, int major, uint64_t arg, int indefinite,
+			int depth)
+{
+	uint64_t	i;
+
+	if (depth > CBOR_MAX_DEPTH)
+	{
+		return -1;
+	}
+
+	switch (major)
+	{
+	case 0:
+	case 1:
+	case 7:
+		return indefinite ? -1 : 0;	/*	Lone break: bad.	*/
+
+	case 2:
+	case 3:
+		if (indefinite)
+		{
+			for (;;)		/*	Definite chunks.	*/
+			{
+				int		m;
+				uint64_t	a;
+				int		ind;
+
+				if (cborHead(c, &m, &a, &ind) < 0)
+				{
+					return -1;
+				}
+
+				if (m == 7 && ind)
+				{
+					return 0;
+				}
+
+				if (m != major || ind
+				|| a > (uint64_t) (c->end - c->p))
+				{
+					return -1;
+				}
+
+				c->p += a;
+			}
+		}
+
+		if (arg > (uint64_t) (c->end - c->p))
+		{
+			return -1;
+		}
+
+		c->p += arg;
+		return 0;
+
+	case 4:
+	case 5:
+		if (indefinite)
+		{
+			for (;;)
+			{
+				if (c->p >= c->end)
+				{
+					return -1;
+				}
+
+				if (*c->p == 0xff)
+				{
+					c->p++;
+					return 0;
+				}
+
+				if (cborSkip(c, depth + 1) < 0
+				|| (major == 5 && cborSkip(c, depth + 1) < 0))
+				{
+					return -1;
+				}
+			}
+		}
+
+		/*	Each item takes at least one byte, which bounds a
+		 *	length a peer could inflate.			*/
+
+		if (arg > (uint64_t) (c->end - c->p))
+		{
+			return -1;
+		}
+
+		for (i = 0; i < arg * (major == 5 ? 2 : 1); i++)
+		{
+			if (cborSkip(c, depth + 1) < 0)
+			{
+				return -1;
+			}
+		}
+
+		return 0;
+
+	default:			/*	6: tag, then one item.	*/
+		return cborSkip(c, depth + 1);
+	}
+}
+
+static int	cborSkip(Cbor *c, int depth)
+{
+	int		major;
+	uint64_t	arg;
+	int		indefinite;
+
+	if (cborHead(c, &major, &arg, &indefinite) < 0)
+	{
+		return -1;
+	}
+
+	return cborSkipBody(c, major, arg, indefinite, depth);
+}
+
+static int	cborUint(Cbor *c, uint64_t *value)
+{
+	int	major;
+	int	indefinite;
+
+	if (cborHead(c, &major, value, &indefinite) < 0 || major != 0)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+/*	A definite array head of n items, n within [min, max].		*/
+static int	cborArray(Cbor *c, uint64_t min, uint64_t max, uint64_t *n)
+{
+	int	major;
+	int	indefinite;
+
+	if (cborHead(c, &major, n, &indefinite) < 0 || major != 4
+	|| indefinite || *n < min || *n > max)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+/*	The data of an age block: one unsigned integer.			*/
+static void	readAge(const unsigned char *data, size_t len,
+			ZclBundleInfo *info)
+{
+	Cbor	c;
+
+	c.p = data;
+	c.end = data + len;
+	if (cborUint(&c, &info->ageMs) == 0)
+	{
+		info->hasAge = 1;
+	}
+}
+
+/*	The data of ION's QoS block: [flags, class of service, ordinal,
+ *	data label]; ION's class of service is the bundle's priority.	*/
+static void	readQos(const unsigned char *data, size_t len,
+			ZclBundleInfo *info)
+{
+	Cbor		c;
+	uint64_t	n;
+	uint64_t	flags;
+	uint64_t	cos;
+
+	c.p = data;
+	c.end = data + len;
+	if (cborArray(&c, 4, 4, &n) == 0 && cborUint(&c, &flags) == 0
+	&& cborUint(&c, &cos) == 0 && cos <= 2)
+	{
+		info->priority = (int) cos;
+	}
+}
+
+int	zclBundleInfo(const unsigned char *bundle, size_t len,
+		ZclBundleInfo *info)
+{
+	Cbor		c;
+	uint64_t	n;
+	uint64_t	v;
+	uint64_t	i;
+	int		k;
+
+	memset(info, 0, sizeof *info);
+	info->priority = -1;
+	if (bundle == NULL || len < 2 || bundle[0] != 0x9f)
+	{
+		return -1;	/*	A bundle is an indefinite array.	*/
+	}
+
+	c.p = bundle + 1;
+	c.end = bundle + len;
+
+	/*	Primary block: version, flags, CRC type, destination,
+	 *	source, report-to, creation timestamp, lifetime, then
+	 *	fragment fields and CRC as the flags and CRC type say.	*/
+
+	if (cborArray(&c, 8, 11, &n) < 0 || cborUint(&c, &v) < 0 || v != 7)
+	{
+		return -1;
+	}
+
+	for (k = 0; k < 5; k++)		/*	flags .. report-to	*/
+	{
+		if (cborSkip(&c, 0) < 0)
+		{
+			return -1;
+		}
+	}
+
+	if (cborArray(&c, 2, 2, &v) < 0 || cborUint(&c, &info->creationMs) < 0
+	|| cborUint(&c, &v) < 0 || cborUint(&c, &info->lifetimeMs) < 0)
+	{
+		return -1;
+	}
+
+	for (i = 8; i < n; i++)
+	{
+		if (cborSkip(&c, 0) < 0)
+		{
+			return -1;
+		}
+	}
+
+	/*	Canonical blocks: type, number, flags, CRC type, data,
+	 *	optional CRC; up to the break that ends the bundle.	*/
+
+	while (c.p < c.end && *c.p != 0xff)
+	{
+		uint64_t	type;
+		int		major;
+		int		indefinite;
+		uint64_t	dataLen;
+		const unsigned char	*data;
+
+		if (cborArray(&c, 5, 6, &n) < 0 || cborUint(&c, &type) < 0
+		|| cborSkip(&c, 0) < 0 || cborSkip(&c, 0) < 0
+		|| cborSkip(&c, 0) < 0
+		|| cborHead(&c, &major, &dataLen, &indefinite) < 0
+		|| major != 2 || indefinite
+		|| dataLen > (uint64_t) (c.end - c.p))
+		{
+			return -1;
+		}
+
+		data = c.p;
+		c.p += dataLen;
+		if (n == 6 && cborSkip(&c, 0) < 0)
+		{
+			return -1;
+		}
+
+		if (type == ZCL_AGE_BLOCK)
+		{
+			readAge(data, (size_t) dataLen, info);
+		}
+		else if (type == ZCL_QOS_BLOCK)
+		{
+			readQos(data, (size_t) dataLen, info);
+		}
+	}
+
+	return c.p < c.end ? 0 : -1;		/*	Break present?	*/
+}
+
 /*	*	*	Receiver	*	*	*	*	*/
 
 typedef struct pending
