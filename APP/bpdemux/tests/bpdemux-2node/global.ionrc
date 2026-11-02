@@ -1,0 +1,5 @@
+# Nodes 1 (A, the demux node) and 2 (B, the sender), both ways, for an hour.
+m horizon +0
+a range   +0 +3600  1 2  1
+a contact +0 +3600  1 2  125000
+a contact +0 +3600  2 1  125000

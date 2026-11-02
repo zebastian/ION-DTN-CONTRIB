@@ -1,0 +1,5 @@
+# Demux endpoint ipn:1.1; bundles without a rule go to service 799.
+1 ipn:1.1 799
+# One named rule, one without a name.
+a label 42 705 cherry
+a label 43 706

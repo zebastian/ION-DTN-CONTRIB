@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# Two-node test of bpdemux: node 2 (B) knows only ipn:1.1 on node 1
+# (A) and sends with stock bpsendfile, a data label in its class of
+# service.  On node 1 bpdemuxd owns ipn:1.1 and moves each bundle on to
+# the service its label names:
+#
+#   1. label 42 (rule "cherry") -> ipn:1.705, source still ipn:2.1
+#   2. label 43 (unnamed rule)  -> ipn:1.706
+#   3. label 99 (no rule)       -> ipn:1.799, the default
+#   4. no label                 -> ipn:1.799
+#   5. "c label cherry 706" while running: label 42 -> ipn:1.706
+#   6. "s default 0": label 99 is abandoned, nothing reaches 1.799
+#   7. bpdemuxadmin shows the rules and an empty demux queue
+#
+
+HERE=$PWD
+export ION_NODE_LIST_DIR=$HERE
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing bpdemux: delivery to local services by data"
+echo "         label, with the sender's identity kept."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+pass() { echo "  PASS: $1"; }
+
+# Binaries built in this tree come first, else installed ones.
+BUILT="$HERE/../.."
+for b in bpdemuxd bpdemuxadmin dmxrecv; do
+	if [ ! -x "$BUILT/$b" ] && ! command -v "$b" >/dev/null 2>&1; then
+		echo "SKIP: $b not built."
+		exit 2
+	fi
+done
+export PATH="$BUILT:$PATH"
+
+for t in ionadmin bpadmin ipnadmin ionstop killm bpsendfile; do
+	if ! command -v "$t" >/dev/null 2>&1; then
+		echo "SKIP: '$t' not found."
+		exit 2
+	fi
+done
+
+# expect <file> <extended regex> <what>
+expect()
+{
+	if grep -Eq "$2" "$1"; then
+		pass "$3"
+	else
+		fail "$3 (no line matching '$2' in $1)"
+		sed 's/^/      | /' "$1"
+	fi
+}
+
+start_node()
+{
+	(
+		cd "node$1" || exit 1
+		ionadmin node.ionrc >/dev/null
+		ionadmin ../global.ionrc >/dev/null
+		bpadmin node.bprc >/dev/null
+		ipnadmin node.ipnrc >/dev/null
+	)
+}
+
+await_node()
+{
+	local i
+
+	for i in $(seq 1 50); do
+		grep -q "ipnfw is running" "node$1/ion.log" 2>/dev/null \
+			&& return 0
+		sleep 0.2
+	done
+
+	return 1
+}
+
+stop_all()
+{
+	[ -f node1/demux.pid ] && kill "$(cat node1/demux.pid)" 2>/dev/null
+	sleep 0.5
+	for n in 1 2; do
+		(cd "node$n" && ionstop >/dev/null 2>&1)
+	done
+
+	killm f >/dev/null 2>&1
+}
+
+# send <label or 0> <text>: from ipn:2.1 to ipn:1.1
+send()
+{
+	local cos="0.1"
+
+	[ "$1" != 0 ] && cos="0.1.0.0.0.$1"
+	printf '%s' "$2" > "node2/payload.$1"
+	(cd node2 && bpsendfile ipn:2.1 ipn:1.1 "payload.$1" "$cos" 60) \
+		>/dev/null 2>&1
+}
+
+# collect <service> <count> <out>: the bundles queued at ipn:1.<service>
+collect()
+{
+	(cd node1 && dmxrecv "ipn:1.$1" "$2" 3) > "$3" 2>&1
+}
+
+echo "Killing old ION..."
+./cleanup
+sleep 1
+
+echo "Starting nodes 1 and 2..."
+for n in 1 2; do
+	start_node $n
+	if ! await_node $n; then
+		echo "ERROR: node $n did not start."
+		tail -20 "node$n/ion.log" 2>/dev/null
+		stop_all
+		exit 1
+	fi
+done
+
+(cd node1 && bpdemuxadmin ../config/demux.rc) > admin.out 2>&1 \
+	&& pass "rules loaded" || { fail "bpdemuxadmin"; cat admin.out; }
+(cd node1 && exec bpdemuxd ipn:1.1) & echo $! > node1/demux.pid
+sleep 1
+
+# --- 1-4: by rule, by default ------------------------------------------
+echo "1-4: labels 42, 43, 99 and none..."
+send 42 "cherry-1"
+send 43 "unnamed-1"
+send 99 "unknown-1"
+send 0 "nolabel-1"
+sleep 2
+
+collect 705 1 r705.out
+expect r705.out "^src=ipn:2\.1 len=8 text=cherry-1$" \
+	"label 42 at ipn:1.705, source ipn:2.1"
+collect 706 1 r706.out
+expect r706.out "^src=ipn:2\.1 len=9 text=unnamed-1$" \
+	"label 43 at ipn:1.706"
+collect 799 2 r799.out
+expect r799.out "text=unknown-1$" "label 99 at the default ipn:1.799"
+expect r799.out "text=nolabel-1$" "no label at the default ipn:1.799"
+
+# --- 5: a rule changed while running -----------------------------------
+echo "5: c label cherry 706..."
+echo "c label cherry 706" | (cd node1 && bpdemuxadmin) >/dev/null 2>&1
+send 42 "cherry-2"
+sleep 2
+collect 706 1 r706b.out
+expect r706b.out "text=cherry-2$" "label 42 now at ipn:1.706"
+collect 705 1 r705b.out
+grep -q "text=" r705b.out && fail "label 42 still at ipn:1.705" \
+	|| pass "nothing more at ipn:1.705"
+
+# --- 6: no default -----------------------------------------------------
+echo "6: s default 0..."
+echo "s default 0" | (cd node1 && bpdemuxadmin) >/dev/null 2>&1
+send 99 "unknown-2"
+sleep 2
+collect 799 1 r799b.out
+grep -q "text=" r799b.out && fail "label 99 reached ipn:1.799" \
+	|| pass "label 99 abandoned, not at ipn:1.799"
+kill -USR1 "$(cat node1/demux.pid)"
+sleep 1
+expect node1/ion.log "bpdemuxd ipn:1\.1: 3 bundles moved by rule, 2 to \
+the default, 1 abandoned" "bpdemuxd counted 3 by rule, 2 default, 1 abandoned"
+
+# --- 7: admin view -----------------------------------------------------
+echo "7: bpdemuxadmin l and i..."
+printf 'l\ni\ni label cherry\n' | (cd node1 && bpdemuxadmin) > info.out 2>&1
+expect info.out "^1 ipn:1\.1 0$" "list: endpoint, no default"
+expect info.out "^a label 42 706 cherry$" "list: the changed named rule"
+expect info.out "^a label 43 706$" "list: the unnamed rule"
+expect info.out "^demux endpoint: ipn:1\.1: open, 0 bundles queued" \
+	"nothing left at the demux endpoint"
+expect info.out "^  ipn:1\.706: " "info on the rule's target"
+
+echo "Cleaning up..."
+stop_all
+./cleanup
+
+exit $FAIL

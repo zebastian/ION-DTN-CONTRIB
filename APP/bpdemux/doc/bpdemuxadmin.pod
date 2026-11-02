@@ -1,0 +1,107 @@
+=head1 NAME
+
+bpdemuxadmin - administration of bpdemux's data-label rules
+
+=head1 SYNOPSIS
+
+B<bpdemuxadmin> [ I<commands_filename> | . ]
+
+=head1 DESCRIPTION
+
+B<bpdemuxadmin> configures the rules by which B<bpdemuxd> moves the
+bundles delivered to a node's demux endpoint on to other local
+endpoints.  It reads commands from I<commands_filename>, or from
+standard input when no file is named or the name is '.'; at a terminal
+it prompts for each.  The rules are kept in ION's SDR; B<bpdemuxd>
+reads them for every batch of bundles, so a change applies to the next
+bundle.
+
+A rule maps an ION data label - the number a sender gives in its class
+of service, e.g. B<bpsendfile> ... B<0.1.0.0.0.42> - to a service
+number on this node.  A bundle with no label, or with a label no rule
+names, goes to the default service; with no default it is abandoned.
+
+=head1 COMMANDS
+
+=over 4
+
+=item B<1> B<ipn:>I<node>B<.>I<service> [I<default_service>]
+
+Initialize the rules database for the demux endpoint, which must be on
+this node, and optionally set the default service.  Must come first,
+once per node.
+
+=item B<a label> I<label> I<service> [I<name>]
+
+Add a rule: bundles with data label I<label> (1 to 4294967295) go to
+B<ipn:>I<node>B<.>I<service>.  The I<name> is optional and only for
+display and for referring to the rule: up to 31 of A-Z a-z 0-9 _ . -,
+not all digits.  No label and no name may appear twice, and the service
+may not be the demux endpoint's own.
+
+=item B<c label> I<label> | I<name> I<service> [I<name>]
+
+Change a rule's service, and its name if one is given.
+
+=item B<d label> I<label> | I<name>
+
+Delete a rule.
+
+=item B<s default> I<service> | B<0>
+
+Set the default service; B<0> removes it, so that bundles without a
+rule are abandoned (with a "deleted" status report if the sender asked
+for one).
+
+=item B<i>
+
+Print the demux endpoint and the default service: whether each is
+defined and open, and how many bundles are queued there.
+
+=item B<i label> I<label> | I<name>
+
+Print the rule and the same about its target endpoint.
+
+=item B<l>
+
+List the database as the commands that recreate it.
+
+=item B<e> { B<0> | B<1> }
+
+Echo printed output to ION's log, or not.
+
+=item B<#> I<comment>
+
+A comment.
+
+=item B<h>, B<?>
+
+Help.
+
+=item B<v>
+
+Print the version.
+
+=item B<q>
+
+Quit.
+
+=back
+
+=head1 EXAMPLE
+
+    1 ipn:1.1 799
+    a label 42 705 cherry
+    a label 43 706
+
+Bundles sent to B<ipn:1.1> with data label 42 are delivered to
+B<ipn:1.705>, label 43 to B<ipn:1.706>, everything else to
+B<ipn:1.799>.
+
+=head1 EXIT STATUS
+
+0, or 1 if a command from a file failed.
+
+=head1 SEE ALSO
+
+bpdemuxd(1), bpadmin(1), bpsendfile(1)

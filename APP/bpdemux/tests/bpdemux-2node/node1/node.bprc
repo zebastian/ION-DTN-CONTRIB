@@ -1,0 +1,14 @@
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.0 q
+# The demux endpoint: the only one B knows.  'q' keeps bundles while
+# bpdemuxd is not running.
+a endpoint ipn:1.1 q
+# Internal services the data labels select, and the default.
+a endpoint ipn:1.705 q
+a endpoint ipn:1.706 q
+a endpoint ipn:1.799 q
+a protocol udp 1400 100
+a induct  udp 127.0.0.1:4741 udpcli
+a outduct udp 127.0.0.1:4742 udpclo
+s

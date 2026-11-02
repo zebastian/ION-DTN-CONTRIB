@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+export ION_NODE_LIST_DIR=$PWD
+[ -f node1/demux.pid ] && kill "$(cat node1/demux.pid)" >/dev/null 2>&1
+killm f >/dev/null 2>&1
+rm -f ion.log ion_nodes node*/ion.log node*/*.pid node2/payload.* *.out

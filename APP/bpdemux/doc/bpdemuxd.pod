@@ -1,0 +1,72 @@
+=head1 NAME
+
+bpdemuxd - deliver bundles to local services by their data label
+
+=head1 SYNOPSIS
+
+B<bpdemuxd> B<ipn:>I<node>B<.>I<service>
+
+=head1 DESCRIPTION
+
+B<bpdemuxd> opens the named endpoint of this node - the demux
+endpoint, the only one remote senders need to know - and moves every
+bundle delivered to it on to the local endpoint that the bundle's ION
+data label selects, by the rules set with B<bpdemuxadmin>.
+
+The bundle itself is moved, not copied: its destination's service
+number is rewritten and it is put into the target endpoint's delivery
+queue.  Source, creation time, lifetime and status-report requests stay
+those the sender gave it, so the application on the target endpoint
+sees the real sender and can answer it directly; a "delivered" status
+report is sent when that application receives the bundle.  The target
+endpoint's own rule applies: if no application has it open, the bundle
+waits there (B<q>) or is discarded (B<x>), after its reanimation script
+has run.
+
+A bundle with no data label, or a label no rule names, or a rule whose
+target endpoint the node does not have, goes to the default service.
+Without a default it is abandoned, with a "deleted" status report if
+one was requested.
+
+The demux endpoint should be defined with B<q>, so that bundles wait
+for B<bpdemuxd> while it is not running.  While it runs, no other
+application can open that endpoint.
+
+B<bpdemuxd> reads ION's Bundle record and needs ION 4.1.4 or later.
+
+=head1 SIGNALS
+
+=over 4
+
+=item SIGTERM, SIGINT
+
+Stop.
+
+=item SIGUSR1
+
+Log the counters: bundles moved by a rule, to the default, abandoned,
+and payload bytes moved.
+
+=back
+
+=head1 EXAMPLE
+
+    bpadmin:   a endpoint ipn:1.1 q
+               a endpoint ipn:1.705 q
+               a endpoint ipn:1.799 q
+    bpdemuxadmin:
+               1 ipn:1.1 799
+               a label 42 705 cherry
+    run:       bpdemuxd ipn:1.1 &
+    sender:    bpsendfile ipn:2.1 ipn:1.1 report.txt 0.1.0.0.0.42
+
+The file is delivered to whatever has B<ipn:1.705> open, from
+B<ipn:2.1>.
+
+=head1 EXIT STATUS
+
+0 when stopped, 1 on an error.
+
+=head1 SEE ALSO
+
+bpdemuxadmin(1), bpadmin(1), ipnrc(5)

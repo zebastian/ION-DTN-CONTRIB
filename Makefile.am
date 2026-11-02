@@ -33,6 +33,9 @@ endif
 if ENABLE_APP_BPTUN
 SUBDIRS += APP/bptun
 endif
+if ENABLE_APP_BPDEMUX
+SUBDIRS += APP/bpdemux
+endif
 
 # Vendored ION-DTN private headers and the compatibility shims, shared by all
 # contributions (see include/README).
