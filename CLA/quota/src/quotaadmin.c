@@ -97,7 +97,12 @@ static Object	beginDb(QuotaClDb *db)
 		return 0;
 	}
 
-	sdr_read(sdr, (char *) db, dbObj, sizeof(QuotaClDb));
+	/*	Staged, not just read: a change writes the root back
+	 *	(commitChange), and ION's default SDR configuration
+	 *	(SDR_BOUNDED) lets a transaction write only objects it
+	 *	allocated or staged.					*/
+
+	sdr_stage(sdr, (char *) db, dbObj, sizeof(QuotaClDb));
 	if (db->version != QUOTACL_DB_VERSION)
 	{
 		sdr_exit_xn(sdr);
@@ -130,6 +135,9 @@ static Object	findRule(QuotaClDb *db, const char *name, QuotaRule *rule,
 				*ruleElt = elt;
 			}
 
+			/*	The callers may rewrite it; see beginDb.	*/
+
+			sdr_stage(sdr, NULL, obj, 0);
 			return obj;
 		}
 	}

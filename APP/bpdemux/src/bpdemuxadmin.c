@@ -96,7 +96,12 @@ static Object	beginDb(DmxDb *db, int *count)
 		return 0;
 	}
 
-	sdr_read(sdr, (char *) db, dbObj, sizeof(DmxDb));
+	/*	Staged, not just read: every change writes the root back
+	 *	(commitChange), and ION's default SDR configuration
+	 *	(SDR_BOUNDED) lets a transaction write only objects it
+	 *	allocated or staged.					*/
+
+	sdr_stage(sdr, (char *) db, dbObj, sizeof(DmxDb));
 	if (db->version != BPDEMUX_DB_VERSION)
 	{
 		sdr_exit_xn(sdr);
@@ -288,6 +293,7 @@ static int	changeRule(int argc, char **argv)
 	DmxDb		db;
 	DmxRule		rule;
 	Object		dbObj;
+	Object		ruleObj;
 	const char	*why;
 	uvast		svc;
 	int		count;
@@ -337,8 +343,9 @@ static int	changeRule(int argc, char **argv)
 		return -1;
 	}
 
-	sdr_write(sdr, sdr_list_data(sdr, ruleElt(&db, i)), (char *) &rule,
-			sizeof(DmxRule));
+	ruleObj = sdr_list_data(sdr, ruleElt(&db, i));
+	sdr_stage(sdr, NULL, ruleObj, 0);
+	sdr_write(sdr, ruleObj, (char *) &rule, sizeof(DmxRule));
 	return commitChange(dbObj, &db);
 }
 

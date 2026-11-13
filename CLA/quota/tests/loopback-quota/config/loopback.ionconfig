@@ -1,4 +1,7 @@
 wmSize 50000000
-configFlags 1
+# ION's default SDR configuration: in DRAM (1), reversible (4) and
+# bounded (8), which lets a transaction write only objects it allocated
+# or staged - so that the test catches a write that ION would refuse.
+configFlags 13
 heapWords 2500000
 pathName TESTDIR
