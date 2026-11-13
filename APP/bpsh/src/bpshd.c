@@ -63,8 +63,11 @@ static int parseAllowedEids(const char *arg)
 		}
 	}
 
-	copy = MTAKE(len + 1);
-	allowedEids = MTAKE(maxPats * sizeof(char *));
+	/*	Plain malloc: this runs before bp_attach, when ION's
+	 *	memory (MTAKE) is not there yet.  Held for the process
+	 *	lifetime, as before.					*/
+	copy = malloc(len + 1);
+	allowedEids = malloc(maxPats * sizeof(char *));
 	if (copy == NULL || allowedEids == NULL)
 	{
 		return -1;
