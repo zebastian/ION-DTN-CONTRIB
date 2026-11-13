@@ -25,7 +25,10 @@ whether `quiccla` accepted it or opened it.
 - **Reliable service (default):** bundles are sent as `XFER_SEGMENT` messages
   on the client-initiated data streams. Each bundle is segmented to the peer's
   negotiated Segment MRU, carries a per-direction Transfer ID and START/END
-  flags, and is acknowledged with a cumulative `XFER_ACK`. Bundles are mapped
+  flags, and is acknowledged with a cumulative `XFER_ACK`. A bundle counts as
+  sent only once the peer acknowledges its END segment; if the session fails
+  first - an outage longer than the idle timeout, say - the bundle goes back to
+  ION, which forwards it again on a new session. Bundles are mapped
   to one of four priority streams (4 = expedited, 8 = normal, 12 = bulk,
   16 = no priority) by the bundle's ECOS ordinal.
 - **Unreliable service (`quiccla -u`):** bundles are segmented and sent as QUIC
@@ -157,7 +160,7 @@ messages.
 
 Some behaviours are verified by inspection rather than by the automated
 suite, as they are awkward to drive with the standard BP tools:
-cumulative `XFER_ACK` transmission (the sender does not block on it),
+cumulative `XFER_ACK` transmission on partial transfers,
 `KEEPALIVE` emission on a long-idle session, and `MSG_REJECT` generation.
 `XFER_REFUSE` is decoded but never originated by this implementation.
 

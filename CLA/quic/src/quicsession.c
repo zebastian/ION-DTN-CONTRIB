@@ -82,7 +82,19 @@ typedef struct QuicConn
 	int		     sendLen;
 	int		     sendOff;
 	int		     sendDone;
+	int		     sendSlot; /* dataStreams index in use.	*/
 	uint64_t	     nextTxId; /* next outbound Transfer ID.	*/
+
+	/*	Octets written to each of our data streams and how far QUIC
+	 *	has acknowledged them: ngtcp2 retransmits from the sender's
+	 *	buffer, so a bundle's frame may be freed only once its
+	 *	octets are acknowledged.  peerAckedTxId is one past the last
+	 *	transfer the peer acknowledged in full (XFER_ACK with END),
+	 *	0 for none: only then is a bundle sent.  All three are
+	 *	written by the I/O thread under the session mutex.	*/
+	uint64_t	     dataSent[4];
+	uint64_t	     dataAcked[4];
+	uint64_t	     peerAckedTxId;
 
 	/*	Raw inbound data-stream bytes (XFER_* messages).	*/
 	unsigned char *rxBuf;
@@ -663,8 +675,9 @@ static int xferReassemble(QuicConn *qc, const QuicXferSegment *seg,
 }
 
 /*	Parse XFER_* messages from the inbound data stream: reassemble and
- *	deliver bundles (XFER_SEGMENT); ACK/REFUSE are accepted and, for
- *	now, consumed without sender-side action.			*/
+ *	deliver bundles (XFER_SEGMENT); an XFER_ACK of a whole transfer is
+ *	recorded for the sender (doSend), and REFUSE is consumed without
+ *	sender-side action.						*/
 
 static int deliverBundles(QuicConn *qc)
 {
@@ -721,6 +734,21 @@ static int deliverBundles(QuicConn *qc)
 			}
 
 			off += hdr;
+
+			/*	The peer has the whole bundle once it
+			 *	acknowledges the END segment; doSend waits
+			 *	for that before reporting the bundle sent.	*/
+
+			if (ack.flags & QMSG_FLAG_END)
+			{
+				pthread_mutex_lock(&qc->owner->mutex);
+				if (ack.transferId >= qc->peerAckedTxId)
+				{
+					qc->peerAckedTxId = ack.transferId + 1;
+				}
+
+				pthread_mutex_unlock(&qc->owner->mutex);
+			}
 		}
 		else if (type == QMSG_XFER_REFUSE)
 		{
@@ -976,13 +1004,28 @@ static int ackedOffsetCb(ngtcp2_conn *conn, int64_t stream_id, uint64_t offset,
 		uint64_t datalen, void *user_data, void *stream_user_data)
 {
 	QuicConn *qc = user_data;
+	int	  i;
 
 	(void) conn;
-	(void) offset;
 	(void) stream_user_data;
 
-	/*	Track acknowledgement of our XFER_ACKs on the data stream so
-	 *	the single ACK buffer can be reused once fully acked.	*/
+	/*	Bundle octets on one of our own data streams: acknowledged
+	 *	up to offset + datalen (ngtcp2 reports in order).		*/
+
+	for (i = 0; i < 4; i++)
+	{
+		if (qc->dataStreamsOpen && stream_id == qc->dataStreams[i])
+		{
+			pthread_mutex_lock(&qc->owner->mutex);
+			qc->dataAcked[i] = offset + datalen;
+			pthread_mutex_unlock(&qc->owner->mutex);
+			return 0;
+		}
+	}
+
+	/*	Track acknowledgement of our XFER_ACKs on the peer's data
+	 *	stream so the single ACK buffer can be reused once fully
+	 *	acked.							*/
 
 	if (stream_id != QUICCL_SIG_STREAM)
 	{
@@ -1215,6 +1258,8 @@ static int writeConn(QuicConn *qc)
 			else if (chan == 2)
 			{
 				qc->sendOff += (int) pdatalen;
+				qc->dataSent[qc->sendSlot] +=
+						(uint64_t) pdatalen;
 			}
 
 			pthread_mutex_unlock(&s->mutex);
@@ -2061,7 +2106,7 @@ static unsigned char *frameBundle(QuicConn *qc, const unsigned char *bundle,
  *	data streams: stream 4 (expedited) ... stream 16 (no priority), per
  *	the QUICCL default mapping.					*/
 
-static int64_t priorityStream(QuicConn *qc, int ordinal)
+static int priorityIndex(int ordinal)
 {
 	int idx;
 
@@ -2082,7 +2127,7 @@ static int64_t priorityStream(QuicConn *qc, int ordinal)
 		idx = 3; /* stream 16 (no priority)	*/
 	}
 
-	return qc->dataStreams[idx];
+	return idx;
 }
 
 /*	Datagram payload (XFER_SEGMENT data) per segment for the unreliable
@@ -2241,13 +2286,19 @@ static QuicConn *claimReadyConn(QuicSession *s, uvast nodeNbr, int *exists)
 /*	Send one bundle on a claimed connection as reliable XFER_SEGMENT(s),
  *	handing it to the I/O thread (the only thread that may touch the
  *	non-thread-safe ngtcp2_conn) on the priority-appropriate data stream
- *	and blocking until it is sent or the connection fails.		*/
+ *	and blocking until the peer has acknowledged it or the connection
+ *	fails; -1 hands the bundle back to ION.				*/
 
 static int doSend(QuicSession *s, QuicConn *qc, const unsigned char *bundle,
 		int len, int ordinal)
 {
-	unsigned char *framed;
-	int	       flen;
+	unsigned char  *framed;
+	int		flen;
+	uint64_t	txid = qc->nextTxId; /* frameBundle takes this one. */
+	int		slot = priorityIndex(ordinal);
+	int		idle;
+	int		delivered;
+	struct timespec deadline;
 
 	framed = frameBundle(qc, bundle, len, &flen);
 	if (framed == NULL)
@@ -2260,7 +2311,8 @@ static int doSend(QuicSession *s, QuicConn *qc, const unsigned char *bundle,
 	qc->sendLen = flen;
 	qc->sendOff = 0;
 	qc->sendDone = 0;
-	qc->sendStreamId = priorityStream(qc, ordinal);
+	qc->sendSlot = slot;
+	qc->sendStreamId = qc->dataStreams[slot];
 	pthread_mutex_unlock(&s->mutex);
 
 	if (qc->sendStreamId != qc->lastSentStream)
@@ -2276,17 +2328,49 @@ static int doSend(QuicSession *s, QuicConn *qc, const unsigned char *bundle,
 
 	wakeIo(s);
 
+	/*	Handed to QUIC is not yet delivered: the bundle is sent once
+	 *	the peer acknowledges its END segment (XFER_ACK), and its
+	 *	frame may be freed once QUIC has acknowledged all of its
+	 *	octets, as ngtcp2 retransmits from it until then.  If the
+	 *	connection fails first - an outage that outlasts the idle
+	 *	timeout - the bundle goes back to ION, which forwards it
+	 *	again on a new session.  A peer that stays connected but
+	 *	never acknowledges ends the session after twice the idle
+	 *	timeout.						*/
+
+	idle = s->cfg.idleSec > 0 ? s->cfg.idleSec : QUIC_DEFAULT_IDLE_SEC;
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 2 * idle;
+
 	pthread_mutex_lock(&s->mutex);
-	while (!qc->sendDone && !qc->failed)
+	while (!qc->failed && !(qc->sendDone && qc->peerAckedTxId > txid
+			&& qc->dataAcked[slot] >= qc->dataSent[slot]))
 	{
-		pthread_cond_wait(&s->cond, &s->mutex);
+		if (pthread_cond_timedwait(&s->cond, &s->mutex, &deadline)
+				== ETIMEDOUT)
+		{
+			writeMemo("[?] quic: bundle not acknowledged in time; \
+ending the session.");
+			qc->failed = 1;
+
+			/*	Let the I/O thread finish any write from the
+			 *	frame it may be in before the frame is freed:
+			 *	from its next pass on it skips this connection.	*/
+
+			clock_gettime(CLOCK_REALTIME, &deadline);
+			deadline.tv_sec += 2;
+			oK(pthread_cond_timedwait(&s->cond, &s->mutex,
+					&deadline));
+			break;
+		}
 	}
 
+	delivered = qc->sendDone && qc->peerAckedTxId > txid;
 	qc->sendData = NULL;
 	pthread_mutex_unlock(&s->mutex);
 
 	MRELEASE(framed);
-	return qc->failed ? -1 : 0;
+	return delivered ? 0 : -1;
 }
 
 int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
