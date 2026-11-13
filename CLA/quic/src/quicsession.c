@@ -1356,14 +1356,21 @@ static int feedConn(QuicConn *qc, const uint8_t *pkt, size_t pktlen)
 		 *	in ccerr.error_code, which is the key clue when debugging
 		 *	interop against a different QUIC/TLS stack.		*/
 
-		ngtcp2_connection_close_error ccerr;
 		char note[160];
+#if NGTCP2_VERSION_NUM >= 0x010000
+		/*	ngtcp2 1.0 renamed the close error to ngtcp2_ccerr
+		 *	and hands back a pointer to the connection's own.	*/
+		const ngtcp2_ccerr *ccerr = ngtcp2_conn_get_ccerr(qc->conn);
+#else
+		ngtcp2_connection_close_error ccerrBuf;
+		const ngtcp2_connection_close_error *ccerr = &ccerrBuf;
 
-		ngtcp2_conn_get_connection_close_error(qc->conn, &ccerr);
+		ngtcp2_conn_get_connection_close_error(qc->conn, &ccerrBuf);
+#endif
 		isprintf(note, sizeof note,
 				"%s (peer close type %d, code %llu)",
-				(char *) ngtcp2_strerror(rc), (int) ccerr.type,
-				(unsigned long long) ccerr.error_code);
+				(char *) ngtcp2_strerror(rc), (int) ccerr->type,
+				(unsigned long long) ccerr->error_code);
 		writeMemoNote("[?] quic: read_pkt failed", note);
 		qc->failed = 1;
 		return -1;
@@ -2445,6 +2452,10 @@ static QuicConn *acceptConn(QuicSession *s, const uint8_t *pkt, size_t pktlen,
 	settings.initial_ts = quicNow();
 	defaultTransportParams(&s->cfg, &params);
 	params.original_dcid = hd.dcid;
+#if NGTCP2_VERSION_NUM >= 0x010000
+	/*	Since ngtcp2 1.0 a server must say that it set it.	*/
+	params.original_dcid_present = 1;
+#endif
 	setCallbacks(&callbacks, 1);
 
 	ngtcp2_path_storage_init(&ps, (struct sockaddr *) &qc->local,
