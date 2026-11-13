@@ -4,7 +4,7 @@
 #
 # A single ION node sends a file to itself: mysqlclo writes the bundle
 # into the "loopback" table, and mysqlcli (filtering on this node's own
-# src_eid) reads it back, injects it into ION, and deletes the row.
+# dst_eid) reads it back, injects it into ION, and deletes the row.
 #
 # Requires a reachable MySQL/MariaDB server.  Override via env:
 #   MYSQL_HOST (127.0.0.1) MYSQL_PORT (3306) MYSQL_USER (root)

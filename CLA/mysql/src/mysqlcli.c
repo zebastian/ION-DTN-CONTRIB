@@ -1,6 +1,6 @@
 /*
         mysqlcli.c:	BP MySQL-based convergence-layer input daemon.
-                        Reads bundles addressed to this node (src_eid =
+                        Reads bundles addressed to this node (dst_eid =
                         local node) from its table, injects them into
                         ION, and deletes the consumed rows.  Several
                         nodes may share one table; each picks up only
@@ -69,7 +69,7 @@ static int processBatch(ReceiverThreadParms *rtp, AcqWorkArea *work)
 	}
 
 	isprintf(query, sizeof(query),
-			"SELECT id,payload FROM `%s` WHERE src_eid LIKE '%s' "
+			"SELECT id,payload FROM `%s` WHERE dst_eid LIKE '%s' "
 			"ORDER BY id LIMIT %d FOR UPDATE",
 			cfg->table, escPattern, cfg->batch);
 	if (mysql_query(conn, query) != 0)
@@ -274,7 +274,7 @@ int main(int argc, char *argv[])
 	{
 		PUTS("Usage: mysqlcli <host[:port]> [-d db] [-T table] "
 		     "[-u user] [-p pass] [-S socket] [-n batch] "
-		     "[-i pollms] [-e srcpattern] "
+		     "[-i pollms] [-e dstpattern] "
 		     "[-t] [-c cafile] [-k cert] [-K key]");
 		return 0;
 	}

@@ -6,21 +6,23 @@ mysqlcli - DTN MySQL convergence layer input task
 
 B<mysqlcli> I<host>[:I<port>] [B<-d> I<db>] [B<-T> I<table>]
 [B<-u> I<user>] [B<-p> I<password>] [B<-S> I<socket>] [B<-n> I<batch>]
-[B<-i> I<pollms>] [B<-e> I<srcpattern>] [B<-t>] [B<-c> I<cafile>]
+[B<-i> I<pollms>] [B<-e> I<dstpattern>] [B<-t>] [B<-c> I<cafile>]
 [B<-k> I<cert>] [B<-K> I<key>]
 
 =head1 DESCRIPTION
 
 B<mysqlcli> is a background "daemon" task that receives bundles from a
-MySQL/MariaDB table.  It selects the rows whose C<src_eid> belongs to the
+MySQL/MariaDB table.  It selects the rows whose C<dst_eid> belongs to the
 local node from the table named by B<-T> (default C<outbound>) in the
 database named by B<-d> (default C<ion>), injects each bundle into ION,
 and deletes the consumed rows.
 
-Because the row owner is matched against the local node's own EID
+Because the destination is matched against the local node's own EID
 (derived from ION as C<ipn:>I<ownNodeNbr>C<.*>), several ION nodes may
-share one server and table; each B<mysqlcli> picks up only its own rows.
-The match can be overridden with B<-e>.
+share one server and table; each B<mysqlcli> picks up only the bundles
+addressed to it.  A node that relays bundles for other destinations
+through the database needs a table per next hop (B<-T>) or a pattern of
+its own (B<-e>).
 
 The duct name format is I<host>[:I<port>], identifying the MySQL server
 (default port 3306).  The database and table are created if they do not
@@ -71,11 +73,11 @@ Maximum number of bundles read and deleted per transaction (default 100).
 Idle poll interval, in milliseconds, when no matching rows are present
 (default 1000).
 
-=item B<-e> I<srcpattern>
+=item B<-e> I<dstpattern>
 
-Override the row-owner match with an explicit SQL C<LIKE> pattern applied
-to C<src_eid> (e.g. C<'ipn:5.%'>), instead of deriving the local node's
-own EID.
+Override the destination match with an explicit SQL C<LIKE> pattern
+applied to C<dst_eid> (e.g. C<'ipn:5.%'>, or C<%> for every row), instead
+of deriving the local node's own EID.
 
 =item B<-t>
 

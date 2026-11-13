@@ -10,9 +10,9 @@
                     (default "inbound").  No filtering.
 
           mysqlcli  (induct):  it selects bundles from its table
-                    (default "outbound") that belong to THIS node --
-                    src_eid matches the local node's own EID -- injects
-                    them into ION, and deletes the consumed rows.
+                    (default "outbound") that are addressed to THIS
+                    node -- dst_eid matches the local node's own EID --
+                    injects them into ION, and deletes the consumed rows.
 
         Several ION nodes may share one server/table; each node's cli
         picks up only its own rows, so the same table multiplexes many
@@ -63,7 +63,7 @@ typedef struct
 	int  pollMs;	     /*	cli: idle poll interval.	*/
 	int  flushMs;	     /*	clo: partial-batch flush window.*/
 	int  bufSz;	     /*	Max bundle size handled.	*/
-	char srcFilter[256]; /*	cli: -e override for src match.	*/
+	char dstFilter[256]; /*	cli: -e override for dst match.	*/
 	int  useTls;
 	char caFile[MYSQL_MAX_PATH_LEN];
 	char certFile[MYSQL_MAX_PATH_LEN];
@@ -153,7 +153,7 @@ static int parseMysqlDuctName(const char *ductName, char *host, int *port)
  *   -i <ms>        cli: idle poll interval (default 1000)
  *   -f <ms>        clo: partial-batch flush window (default 100)
  *   -b <bytes>     max bundle size handled (default 262144)
- *   -e <pattern>   cli: override src_eid match (SQL LIKE pattern)
+ *   -e <pattern>   cli: override dst_eid match (SQL LIKE pattern)
  *   -t             enable TLS
  *   -c <cafile>    CA certificate (PEM)
  *   -k <certfile>  client certificate (PEM)
@@ -226,8 +226,8 @@ static int parseMysqlArgs(int argc, char *argv[], MysqlClaConfig *cfg,
 		}
 		else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc)
 		{
-			istrcpy(cfg->srcFilter, argv[++i],
-					sizeof(cfg->srcFilter));
+			istrcpy(cfg->dstFilter, argv[++i],
+					sizeof(cfg->dstFilter));
 		}
 		else if (strcmp(argv[i], "-t") == 0)
 		{
@@ -324,7 +324,7 @@ static MYSQL *mysqlClaConnect(const MysqlClaConfig *cfg)
 			"src_eid VARCHAR(64),"
 			"dst_eid VARCHAR(64),"
 			"created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
-			"INDEX (src_eid))",
+			"INDEX (dst_eid))",
 			cfg->table);
 	if (mysql_query(conn, stmt) != 0)
 	{
@@ -425,9 +425,9 @@ static int mysqlExtractEids(unsigned char *buf, int len, char *src, int srcLen,
  */
 static void mysqlOwnEidPattern(const MysqlClaConfig *cfg, char *buf, int bufLen)
 {
-	if (cfg->srcFilter[0] != '\0')
+	if (cfg->dstFilter[0] != '\0')
 	{
-		istrcpy(buf, cfg->srcFilter, bufLen);
+		istrcpy(buf, cfg->dstFilter, bufLen);
 	}
 	else
 	{

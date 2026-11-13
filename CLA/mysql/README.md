@@ -7,7 +7,7 @@ it, so a single pair of tables multiplexes many links.
 
 - `mysqlclo` — output daemon (ION _outduct_): takes bundles from ION and
   stores them, with metadata, into its table (default `inbound`).
-- `mysqlcli` — input daemon (ION _induct_): reads bundles whose source is
+- `mysqlcli` — input daemon (ION _induct_): reads bundles addressed to
   the local node from its table (default `outbound`), injects them into
   ION, and deletes the consumed rows.
 
@@ -18,7 +18,7 @@ it, so a single pair of tables multiplexes many links.
    ION node ──bpDequeue──> [mysqlclo] ──INSERT──> `inbound`  table
                                                   (metadata: src/dst eid)
 
-   `outbound` table ──SELECT WHERE src_eid = me──> [mysqlcli] ──bpEndAcq──> ION
+   `outbound` table ──SELECT WHERE dst_eid = me──> [mysqlcli] ──bpEndAcq──> ION
                      <──DELETE consumed rows──────
 ```
 
