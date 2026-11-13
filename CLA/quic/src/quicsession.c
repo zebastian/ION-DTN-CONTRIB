@@ -52,6 +52,7 @@ typedef struct QuicConn
 	int			handshakeDone;
 	int			failed;
 	int			clientRole; /* 1 = we opened it (active).	*/
+	char			peerHost[QUIC_MAX_HOST_LEN]; /* opened to. */
 	uvast			peerNode;   /* peer node nbr from SESS_INIT.	*/
 	int			sendBusy;   /* a sender holds this conn.	*/
 
@@ -1046,7 +1047,7 @@ static int setupTls(QuicSession *s, QuicConn *qc, int isServer)
 	qc->connRef.user_data = qc;
 	qc->tls = quicTlsConnNew(&s->cfg,
 			isServer ? s->serverCreds : s->clientCreds,
-			&qc->connRef, isServer);
+			&qc->connRef, isServer, isServer ? NULL : qc->peerHost);
 	return qc->tls == NULL ? -1 : 0;
 }
 
@@ -1697,6 +1698,7 @@ static int quicEngineConnect(QuicSession *s, const char *host, int port)
 	qc->localLen = sizeof(qc->local);
 	oK(getsockname(s->fd, (struct sockaddr *) &qc->local, &qc->localLen));
 
+	istrcpy(qc->peerHost, host, sizeof(qc->peerHost));
 	if (setupTls(s, qc, 0) < 0)
 	{
 		putErrmsg("quiccla: TLS setup failed.", NULL);

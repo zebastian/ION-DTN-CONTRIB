@@ -78,7 +78,8 @@ void quicTlsCredsFree(QuicTlsCreds *creds)
 }
 
 QuicTlsConn *quicTlsConnNew(const QuicClaConfig *cfg, QuicTlsCreds *creds,
-		ngtcp2_crypto_conn_ref *connRef, int isServer)
+		ngtcp2_crypto_conn_ref *connRef, int isServer,
+		const char *peerHost)
 {
 	QuicTlsConn   *conn = MTAKE(sizeof(QuicTlsConn));
 	gnutls_datum_t alpn;
@@ -125,11 +126,13 @@ QuicTlsConn *quicTlsConnNew(const QuicClaConfig *cfg, QuicTlsCreds *creds,
 
 	if (!isServer)
 	{
-		gnutls_server_name_set(conn->session, GNUTLS_NAME_DNS, cfg->host,
-				strlen(cfg->host));
+		/*	The peer's name, not cfg->host: that is the host
+		 *	of this node's own induct, e.g. 0.0.0.0.		*/
+		gnutls_server_name_set(conn->session, GNUTLS_NAME_DNS, peerHost,
+				strlen(peerHost));
 		if (!cfg->noVerify)
 		{
-			gnutls_session_set_verify_cert(conn->session, cfg->host,
+			gnutls_session_set_verify_cert(conn->session, peerHost,
 					0);
 		}
 	}

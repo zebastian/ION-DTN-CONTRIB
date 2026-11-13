@@ -40,8 +40,12 @@ void quicTlsCredsFree(QuicTlsCreds *creds);
 /*	Create a TLS session bound to creds and to connRef (which ngtcp2's
  *	crypto layer uses to recover the ngtcp2_conn).  ALPN, SNI and peer
  *	verification are taken from cfg.  Returns NULL on failure.	*/
+/*	peerHost: what the peer's certificate must name when this node
+ *	opens the connection, NULL when it accepts it.  It must stay valid
+ *	for the life of the connection.					*/
 QuicTlsConn *quicTlsConnNew(const QuicClaConfig *cfg, QuicTlsCreds *creds,
-		ngtcp2_crypto_conn_ref *connRef, int isServer);
+		ngtcp2_crypto_conn_ref *connRef, int isServer,
+		const char *peerHost);
 void quicTlsConnFree(QuicTlsConn *conn);
 
 /*	The native TLS handle to pass to ngtcp2_conn_set_tls_native_handle. */
