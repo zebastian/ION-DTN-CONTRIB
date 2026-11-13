@@ -155,6 +155,13 @@ struct QuicSession
 	QuicConn    *conns;
 	QuicBundleCb cb;
 	void	    *cbUser;
+
+	/*	The I/O thread's receive buffer, one GRO train long.  Not on
+	 *	its stack: a thread started without attributes has 128 KiB of
+	 *	stack on musl (8 MiB on glibc), and the TLS handshake run
+	 *	below the I/O loop overflowed what this left of it.		*/
+
+	uint8_t	     rxBuf[QUIC_RX_BUFSZ];
 };
 
 /*	The I/O thread reads this flag for as long as it runs, while the
@@ -1827,7 +1834,6 @@ static void *engineIo(void *parm)
 	while (QUIC_GET(s->running))
 	{
 		struct pollfd		pfds[2];
-		uint8_t			buf[QUIC_RX_BUFSZ];
 		ssize_t			n;
 		struct sockaddr_storage remote;
 		socklen_t		remoteLen;
@@ -1900,14 +1906,15 @@ static void *engineIo(void *parm)
 		 *	demultiplex each to its connection (accepting a new one
 		 *	when needed).					*/
 
-		while ((n = quicUdpRecv(s->fd, s->useGro, buf, sizeof(buf),
+		while ((n = quicUdpRecv(s->fd, s->useGro, s->rxBuf,
+				sizeof(s->rxBuf),
 				&remote, &remoteLen, &seg))
 				> 0)
 		{
 			ctx.s = s;
 			ctx.remote = &remote;
 			ctx.remoteLen = remoteLen;
-			oK(quicUdpForEachPacket(buf, (size_t) n, seg,
+			oK(quicUdpForEachPacket(s->rxBuf, (size_t) n, seg,
 					serverFeedPacket, &ctx));
 		}
 
