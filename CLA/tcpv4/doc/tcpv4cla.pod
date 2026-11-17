@@ -29,6 +29,15 @@ second one.  Each bundle is one TCPCL transfer, segmented to the peer's
 Segment MTU and carried in XFER_SEGMENT messages that the peer acknowledges
 with cumulative XFER_ACKs.
 
+B<tcpv4cla> drains the "tcpv4" outducts that no plan cites as well, which a
+shaper or tunnel CLA hands its bundles on to (B<quotaclo>, B<zclo -T>) and
+which such a CLA insists no plan cite.  An outduct of that kind names an
+address but no node, so each of its bundles goes to its proximate node: the
+neighbour of the plan that enqueued it, which ION records with the bundle.
+An anonymous bundle, which ION can't look up - B<zclo>'s carriers are such
+bundles - goes to the node it is destined for instead.  Either node ID is
+matched against the peer's SESS_INIT as a plan's is.
+
 Session establishment follows RFC 9174 section 4: the entity that opened the
 connection sends its contact header first, the peer answers with its own, the
 Enable TLS parameter is the logical AND of the two CAN_TLS flags, and - when

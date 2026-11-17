@@ -6,7 +6,10 @@
 			plans that cite tcpv4 outducts and drains those
 			outducts, transmitting over the session to that node
 			(reusing an existing session to the node when one
-			exists).
+			exists).  It drains the tcpv4 outducts that no plan
+			cites as well, which a shaper or tunnel CLA (quotaclo,
+			zclo -T) hands its bundles on to, sending each to the
+			node its plan named.
 									*/
 #include "tcpv4session.h"
 #include "tcpv4tls.h"
@@ -26,6 +29,8 @@ typedef struct Tcpv4Rx
 /*	One egress neighbour: a node reachable via a tcpv4 outduct.  A
  *	sender thread drains the outduct and transmits over the session to
  *	nodeId, opening one to the outduct's host:port if none exists.
+ *	nodeId is empty for an outduct that no plan cites; each of its
+ *	bundles then goes to its own proximate node (see bundleProxNode).
  *
  *	The neighbour is named by the plan's neighbour EID rather than by a
  *	node number, so a peer named in any EID scheme is reachable: it is
@@ -299,6 +304,104 @@ static void txDone(void *user, Object bundle, int succeeded)
 	}
 }
 
+/*	The node a bundle in an outduct that no plan cites is to be sent
+ *	to: its proximate node, the neighbour EID of the plan that
+ *	enqueued it, which ION records with the bundle and keeps while it
+ *	is in transit.  A shaper or tunnel CLA that moves bundles on from
+ *	its own duct to such an outduct (quotaclo; zclo with its carriers)
+ *	leaves it as the plan set it.  The node ID therefore comes from
+ *	the local configuration, as a plan's does, and is matched against
+ *	the peer's SESS_INIT in the same way.
+ *
+ *	ION can look a bundle up only by its ID, which an anonymous bundle
+ *	(source dtn:none) doesn't have - zclo sends its carriers that way.
+ *	Such a bundle goes to the node it is destined for, which for a
+ *	carrier is the peer's zcl endpoint and so the neighbour; should
+ *	the node at the duct's address be another, its SESS_INIT won't
+ *	match and the session is not used.
+ *
+ *	Fills nodeId, which must hold SDRSTRING_BUFSZ octets; returns 0,
+ *	or -1 if neither yields a node.					*/
+
+static void destinationNode(Sdr sdr, Object bundleZco, char *nodeId)
+{
+	unsigned char *buffer;
+	Bundle	       image;
+	char	      *dest = NULL;
+	uint64_t       allocator;
+	uint64_t       node;
+
+	buffer = MTAKE(BP_MAX_BLOCK_SIZE);
+	if (buffer == NULL)
+	{
+		return;
+	}
+
+	memset((char *) &image, 0, sizeof image);
+	if (decodeBundle(sdr, bundleZco, buffer, &image) == 0)
+	{
+		readEid(&image.destination, &dest);
+	}
+
+	MRELEASE(buffer);
+	if (dest != NULL && tcpv4NodeIdIpn(dest, &allocator, &node))
+	{
+		if (allocator == 0)
+		{
+			isprintf(nodeId, SDRSTRING_BUFSZ, "ipn:" UVAST_FIELDSPEC
+					".0", (uvast) node);
+		}
+		else
+		{
+			isprintf(nodeId, SDRSTRING_BUFSZ, "ipn:" UVAST_FIELDSPEC
+					"." UVAST_FIELDSPEC ".0",
+					(uvast) allocator, (uvast) node);
+		}
+	}
+	else if (dest != NULL)
+	{
+		istrcpy(nodeId, dest, SDRSTRING_BUFSZ);
+	}
+
+	if (dest != NULL)
+	{
+		MRELEASE(dest);
+	}
+
+	eraseEid(&image.id.source);
+	eraseEid(&image.destination);
+	eraseEid(&image.reportTo);
+}
+
+static int bundleProxNode(Object bundleZco, char *nodeId)
+{
+	Sdr	sdr = getIonsdr();
+	Object	bundleObj = 0;
+	OBJ_POINTER(Bundle, bundle);
+
+	nodeId[0] = '\0';
+	CHKERR(sdr_begin_xn(sdr));
+	if (retrieveSerializedBundle(bundleZco, &bundleObj) == 0)
+	{
+		if (bundleObj == 0)	/*	Not catalogued.		*/
+		{
+			destinationNode(sdr, bundleZco, nodeId);
+		}
+		else
+		{
+			GET_OBJ_POINTER(sdr, Bundle, bundle, bundleObj);
+			if (bundle->proxNodeEid)
+			{
+				sdr_string_read(sdr, nodeId,
+						bundle->proxNodeEid);
+			}
+		}
+	}
+
+	sdr_exit_xn(sdr);
+	return tcpv4NodeIdIsSet(nodeId) ? 0 : -1;
+}
+
 /*	Drain one tcpv4 outduct, handing each bundle to the session to the
  *	neighbour (opening one on demand, or reusing an accepted one).
  *	The hand-off does not wait for the bundle to be written, let alone
@@ -313,6 +416,9 @@ static void *senderThread(void *parm)
 	BpAncillaryData ancillaryData;
 	vast		bundleLength;
 	int		refusals = 0;
+	int		perBundle = !tcpv4NodeIdIsSet(nb->nodeId);
+	char		proxNodeId[SDRSTRING_BUFSZ];
+	const char     *nodeId = nb->nodeId;
 
 	/*	Adopt the outduct: mark it serviced by this thread and make
 	 *	sure its semaphore is live so bpDequeue can be woken.	*/
@@ -343,12 +449,33 @@ static void *senderThread(void *parm)
 		bundleLength = zco_length(sdr, bundleZco);
 		sdr_exit_xn(sdr);
 
+		/*	An outduct that no plan cites names no node; each
+		 *	bundle's proximate node does.  A bundle without one
+		 *	can't be sent and goes back to BP like a declined
+		 *	one.							*/
+
+		if (perBundle)
+		{
+			if (bundleProxNode(bundleZco, proxNodeId) < 0)
+			{
+				writeMemoNote("[?] tcpv4cla: a bundle in an"
+					      " outduct no plan cites names no"
+					      " node to send it to;",
+						nb->outductName);
+				proxNodeId[0] = '\0';
+			}
+
+			nodeId = proxNodeId;
+		}
+
 		/*	From here the engine owns the bundle and reports its
 		 *	outcome through txDone - unless it declines it, in
 		 *	which case it is still ours to requeue.		*/
 
-		if (tcpv4EngineSendTo(Engine, nb->nodeId, nb->outductName,
-				    bundleZco, bundleLength)
+		if (tcpv4NodeIdIsSet(nodeId)
+				&& tcpv4EngineSendTo(Engine, nodeId,
+					    nb->outductName, bundleZco,
+					    bundleLength)
 				== 0)
 		{
 			refusals = 0;
@@ -389,10 +516,10 @@ static void *senderThread(void *parm)
 	return NULL;
 }
 
-/*	Add a sender for a tcpv4 outduct if one is not already running.
- *	Called on the (single) rescan thread, so no lock is needed to
- *	insert; the NeighborsMutex only guards traversal from the shutdown
- *	path.								*/
+/*	Add a sender for a tcpv4 outduct if one is not already running;
+ *	nodeId is empty for an outduct that no plan cites.  Called on the
+ *	(single) rescan thread, so no lock is needed to insert; the
+ *	NeighborsMutex only guards traversal from the shutdown path.	*/
 
 static int ensureNeighbor(const char *nodeId, const char *outductName,
 		VOutduct *vduct)
@@ -525,6 +652,52 @@ static int scanPlans(void)
 	return result;
 }
 
+/*	Scan the tcpv4 outducts that no plan cites and make sure each has
+ *	a sender as well.  A shaper or tunnel CLA hands its bundles on to
+ *	such a duct (quotaclo; zclo -T), and insists that no plan cite it,
+ *	or bpclm could pass the bundles to it directly and skip the shaper
+ *	or the tunnel.  Their sender takes the node each bundle is for
+ *	from the bundle (bundleProxNode).				*/
+
+static int scanUnplannedDucts(void)
+{
+	Sdr	     sdr = getIonsdr();
+	PsmPartition wm = getIonwm();
+	BpVdb	    *vdb = getBpVdb();
+	PsmAddress   vductElt;
+	VOutduct    *vduct;
+	OBJ_POINTER(Outduct, outduct);
+	int	     result = 0;
+
+	CHKERR(sdr_begin_xn(sdr));
+	for (vductElt = sm_list_first(wm, vdb->outducts); vductElt;
+			vductElt = sm_list_next(wm, vductElt))
+	{
+		vduct = (VOutduct *) psp(wm, sm_list_data(wm, vductElt));
+		if (strcmp(vduct->protocolName, "tcpv4") != 0)
+		{
+			continue;
+		}
+
+		GET_OBJ_POINTER(sdr, Outduct, outduct,
+				sdr_list_data(sdr, vduct->outductElt));
+		if (outduct->planDuctListElt != 0
+				|| outduct->name[0] == '#')
+		{
+			continue; /* A plan cites it: scanPlans' duct.	*/
+		}
+
+		if (ensureNeighbor("", vduct->ductName, vduct) < 0)
+		{
+			result = -1;
+			break;
+		}
+	}
+
+	sdr_exit_xn(sdr);
+	return result;
+}
+
 #if defined(ION_LWT)
 int tcpv4cla(saddr a1, saddr a2, saddr a3, saddr a4, saddr a5, saddr a6,
 		saddr a7, saddr a8, saddr a9, saddr a10)
@@ -639,12 +812,14 @@ int main(int argc, char *argv[])
 		writeMemo(txt);
 	}
 
-	/*	Discover tcpv4 outducts and keep discovering them (plans may
-	 *	be added after start-up), spawning a sender per neighbour.	*/
+	/*	Discover tcpv4 outducts and keep discovering them (plans and
+	 *	ducts may be added after start-up), spawning a sender per
+	 *	outduct: for those that plans cite, and for those that none
+	 *	does.								*/
 
 	while (Running)
 	{
-		if (scanPlans() < 0)
+		if (scanPlans() < 0 || scanUnplannedDucts() < 0)
 		{
 			ionKillMainThread("tcpv4cla");
 			break;

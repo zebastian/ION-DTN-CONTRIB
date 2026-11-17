@@ -1,0 +1,3 @@
+# Bundles to node 1 go through the zcl duct, and the carriers zclo cuts from
+# them to the tcpv4 outduct, which no plan cites.
+a plan 1 zcl/ipn:1.7

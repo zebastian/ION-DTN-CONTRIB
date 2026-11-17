@@ -76,7 +76,10 @@ a quota cam bytes 1M/1s
 The target duct must be in no plan - don't use the `a plan ipn:20.0
 ltp/20` shorthand for it - or bpclm could hand bundles to it directly;
 quotaclo refuses to start on such a target.  The quota duct takes the
-target's max payload length by itself.
+target's max payload length by itself.  The target can be any outduct
+whose daemon drains it with no plan citing it: LTP's or UDP's, or a
+`tcpv4` one, which `tcpv4cla` drains by sending each bundle to the node of
+the quota plan (`quotaclo tcpv4/peer.example:4556`).
 
 More rules:
 

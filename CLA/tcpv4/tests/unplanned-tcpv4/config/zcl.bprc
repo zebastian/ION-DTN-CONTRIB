@@ -1,0 +1,22 @@
+# bprc for the test of a tcpv4 outduct that no plan cites, with zclo in front
+# of it: node 1 sends to itself through zcl, and zclo hands its carriers, which
+# are anonymous, to the tcpv4 outduct.  TCPDUCT substituted by dotest.
+1
+m heapmax 262144
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+a endpoint ipn:1.7 q
+
+# TCPCLv4 carries the carriers, but its outduct is in no plan: only zclo feeds
+# it, and tcpv4cla sends each carrier to the node it is destined for.
+a protocol tcpv4 1400 100
+a induct  tcpv4 TCPDUCT 'tcpv4cla -T none'
+a outduct tcpv4 TCPDUCT ''
+
+a protocol zcl
+a induct  zcl ipn:1.7 'zcli -r 2000'
+a outduct zcl ipn:1.7 'zclo -w 200 -T tcpv4/TCPDUCT'
+
+r 'ipnadmin config/zcl.ipnrc'
+s

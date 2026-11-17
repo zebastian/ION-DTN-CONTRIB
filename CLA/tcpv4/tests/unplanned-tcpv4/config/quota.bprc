@@ -1,0 +1,22 @@
+# bprc for the test of a tcpv4 outduct that no plan cites, with quotaclo in
+# front of it.  TCPDUCT substituted by dotest.
+1
+m heapmax 262144
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:1.1 q
+a endpoint ipn:1.2 q
+
+# TCPCLv4 carries everything, but its outduct is in no plan: only quotaclo
+# feeds it, and tcpv4cla takes the node to send each bundle to from the
+# bundle's proximate node.
+a protocol tcpv4 1400 100
+a induct  tcpv4 TCPDUCT 'tcpv4cla -T none'
+a outduct tcpv4 TCPDUCT ''
+
+# The shaper, with no rules: it passes every bundle on.  Class 26 so that
+# every bundle for node 1 takes it.
+a protocol quota 26
+a outduct quota 1 'quotaclo tcpv4/TCPDUCT'
+
+r 'ipnadmin config/quota.ipnrc'
+s

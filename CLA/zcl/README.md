@@ -86,6 +86,11 @@ it - and gives the zcl duct the target's max payload length, which bpclm
 fragments to.  The last carrier cut when zclo stops waits in the zcl duct
 for the next zclo.
 
+The target can be any outduct whose daemon drains it with no plan citing
+it: LTP's or UDP's, or a `tcpv4` one, which `tcpv4cla` drains by sending
+each carrier - an anonymous bundle - to the node it is destined for, the
+peer's (`-T tcpv4/peer.example:4556`).
+
 On node 20:
 
 ```

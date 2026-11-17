@@ -20,6 +20,28 @@ for the egress plans that cite `tcpv4` outducts and drains those outducts,
 transmitting over the session to that node. An established session to a node is
 reused for both directions, whether `tcpv4cla` accepted it or opened it.
 
+It drains the `tcpv4` outducts that no plan cites as well. A shaper or tunnel
+CLA hands its bundles on to such a duct (`quotaclo <target>`, `zclo -T
+<target>`) and insists that no plan cite it, or bpclm could pass bundles to it
+directly. Such a duct names an address but no node, so each of its bundles
+goes to its *proximate node*: the neighbour of the plan that enqueued it, which
+ION records with the bundle and the shaper or tunnel leaves as it is. That node
+ID comes from the local configuration, as a plan's does, and is matched against
+the peer's `SESS_INIT` in the same way. ION can look a bundle up only by its ID,
+which an anonymous bundle (source `dtn:none`) lacks; zclo's carriers are such
+bundles, and one goes to the node it is destined for, the peer's zcl endpoint.
+If that is not the node at the duct's address, its `SESS_INIT` doesn't match
+and the session is not used:
+
+```
+a protocol tcpv4 1400 100
+a induct  tcpv4 0.0.0.0:4556 'tcpv4cla -c node.pem -k node.key -C ca.pem'
+a outduct tcpv4 peer.example:4556 ''              # in no plan
+a protocol quota 26
+a outduct quota 20 'quotaclo tcpv4/peer.example:4556'
+a plan 20 quota/20                  # bundles for node 20 go to the shaper
+```
+
 ## Protocol
 
 - **TCP port 4556** (RFC 9174 §8.1), contact header magic `dtn!`, version 4.

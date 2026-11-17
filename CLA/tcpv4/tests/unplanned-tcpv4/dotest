@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+#
+# Test of a tcpv4 outduct that no plan cites, as a shaper or tunnel CLA
+# hands its bundles on to (quotaclo; zclo -T): neither can have its target
+# in a plan, or bpclm could pass bundles to it directly.  tcpv4cla must
+# drain such an outduct too, and send each bundle to the node its plan
+# named - ION's proximate node for it - or, for an anonymous bundle, which
+# ION can't look up, to the node it is destined for, over a session it
+# opens to the outduct's host:port.
+#
+# One node in loopback, twice:
+#   quota  bundles for node 1 take the quota duct, whose quotaclo, with no
+#          rules, hands every one on to the tcpv4 outduct;
+#   zcl    bundles for node 1 take the zcl duct, whose zclo hands its
+#          carriers - anonymous bundles - on to the tcpv4 outduct.
+# A case whose daemons aren't there is skipped; the test is skipped if
+# both are.
+#
+# Needs tcpv4cla, and quotaclo and quotaadmin or zclo and zcli (installed,
+# or built in this tree), and ION's bp test tools.  Plaintext, so no
+# certificate.
+#
+# Tunables (env overridable):
+#   TCPV4_PORT   TCP port of the tcpv4 duct; the zcl case takes the next
+#                one   (default 4758)
+#
+
+TCP_PORT="${TCPV4_PORT:-4758}"
+CONFIGDIR="./config"
+
+# Prefer the daemons built in this tree.
+for dir in ../.. ../../../quota ../../../zcl; do
+	BUILT=$(cd "$dir" 2>/dev/null && pwd)
+	if [ -n "$BUILT" ]; then
+		PATH="$BUILT:$PATH"
+	fi
+done
+export PATH
+
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Testing that tcpv4cla drains a tcpv4 outduct that no plan"
+echo "         cites, sending each bundle to the node it is for."
+echo
+echo "########################################"
+
+FAIL=0
+fail() { echo "FAILURE: $1"; FAIL=1; }
+
+have() {
+	local t
+
+	for t in "$@"; do
+		command -v "$t" >/dev/null 2>&1 || return 1
+	done
+
+	return 0
+}
+
+# Wait for a delivered copy of $1; $2 caps the wait in seconds.
+await_file()
+{
+	local src="$1"
+	local cap="${2:-10}"
+	local i
+
+	for i in $(seq 1 $((cap * 10))); do
+		if [ -f testfile1 ] && cmp -s "$src" testfile1; then
+			return 0
+		fi
+		sleep 0.1
+	done
+
+	return 1
+}
+
+# run_case name port: one node in loopback with config/<name>.bprc and
+# .ipnrc, the tcpv4 duct on 127.0.0.1:<port>.
+run_case()
+{
+	local name="$1"
+	local tcpduct="127.0.0.1:$2"
+	local i
+
+	echo
+	echo "=== Case ${name}: ${name} in front of the tcpv4 outduct ==="
+	./cleanup 2>/dev/null
+	sleep 1
+
+	sed -e "s|TCPDUCT|${tcpduct}|g" \
+		"${CONFIGDIR}/${name}.bprc" > "${CONFIGDIR}/${name}_runtime.bprc"
+	sed -e "s|TESTDIR|$(pwd)|g" \
+		"${CONFIGDIR}/unplanned.ionconfig" \
+		> "${CONFIGDIR}/unplanned_runtime.ionconfig"
+
+	ionadmin "${CONFIGDIR}/unplanned.ionrc" >/dev/null
+	sleep 1
+	bpadmin "${CONFIGDIR}/${name}_runtime.bprc" >/dev/null
+	if [ -f "${CONFIGDIR}/${name}.quotarc" ] \
+			&& ! quotaadmin "${CONFIGDIR}/${name}.quotarc"; then
+		fail "${name}: quotaadmin rejected the configuration."
+	fi
+
+	for i in $(seq 1 50); do
+		grep -q "tcpv4cla is running" ion.log 2>/dev/null && break
+		sleep 0.1
+	done
+
+	if ! pgrep -x tcpv4cla >/dev/null; then
+		fail "${name}: tcpv4cla did not start."
+		tail -30 ion.log 2>/dev/null
+		./cleanup
+		return
+	fi
+
+	# The point of the test: no plan cites the tcpv4 outduct.
+	if echo "l plan" | ipnadmin 2>/dev/null | grep -q "tcpv4"; then
+		fail "${name}: a plan cites the tcpv4 outduct."
+	fi
+
+	echo "Phase 1: a file..."
+	head -c 4000 /dev/urandom | base64 | head -c 4000 > sendfile
+	rm -f testfile*
+	bprecvfile ipn:1.2 & RP=$!
+	sleep 1
+	bpsendfile ipn:1.1 ipn:1.2 sendfile
+	if await_file sendfile 15; then
+		echo "  PASS: bundle delivered over the outduct no plan cites."
+	else
+		fail "${name}: bundle not delivered over the outduct."
+	fi
+	kill $RP 2>/dev/null; wait $RP 2>/dev/null
+
+	# tcpv4cla dialled the outduct for node 1, and the peer's SESS_INIT
+	# matched it: a session that may carry bundles.  The session it
+	# accepted from itself is the inbound-only one.
+	if grep "session established with '127.0.0.1' (node 'ipn:1.0'" \
+			ion.log | grep -q "bidirectional"; then
+		echo "  PASS: session opened to ${tcpduct} for node ipn:1.0."
+	else
+		fail "${name}: no bidirectional session for node ipn:1.0."
+	fi
+
+	echo "Phase 2: 30 streamed bundles..."
+	bpcounter ipn:1.2 30 > counter.out 2>&1 & CP=$!
+	sleep 1
+	bpdriver 30 ipn:1.1 ipn:1.2 -1024 >/dev/null 2>&1
+	for i in $(seq 1 30); do
+		kill -0 $CP 2>/dev/null || break
+		sleep 1
+	done
+	kill -9 $CP 2>/dev/null
+	if grep -q "bundles received: 30" counter.out; then
+		echo "  PASS: 30 bundles received."
+	else
+		fail "${name}: did not receive 30 bundles ($(grep -o \
+			'received: [0-9]*' counter.out | tail -1))."
+	fi
+
+	if grep -q "names no node to send it to" ion.log; then
+		fail "${name}: tcpv4cla found a bundle naming no node."
+	fi
+
+	./cleanup
+}
+
+if ! have tcpv4cla bpsendfile bprecvfile bpdriver bpcounter; then
+	echo "SKIP: tcpv4cla or the bp test tools not found."
+	exit 2
+fi
+
+cases=0
+if have quotaclo quotaadmin; then
+	run_case quota "$TCP_PORT"
+	cases=$((cases + 1))
+else
+	echo "Case quota skipped: quotaclo or quotaadmin not found."
+fi
+
+if have zclo zcli; then
+	run_case zcl $((TCP_PORT + 1))
+	cases=$((cases + 1))
+else
+	echo "Case zcl skipped: zclo or zcli not found."
+fi
+
+if [ "$cases" -eq 0 ]; then
+	echo "SKIP: neither quotaclo nor zclo found."
+	exit 2
+fi
+
+exit $FAIL

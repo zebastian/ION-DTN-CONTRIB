@@ -1,0 +1,5 @@
+wmSize 50000000
+# ION's default SDR configuration: in DRAM (1), reversible (4) and bounded (8).
+configFlags 13
+heapWords 2500000
+pathName TESTDIR

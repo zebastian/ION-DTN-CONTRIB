@@ -1,0 +1,10 @@
+#!/bin/bash
+pkill -9 -x tcpv4cla 2>/dev/null
+pkill -9 -x quotaclo 2>/dev/null
+pkill -9 -x zclo 2>/dev/null
+pkill -9 -x zcli 2>/dev/null
+ionstop >/dev/null 2>&1
+killm >/dev/null 2>&1
+rm -f ion.log testfile* sendfile counter.out bpdriverAduFile quota-*.state* bpacq.*
+rm -f config/*_runtime.bprc config/unplanned_runtime.ionconfig
+exit 0
