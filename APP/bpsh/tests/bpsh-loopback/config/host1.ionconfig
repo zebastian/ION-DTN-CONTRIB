@@ -1,0 +1,4 @@
+# The SDR transaction log in shared memory rather than in a file, as on a host
+# where ION may write only to the experiment's home. No log file then holds one
+# of bpshd's low descriptors, so the pipes to its shell start at fd 3 or 4.
+logSize 1000000

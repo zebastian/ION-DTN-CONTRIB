@@ -9,7 +9,7 @@ trap 'killm f >/dev/null 2>&1' EXIT
 #   - INIT replaces any prior session for the same source EID
 #
 
-CONFIGFILES="./config/host1.rc"
+CONFIGFILES="./config/host1.rc ./config/host1.ionconfig"
 
 echo "########################################"
 echo

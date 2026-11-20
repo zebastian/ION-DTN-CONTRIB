@@ -175,22 +175,52 @@ BpshSession *bpshSessionOpen(BpSAP sap, const char *sourceEid, uvast sessionId,
 		/*	Child: wire pipes to fd 0/1/2, the user-stdin pipe to
 		 *	fd 3 (read via "<&3"), and the control pipe to fd 4
 		 *	(exit codes written via ">&4").  Not interactive: we
-		 *	drive it by writing commands plus an rc printf.	*/
-		dup2(inPipe[0], 0);
-		dup2(outPipe[1], 1);
-		dup2(errPipe[1], 2);
-		dup2(dataPipe[0], 3);
-		dup2(ctlPipe[1], 4);
-		close(inPipe[0]);
-		close(inPipe[1]);
-		close(outPipe[0]);
-		close(outPipe[1]);
-		close(errPipe[0]);
-		close(errPipe[1]);
-		close(dataPipe[0]);
-		close(dataPipe[1]);
-		close(ctlPipe[0]);
-		close(ctlPipe[1]);
+		 *	drive it by writing commands plus an rc printf.
+		 *
+		 *	A pipe made while fds 3 and 4 were free sits on them,
+		 *	so wiring one end there could overwrite another end
+		 *	not yet wired, and closing the pipes after would close
+		 *	what was wired.  So each end to wire moves above fd 4
+		 *	first; then every pipe end that is still above fd 4
+		 *	goes, while those at or below were all replaced.	*/
+		int	wire[5] = { inPipe[0], outPipe[1], errPipe[1],
+				dataPipe[0], ctlPipe[1] };
+		int	ends[10] = { inPipe[0], inPipe[1], outPipe[0],
+				outPipe[1], errPipe[0], errPipe[1],
+				dataPipe[0], dataPipe[1], ctlPipe[0],
+				ctlPipe[1] };
+		int	i;
+
+		for (i = 0; i < 5; i++)
+		{
+			wire[i] = fcntl(wire[i], F_DUPFD, 5);
+			if (wire[i] < 0)
+			{
+				_exit(127);
+			}
+		}
+
+		for (i = 0; i < 5; i++)
+		{
+			if (dup2(wire[i], i) < 0)
+			{
+				_exit(127);
+			}
+		}
+
+		for (i = 0; i < 10; i++)
+		{
+			if (ends[i] > 4)
+			{
+				close(ends[i]);
+			}
+		}
+
+		for (i = 0; i < 5; i++)
+		{
+			close(wire[i]);
+		}
+
 		/*	Lead our own process group so a later kill(-pgid)
 		 *	tears down the shell and whatever command it's
 		 *	running together (used to abort a stalled command
