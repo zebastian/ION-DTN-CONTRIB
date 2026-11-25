@@ -878,16 +878,20 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		if (dlv.result == BpReceptionInterrupted || dlv.adu == 0)
-		{
-			bp_release_delivery(&dlv, 1);
-			continue;
-		}
+		/*	Before the test for an empty delivery: a stopped
+		 *	endpoint delivers no ADU either, and bp_receive
+		 *	returns at once for as long as it stays stopped.	*/
 
 		if (dlv.result == BpEndpointStopped)
 		{
 			bp_release_delivery(&dlv, 1);
 			break;
+		}
+
+		if (dlv.result == BpReceptionInterrupted || dlv.adu == 0)
+		{
+			bp_release_delivery(&dlv, 1);
+			continue;
 		}
 
 		if (dlv.result != BpPayloadPresent)
