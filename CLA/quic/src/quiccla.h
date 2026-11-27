@@ -22,6 +22,14 @@ extern "C" {
 #define QUIC_LEN_PREFIX	      4		   /* uint32 BE per bundle.*/
 #define QUIC_DEFAULT_IDLE_SEC 30
 
+/*	Each failed dial to a node doubles the wait before the next one, up
+ *	to this cap (seconds), as RFC 9174 4.1 has TCPCLv4 do.		*/
+#define QUIC_MAX_RECONNECT    60
+
+/*	The longest a sender waits before taking a bundle again after one
+ *	found no session (seconds).					*/
+#define QUIC_RETRY_MAX_SEC    5
+
 #define QUIC_MAX_HOST_LEN     256
 #define QUIC_MAX_PATH_LEN     1024
 #define QUIC_MAX_ALPN_LEN     64

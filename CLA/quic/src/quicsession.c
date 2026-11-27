@@ -146,6 +146,21 @@ typedef struct QuicConn
  *	client-initiated bidirectional stream.				*/
 #define QUICCL_SIG_STREAM 0
 
+/*	The reconnection backoff of one node.  Without it every bundle
+ *	offered for a node that can't be reached dials afresh, and a dial
+ *	that fails at once (no route to the peer) does so hundreds of times
+ *	a second.  As RFC 9174 4.1 has TCPCLv4 do, each failed dial doubles
+ *	the wait before the next, up to QUIC_MAX_RECONNECT, and only an
+ *	established session resets it.  Sessions the peer opens are not
+ *	held back: they carry bundles as soon as they are up.		*/
+typedef struct QuicDial
+{
+	struct QuicDial *next;
+	uvast		 nodeNbr;
+	int		 interval;  /* Current backoff, seconds.	*/
+	time_t		 notBefore; /* No dial before (monotonic s).	*/
+} QuicDial;
+
 struct QuicSession
 {
 	int	      fd;
@@ -165,6 +180,8 @@ struct QuicSession
 	int		wakePipe[2];
 
 	QuicConn    *conns;
+	QuicDial    *dials;	/* Per node, under the mutex.	*/
+	unsigned int randState; /* Backoff randomization (4.1).	*/
 	QuicBundleCb cb;
 	void	    *cbUser;
 
@@ -1607,6 +1624,7 @@ QuicSession *quicEngineStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 	s->cbUser = user;
 	s->fd = -1;
 	s->wakePipe[0] = s->wakePipe[1] = -1;
+	s->randState = (unsigned int) (getpid() ^ (int) time(NULL));
 	pthread_mutex_init(&s->mutex, NULL);
 	pthread_cond_init(&s->cond, NULL);
 
@@ -2373,6 +2391,97 @@ ending the session.");
 	return delivered ? 0 : -1;
 }
 
+/*	*	*	Reconnection backoff	*	*	*	*/
+
+static time_t monotonicSec(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec;
+}
+
+/*	The backoff of a node, made on first use.  Called with s->mutex
+ *	held.								*/
+
+static QuicDial *findDial(QuicSession *s, uvast nodeNbr)
+{
+	QuicDial *dial;
+
+	for (dial = s->dials; dial != NULL; dial = dial->next)
+	{
+		if (dial->nodeNbr == nodeNbr)
+		{
+			return dial;
+		}
+	}
+
+	dial = MTAKE(sizeof(QuicDial));
+	if (dial == NULL)
+	{
+		return NULL;
+	}
+
+	memset(dial, 0, sizeof(*dial));
+	dial->nodeNbr = nodeNbr;
+	dial->interval = 1;
+	dial->next = s->dials;
+	s->dials = dial;
+	return dial;
+}
+
+/*	Whether a dial to the node may start now.  A node whose backoff
+ *	found no memory is dialled as if it had none.			*/
+
+static int mayDial(QuicSession *s, uvast nodeNbr)
+{
+	QuicDial *dial;
+	int	  allowed;
+
+	pthread_mutex_lock(&s->mutex);
+	dial = findDial(s, nodeNbr);
+	allowed = (dial == NULL || monotonicSec() >= dial->notBefore);
+	pthread_mutex_unlock(&s->mutex);
+	return allowed;
+}
+
+/*	Record how a dial to the node ended.  A failure sets the wait before
+ *	the next dial and doubles the interval for the one after that.  The
+ *	wait is drawn from the upper half of the interval rather than being
+ *	the interval itself: 4.1 asks for randomization, so that nodes cut
+ *	off together do not come back in lockstep and collide again.	*/
+
+static void noteDial(QuicSession *s, uvast nodeNbr, int established)
+{
+	QuicDial *dial;
+	int	  half;
+
+	pthread_mutex_lock(&s->mutex);
+	dial = findDial(s, nodeNbr);
+	if (dial != NULL)
+	{
+		if (established)
+		{
+			dial->interval = 1;
+			dial->notBefore = 0;
+		}
+		else
+		{
+			half = dial->interval / 2;
+			dial->notBefore = monotonicSec() + dial->interval - half
+				+ (int) (rand_r(&s->randState)
+						% (unsigned) (half + 1));
+			dial->interval <<= 1;
+			if (dial->interval > QUIC_MAX_RECONNECT)
+			{
+				dial->interval = QUIC_MAX_RECONNECT;
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&s->mutex);
+}
+
 int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 		const unsigned char *bundle, int len, int ordinal)
 {
@@ -2380,6 +2489,7 @@ int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 	int	  exists;
 	int	  dialed = 0;
 	int	  waited = 0;
+	int	  established;
 	int	  rc;
 
 	for (;;)
@@ -2407,9 +2517,17 @@ int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 			continue;
 		}
 
-		/*	No session to this node: open one (once).		*/
+		/*	No session to this node: open one (once), unless a
+		 *	dial to it failed too recently.			*/
 
-		if (dialed || quicEngineConnect(s, host, port) < 0)
+		if (dialed || !mayDial(s, nodeNbr))
+		{
+			return -1;
+		}
+
+		established = (quicEngineConnect(s, host, port) == 0);
+		noteDial(s, nodeNbr, established);
+		if (!established)
 		{
 			return -1;
 		}
@@ -2430,6 +2548,8 @@ void quicEngineStop(QuicSession *s)
 {
 	QuicConn *qc;
 	QuicConn *next;
+	QuicDial *dial;
+	QuicDial *nextDial;
 
 	if (s == NULL)
 	{
@@ -2451,6 +2571,12 @@ void quicEngineStop(QuicSession *s)
 	{
 		next = qc->next;
 		freeConn(qc);
+	}
+
+	for (dial = s->dials; dial != NULL; dial = nextDial)
+	{
+		nextDial = dial->next;
+		MRELEASE(dial);
 	}
 
 	if (s->fd >= 0)

@@ -36,6 +36,13 @@ whether `quiccla` accepted it or opened it.
   the transfer incomplete (dropped), as befits a best-effort service.
 - **Keepalive / termination:** an idle session emits `KEEPALIVE` at the
   negotiated interval; shutdown performs a `SESS_TERM` exchange.
+- **Outages:** dials to a node back off as RFC 9174 4.1 has TCPCLv4 do: each
+  failed dial doubles the wait before the next, randomized and at most 60 s,
+  and only an established session resets it. A bundle that finds no session
+  goes back to ION, and its outduct's sender waits before taking the next
+  one: 1 s after the first failure, a second longer after each further one,
+  at most 5 s. It logs the first failure of an outage only. A session the
+  peer opens carries bundles as soon as it is up.
 
 ## Conformance to draft-caini-dtn-quiccl
 

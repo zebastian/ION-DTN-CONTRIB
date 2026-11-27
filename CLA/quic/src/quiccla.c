@@ -101,6 +101,7 @@ static void *senderThread(void *parm)
 	unsigned int	bundleLength;
 	ZcoReader	reader;
 	int		bytesToSend;
+	int		refusals = 0;
 
 	buffer = MTAKE(QUICCLA_BUFSZ);
 	if (buffer == NULL)
@@ -166,15 +167,35 @@ static void *senderThread(void *parm)
 				    buffer, bytesToSend, ancillaryData.ordinal)
 				< 0)
 		{
-			writeMemo("[?] quiccla: send failed; will retry.");
+			/*	No session took the bundle, so it goes back
+			 *	to BP, which offers it again at once.  What
+			 *	stopped it - a peer that can't be reached, a
+			 *	reconnection backoff with seconds to run - has
+			 *	not gone away a microsecond later, and without
+			 *	a pause here the two of us spin: dequeue,
+			 *	fail, requeue, dequeue, hundreds of times a
+			 *	second.  So wait, a little longer after each
+			 *	successive failure, and say so once rather
+			 *	than each time round the loop.		*/
+
+			if (refusals == 0)
+			{
+				writeMemoNote("[?] quiccla: send failed, will"
+					      " retry", nb->outductName);
+			}
+
 			if (bpHandleXmitFailure(bundleZco) < 0)
 			{
 				break;
 			}
 
+			refusals++;
+			snooze(refusals < QUIC_RETRY_MAX_SEC ? refusals
+							     : QUIC_RETRY_MAX_SEC);
 			continue;
 		}
 
+		refusals = 0;
 		if (bpHandleXmitSuccess(bundleZco) < 0)
 		{
 			putErrmsg("Can't handle xmit success.", NULL);
