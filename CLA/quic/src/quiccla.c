@@ -88,6 +88,21 @@ static uvast nodeNbrFromEid(const char *eid)
 	return node;
 }
 
+/*	Wait seconds before the next bundle, or less if the outduct is
+ *	stopped meanwhile: a stop joins the sender, and bpStop kills a CLA
+ *	that has not ended 5 s after it was asked to.			*/
+
+static void pauseSender(QuicNeighbor *nb, int seconds)
+{
+	int	tenths;
+
+	for (tenths = 10 * seconds; tenths > 0
+			&& !sm_SemEnded(nb->vduct->semaphore); tenths--)
+	{
+		microsnooze(100000);
+	}
+}
+
 /*	Drain one quic outduct, transmitting each bundle over the session to
  *	the neighbour (opening one on demand, or reusing an accepted one).	*/
 
@@ -190,8 +205,8 @@ static void *senderThread(void *parm)
 			}
 
 			refusals++;
-			snooze(refusals < QUIC_RETRY_MAX_SEC ? refusals
-							     : QUIC_RETRY_MAX_SEC);
+			pauseSender(nb, refusals < QUIC_RETRY_MAX_SEC
+					? refusals : QUIC_RETRY_MAX_SEC);
 			continue;
 		}
 
@@ -473,6 +488,10 @@ int main(int argc, char *argv[])
 
 	pthread_mutex_unlock(&NeighborsMutex);
 
+	/*	A sender may be waiting for the handshake with a peer that
+	 *	does not answer, or for a session that is coming up.	*/
+
+	quicEngineReleaseSenders(Engine);
 	for (nb = Neighbors; nb != NULL; nb = nb->next)
 	{
 		if (nb->hasSender)

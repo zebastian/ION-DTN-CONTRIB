@@ -74,7 +74,10 @@ a plan 20 quota/20                  # bundles for node 20 go to the shaper
 - **Termination** (§6): `SESS_TERM` with the REPLY flag exchanged on shutdown,
   no new transfer begun once one has been sent, and optional idle session
   termination (`-t`).  A connection arriving past the session limit (`-L`) is
-  told `SESS_TERM` "Busy" rather than simply dropped.
+  told `SESS_TERM` "Busy" rather than simply dropped.  Stopping `tcpv4cla`
+  doesn't wait for a peer that doesn't answer: it interrupts a dial under way
+  and cuts short a sender's pause before its next try, since `bpStop` kills a
+  convergence layer that hasn't ended 5 s after it was asked to.
 
 ## Conformance to RFC 9174
 

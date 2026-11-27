@@ -599,7 +599,7 @@ int tcpv4EngineSendTo(Tcpv4Engine *e, const char *nodeId,
 	pthread_mutex_lock(&e->mutex);
 	for (;;)
 	{
-		if (!TCPV4_GET(e->running))
+		if (!TCPV4_GET(e->running) || e->releasing)
 		{
 			pthread_mutex_unlock(&e->mutex);
 			return -1;

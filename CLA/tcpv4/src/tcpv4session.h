@@ -94,6 +94,13 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
 int tcpv4EngineSendTo(Tcpv4Engine *e, const char *nodeId,
 		const char *ductName, Object bundle, vast length);
 
+/*	Release the senders, so that they can be stopped: from now on no
+ *	sender dials and tcpv4EngineSendTo fails at once, including in a
+ *	wait for a session that is coming up.  A dial under way is
+ *	interrupted by sending signum to its thread, until the thread has
+ *	left the connect; signum's handler must return.			*/
+void tcpv4EngineReleaseSenders(Tcpv4Engine *e, int signum);
+
 /*	Stop the engine: terminate every session with SESS_TERM, close the
  *	listening socket, and join the internal threads.  Callers must stop
  *	their sender threads first.					*/

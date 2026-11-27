@@ -44,6 +44,11 @@ QuicSession *quicEngineStart(const QuicClaConfig *cfg, QuicBundleCb cb,
 int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 		const unsigned char *bundle, int len, int ordinal);
 
+/*	Release the senders, so that they can be stopped: from now on
+ *	quicEngineSendTo dials no node and fails at once, including in a
+ *	wait for a handshake or for a session that is coming up.	*/
+void quicEngineReleaseSenders(QuicSession *s);
+
 /*	Stop the engine: cleanly terminate every session and join the I/O
  *	thread.								*/
 void quicEngineStop(QuicSession *s);

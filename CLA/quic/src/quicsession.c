@@ -181,6 +181,7 @@ struct QuicSession
 
 	QuicConn    *conns;
 	QuicDial    *dials;	/* Per node, under the mutex.	*/
+	int	     releasing;	/* Senders must give up; mutex.	*/
 	unsigned int randState; /* Backoff randomization (4.1).	*/
 	QuicBundleCb cb;
 	void	    *cbUser;
@@ -1814,7 +1815,7 @@ static int quicEngineConnect(QuicSession *s, const char *host, int port)
 
 	deadline = s->cfg.idleSec * 1000;
 	pthread_mutex_lock(&s->mutex);
-	while (!qc->failed && deadline > 0
+	while (!qc->failed && !s->releasing && deadline > 0
 			&& !(qc->sessState == QSS_ESTABLISHED
 					&& (s->cfg.unreliable
 							|| qc->dataStreamsOpen)))
@@ -1840,7 +1841,12 @@ static int quicEngineConnect(QuicSession *s, const char *host, int port)
 
 	if (!ready)
 	{
-		putErrmsg("quiccla: QUICCL session did not establish.", host);
+		if (!s->releasing)
+		{
+			putErrmsg("quiccla: QUICCL session did not establish.",
+					host);
+		}
+
 		wakeIo(s); /* Let the I/O thread reap the failed conn.	*/
 		return -1;
 	}
@@ -2507,7 +2513,7 @@ int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 			/*	A session to this node exists but is not yet
 			 *	ready (or is busy); wait briefly and retry.	*/
 
-			if (waited >= 50)
+			if (waited >= 50 || s->releasing)
 			{
 				return -1;
 			}
@@ -2520,7 +2526,7 @@ int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 		/*	No session to this node: open one (once), unless a
 		 *	dial to it failed too recently.			*/
 
-		if (dialed || !mayDial(s, nodeNbr))
+		if (dialed || s->releasing || !mayDial(s, nodeNbr))
 		{
 			return -1;
 		}
@@ -2542,6 +2548,19 @@ int quicEngineSendTo(QuicSession *s, uvast nodeNbr, const char *host, int port,
 	qc->sendBusy = 0;
 	pthread_mutex_unlock(&s->mutex);
 	return rc;
+}
+
+void quicEngineReleaseSenders(QuicSession *s)
+{
+	if (s == NULL)
+	{
+		return;
+	}
+
+	pthread_mutex_lock(&s->mutex);
+	s->releasing = 1;
+	pthread_cond_broadcast(&s->cond);
+	pthread_mutex_unlock(&s->mutex);
 }
 
 void quicEngineStop(QuicSession *s)

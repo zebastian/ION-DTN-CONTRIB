@@ -402,6 +402,21 @@ static int bundleProxNode(Object bundleZco, char *nodeId)
 	return tcpv4NodeIdIsSet(nodeId) ? 0 : -1;
 }
 
+/*	Wait seconds before the next bundle, or less if the outduct is
+ *	stopped meanwhile: a stop joins the sender, and bpStop kills a CLA
+ *	that has not ended 5 s after it was asked to.			*/
+
+static void pauseSender(Tcpv4Neighbor *nb, int seconds)
+{
+	int	tenths;
+
+	for (tenths = 10 * seconds; tenths > 0
+			&& !sm_SemEnded(nb->vduct->semaphore); tenths--)
+	{
+		microsnooze(100000);
+	}
+}
+
 /*	Drain one tcpv4 outduct, handing each bundle to the session to the
  *	neighbour (opening one on demand, or reusing an accepted one).
  *	The hand-off does not wait for the bundle to be written, let alone
@@ -508,8 +523,8 @@ static void *senderThread(void *parm)
 		}
 
 		refusals++;
-		snooze(refusals < TCPV4_RETRY_MAX_SEC ? refusals
-						      : TCPV4_RETRY_MAX_SEC);
+		pauseSender(nb, refusals < TCPV4_RETRY_MAX_SEC
+				? refusals : TCPV4_RETRY_MAX_SEC);
 	}
 
 	nb->vduct->hasThread = 0;
@@ -842,6 +857,11 @@ int main(int argc, char *argv[])
 
 	pthread_mutex_unlock(&NeighborsMutex);
 
+	/*	A sender may be dialling a peer that does not answer, or
+	 *	waiting for a session that is coming up.  SIGTERM's handler
+	 *	only notes the stop, which is under way.		*/
+
+	tcpv4EngineReleaseSenders(Engine, SIGTERM);
 	for (nb = Neighbors; nb != NULL; nb = nb->next)
 	{
 		if (nb->hasSender)

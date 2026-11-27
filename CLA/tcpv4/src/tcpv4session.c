@@ -863,6 +863,85 @@ Tcpv4Engine *tcpv4EngineStart(const Tcpv4ClaConfig *cfg,
 	return e;
 }
 
+/*	A sender thread in a dial, on the engine's list of them while it
+ *	connects, so that tcpv4EngineReleaseSenders can interrupt it.	*/
+
+typedef struct Tcpv4Dialer
+{
+	pthread_t	    thread;
+	struct Tcpv4Dialer *next;
+} Tcpv4Dialer;
+
+/*	Put the calling thread on the list of those dialling, unless the
+ *	senders have been released.  Returns 0 if it may dial.		*/
+
+static int beginDial(Tcpv4Engine *e, Tcpv4Dialer *self)
+{
+	pthread_mutex_lock(&e->mutex);
+	if (e->releasing)
+	{
+		pthread_mutex_unlock(&e->mutex);
+		return -1;
+	}
+
+	self->thread = pthread_self();
+	self->next = e->dialers;
+	e->dialers = self;
+	pthread_mutex_unlock(&e->mutex);
+	return 0;
+}
+
+/*	Take the calling thread off that list.  Returns -1 if the senders
+ *	were released meanwhile: the connect may have been interrupted,
+ *	and its outcome tells nothing about the peer.			*/
+
+static int endDial(Tcpv4Engine *e, Tcpv4Dialer *self)
+{
+	Tcpv4Dialer **link;
+	int	      released;
+
+	pthread_mutex_lock(&e->mutex);
+	for (link = &e->dialers; *link != NULL; link = &(*link)->next)
+	{
+		if (*link == self)
+		{
+			*link = self->next;
+			break;
+		}
+	}
+
+	released = e->releasing;
+	pthread_mutex_unlock(&e->mutex);
+	return released ? -1 : 0;
+}
+
+void tcpv4EngineReleaseSenders(Tcpv4Engine *e, int signum)
+{
+	Tcpv4Dialer *d;
+
+	if (e == NULL)
+	{
+		return;
+	}
+
+	pthread_mutex_lock(&e->mutex);
+	e->releasing = 1;
+	pthread_cond_broadcast(&e->cond);
+	while (e->dialers != NULL)
+	{
+		for (d = e->dialers; d != NULL; d = d->next)
+		{
+			oK(pthread_kill(d->thread, signum));
+		}
+
+		pthread_mutex_unlock(&e->mutex);
+		microsnooze(100000);
+		pthread_mutex_lock(&e->mutex);
+	}
+
+	pthread_mutex_unlock(&e->mutex);
+}
+
 /*	Open a session to a peer, honouring the reconnection backoff of
  *	RFC 9174 4.1.  Returns 0 when a session attempt was started, -1
  *	otherwise.							*/
@@ -871,6 +950,7 @@ int tcpv4OpenSession(Tcpv4Engine *e, const char *nodeId, const char *ductName)
 {
 	Tcpv4Dial *dial;
 	Tcpv4Conn *conn;
+	Tcpv4Dialer self;
 	char	   spec[TCPV4_MAX_HOST_LEN + 16];
 	char	   host[TCPV4_MAX_HOST_LEN];
 	int	   port = e->cfg.port;
@@ -933,8 +1013,23 @@ int tcpv4OpenSession(Tcpv4Engine *e, const char *nodeId, const char *ductName)
 	}
 
 	istrcpy(spec, ductName, sizeof(spec));
+	if (beginDial(e, &self) < 0)
+	{
+		return -1;
+	}
+
 	result = itcp_connect_dualstack(spec, (unsigned short) e->cfg.port,
 			&sock, NULL);
+	if (endDial(e, &self) < 0)
+	{
+		if (result == 1)
+		{
+			closesocket(sock);
+		}
+
+		return -1;
+	}
+
 	if (result < 1)
 	{
 		pthread_mutex_lock(&e->mutex);

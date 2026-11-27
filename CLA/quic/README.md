@@ -42,7 +42,9 @@ whether `quiccla` accepted it or opened it.
   goes back to ION, and its outduct's sender waits before taking the next
   one: 1 s after the first failure, a second longer after each further one,
   at most 5 s. It logs the first failure of an outage only. A session the
-  peer opens carries bundles as soon as it is up.
+  peer opens carries bundles as soon as it is up. Stopping `quiccla` cuts
+  short both the wait for a handshake and that pause, since `bpStop` kills a
+  convergence layer that hasn't ended 5 s after it was asked to.
 
 ## Conformance to draft-caini-dtn-quiccl
 

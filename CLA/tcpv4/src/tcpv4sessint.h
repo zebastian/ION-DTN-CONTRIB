@@ -276,6 +276,8 @@ struct Tcpv4Engine
 	int	   connCount;
 	int	   maxSessions;	 /* cfg.maxSessions, for brevity.	*/
 	Tcpv4Dial *dials;
+	int	   releasing;	 /* Senders must give up; under mutex.	*/
+	struct Tcpv4Dialer *dialers; /* Threads in a dial; under mutex.	*/
 	Tcpv4Tick *ticks;	 /* Clock thread scratch, maxSessions
 				    + TCPV4_BUSY_SLACK entries.		*/
 	unsigned int randState;	 /* Backoff randomization (4.1).	*/
